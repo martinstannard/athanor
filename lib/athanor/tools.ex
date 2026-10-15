@@ -9,7 +9,7 @@ defmodule Athanor.Tools do
     available to `:conductor` sessions.
   """
 
-  alias Athanor.{Bus, Orchestrator}
+  alias Athanor.{Bus, Orchestrator, SessionId}
   alias Athanor.Tools.{Glob, Grep}
 
   @default_bash_timeout_ms 30_000
@@ -377,9 +377,10 @@ defmodule Athanor.Tools do
     wait? = Map.get(args, "wait", false) == true
     wait_timeout = Keyword.get(opts, :wait_timeout, @default_subagent_wait_timeout_ms)
 
-    child_id =
-      "worker-#{Registry.count(Athanor.AgentRegistry) + 1}-" <>
-        Base.encode16(:crypto.strong_rand_bytes(2), case: :lower)
+    # Generated here (rather than left to the Orchestrator) so a `wait: true` caller can
+    # subscribe to the child's events *before* it starts. Uses the shared generator so the
+    # id is unique by construction and safe as a future path/branch component.
+    child_id = SessionId.generate("worker")
 
     if wait? do
       Bus.subscribe("agent:#{child_id}:events")

@@ -4,7 +4,11 @@ defmodule Athanor.Orchestrator do
   using `Athanor.Bus` PubSub for control and event routing.
   """
 
-  alias Athanor.{Agent, Bus}
+  alias Athanor.{Agent, Bus, SessionId}
+
+  # Generated-id collisions are already vanishingly unlikely; this bounds a retry loop
+  # rather than silently starting an unreachable, unregistered agent.
+  @id_attempts 3
 
   @doc """
   Subscribes the calling process to `"deck:events"`, receiving
@@ -20,12 +24,8 @@ defmodule Athanor.Orchestrator do
   """
   @spec start_conductor(keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def start_conductor(opts \\ []) do
-    title = Keyword.get(opts, :title, "conductor")
-    id = Keyword.get_lazy(opts, :id, fn -> generate_id("conductor") end)
-
     opts
-    |> Keyword.put(:id, id)
-    |> Keyword.put(:title, title)
+    |> Keyword.put(:title, Keyword.get(opts, :title, "conductor"))
     |> Keyword.put(:role, :conductor)
     |> Keyword.put(:parent_id, nil)
     |> spawn_session()
@@ -38,10 +38,7 @@ defmodule Athanor.Orchestrator do
           {:ok, String.t(), pid()} | {:error, term()}
   def launch_subagent(parent_id, title, prompt, opts \\ [])
       when is_binary(parent_id) and is_binary(title) and is_binary(prompt) do
-    id = Keyword.get_lazy(opts, :id, fn -> generate_id("worker") end)
-
     opts
-    |> Keyword.put(:id, id)
     |> Keyword.put(:title, title)
     |> Keyword.put(:role, :worker)
     |> Keyword.put(:parent_id, parent_id)
@@ -52,37 +49,17 @@ defmodule Athanor.Orchestrator do
   @doc """
   Spawns a supervised `Athanor.Agent` session under `Athanor.AgentSupervisor`
   and dispatches its initial prompt over `Athanor.Bus` if provided.
+
+  Omitting `:id` generates one via `Athanor.SessionId.generate/1`, retrying a bounded number of
+  times on collision. A caller-supplied `:id` is used as-is, and a collision comes back as
+  `{:error, {:duplicate_session_id, id}}` rather than silently starting an unregistered
+  (and therefore unreachable) agent.
   """
   @spec spawn_session(keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def spawn_session(opts \\ []) do
-    role = Keyword.get(opts, :role, :worker)
-    id = Keyword.get_lazy(opts, :id, fn -> generate_id(to_string(role)) end)
-    title = Keyword.get(opts, :title) || Keyword.get(opts, :label) || id
-    initial_prompt = Keyword.get(opts, :prompt)
-
-    child_opts =
-      opts
-      |> Keyword.put(:id, id)
-      |> Keyword.put(:title, title)
-      |> Keyword.put(:register, true)
-      |> Keyword.put_new(:subscriber, nil)
-
-    spec = %{
-      id: {Agent, id},
-      start: {Agent, :start_link, [child_opts]},
-      restart: :temporary
-    }
-
-    case DynamicSupervisor.start_child(Athanor.AgentSupervisor, spec) do
-      {:ok, pid} ->
-        if is_binary(initial_prompt) and String.trim(initial_prompt) != "" do
-          Bus.send_command(id, {:prompt, initial_prompt})
-        end
-
-        {:ok, id, pid}
-
-      {:error, reason} ->
-        {:error, reason}
+    case Keyword.get(opts, :id) do
+      nil -> spawn_generated(opts, to_string(Keyword.get(opts, :role, :worker)), @id_attempts)
+      explicit -> do_spawn_session(opts, explicit)
     end
   end
 
@@ -91,6 +68,49 @@ defmodule Athanor.Orchestrator do
   """
   @spec spawn_agent(keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def spawn_agent(opts \\ []), do: spawn_session(opts)
+
+  defp spawn_generated(_opts, prefix, 0), do: {:error, {:session_id_exhausted, prefix}}
+
+  defp spawn_generated(opts, prefix, attempts) do
+    case do_spawn_session(opts, SessionId.generate(prefix)) do
+      {:error, {:duplicate_session_id, _id}} -> spawn_generated(opts, prefix, attempts - 1)
+      other -> other
+    end
+  end
+
+  defp do_spawn_session(opts, id) do
+    title = Keyword.get(opts, :title) || Keyword.get(opts, :label) || id
+    initial_prompt = Keyword.get(opts, :prompt)
+
+    if SessionId.valid?(id) do
+      child_opts =
+        opts
+        |> Keyword.put(:id, id)
+        |> Keyword.put(:title, title)
+        |> Keyword.put(:register, true)
+        |> Keyword.put_new(:subscriber, nil)
+
+      spec = %{
+        id: {Agent, id},
+        start: {Agent, :start_link, [child_opts]},
+        restart: :temporary
+      }
+
+      case DynamicSupervisor.start_child(Athanor.AgentSupervisor, spec) do
+        {:ok, pid} ->
+          if is_binary(initial_prompt) and String.trim(initial_prompt) != "" do
+            Bus.send_command(id, {:prompt, initial_prompt})
+          end
+
+          {:ok, id, pid}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, {:invalid_session_id, id}}
+    end
+  end
 
   @doc """
   Sends a prompt or follow-up message to any session by ID over `Athanor.Bus` PubSub.
@@ -208,10 +228,5 @@ defmodule Athanor.Orchestrator do
       %{role: "assistant", content: text} when is_binary(text) and text != "" -> text
       _ -> nil
     end)
-  end
-
-  defp generate_id(prefix) do
-    count = Registry.count(Athanor.AgentRegistry) + 1
-    "#{prefix}-#{count}-" <> Base.encode16(:crypto.strong_rand_bytes(2), case: :lower)
   end
 end

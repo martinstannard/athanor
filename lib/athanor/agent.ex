@@ -11,7 +11,7 @@ defmodule Athanor.Agent do
 
   use GenServer
 
-  alias Athanor.{Bus, Config, LLM, Tools}
+  alias Athanor.{Bus, Config, LLM, SessionId, Tools}
 
   @default_max_turns 100
 
@@ -162,49 +162,69 @@ defmodule Athanor.Agent do
     max_turns = Keyword.get(opts, :max_turns, @default_max_turns)
     notify_parent = Keyword.get(opts, :notify_parent_on_done, parent_id != nil)
 
-    if Keyword.get(opts, :register, false) and Process.whereis(Athanor.AgentRegistry) do
-      Registry.register(Athanor.AgentRegistry, id, %{
+    with :ok <- validate_id(id),
+         :ok <- register_session(opts, id, title, role, parent_id, model) do
+      # Subscribe to our own PubSub control inbox
+      Bus.subscribe("agent:#{id}:inbox")
+
+      # Conductors subscribe to their children's lifecycle topic
+      if role == :conductor do
+        Bus.subscribe("conductor:#{id}:children")
+      end
+
+      session_id =
+        Keyword.get_lazy(opts, :session_id, fn ->
+          "ses_athanor_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+        end)
+
+      default_llm_fn = fn messages, tools, caller_pid ->
+        LLM.stream(messages, tools, caller_pid, model: model, session_id: session_id)
+      end
+
+      state = %__MODULE__{
+        id: id,
         title: title,
         role: role,
         parent_id: parent_id,
-        model: model
-      })
+        subscriber: Keyword.get(opts, :subscriber),
+        session_id: session_id,
+        model: model,
+        cd: cd,
+        max_turns: max_turns,
+        notify_parent_on_done: notify_parent,
+        llm_fn: Keyword.get(opts, :llm_fn, default_llm_fn),
+        messages: [%{role: "system", content: String.trim(system_prompt)}]
+      }
+
+      notify(state, {:session_started, snapshot_meta(state)})
+      {:ok, state}
+    else
+      {:error, reason} -> {:stop, reason}
     end
+  end
 
-    # Subscribe to our own PubSub control inbox
-    Bus.subscribe("agent:#{id}:inbox")
+  # An id doubles as a `Registry` key and, from §7.1/§7.4, a path and git-branch component.
+  defp validate_id(id) do
+    if SessionId.valid?(id), do: :ok, else: {:error, {:invalid_session_id, id}}
+  end
 
-    # Conductors subscribe to their children's lifecycle topic
-    if role == :conductor do
-      Bus.subscribe("conductor:#{id}:children")
+  # `DynamicSupervisor` happily accepts duplicate child-spec ids, so the registry is the only
+  # real uniqueness guard. Failing loudly beats running unregistered — such an agent is alive
+  # but unreachable by `Orchestrator.lookup/1`, `send_session/2` and the TUI.
+  defp register_session(opts, id, title, role, parent_id, model) do
+    if Keyword.get(opts, :register, false) and Process.whereis(Athanor.AgentRegistry) do
+      case Registry.register(Athanor.AgentRegistry, id, %{
+             title: title,
+             role: role,
+             parent_id: parent_id,
+             model: model
+           }) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_registered, _pid}} -> {:error, {:duplicate_session_id, id}}
+      end
+    else
+      :ok
     end
-
-    session_id =
-      Keyword.get_lazy(opts, :session_id, fn ->
-        "ses_athanor_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
-      end)
-
-    default_llm_fn = fn messages, tools, caller_pid ->
-      LLM.stream(messages, tools, caller_pid, model: model, session_id: session_id)
-    end
-
-    state = %__MODULE__{
-      id: id,
-      title: title,
-      role: role,
-      parent_id: parent_id,
-      subscriber: Keyword.get(opts, :subscriber),
-      session_id: session_id,
-      model: model,
-      cd: cd,
-      max_turns: max_turns,
-      notify_parent_on_done: notify_parent,
-      llm_fn: Keyword.get(opts, :llm_fn, default_llm_fn),
-      messages: [%{role: "system", content: String.trim(system_prompt)}]
-    }
-
-    notify(state, {:session_started, snapshot_meta(state)})
-    {:ok, state}
   end
 
   @impl true
