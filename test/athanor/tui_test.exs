@@ -73,8 +73,15 @@ defmodule Athanor.TUITest do
       assert tui.theme.key == :dracula
 
       frame = TUI.render_frame(tui)
-      {r, g, b} = Athanor.Theme.colour!(tui.theme, :accent)
-      assert frame =~ "38;2;#{r};#{g};#{b}"
+
+      # Encoding-agnostic: the global theme mode may be 24-bit or 256-colour.
+      expected =
+        case Athanor.Theme.colour!(tui.theme, :accent) do
+          {r, g, b} -> "38;2;#{r};#{g};#{b}"
+          index -> "38;5;#{index}"
+        end
+
+      assert frame =~ expected
       assert frame =~ "theme: dracula"
     end
 

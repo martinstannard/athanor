@@ -3,7 +3,7 @@ defmodule Athanor.DaemonTest do
 
   alias Athanor.Daemon
 
-  test "attaches subscriber relay, hydrates sessions, and cleans up relay on client exit" do
+  test "attaches subscriber relay, relays deck events, and cleans up relay on client exit" do
     {:ok, main_id, sessions} =
       Daemon.ensure_main_conductor_and_hydrate(Node.self(), main_id: "conductor-daemon-test")
 
@@ -21,6 +21,11 @@ defmodule Athanor.DaemonTest do
           {:agent_event, "conductor-daemon-test", event} ->
             send(test_pid, {:client_received, event})
         end
+
+        # Stay alive until told to exit, so the relay's DOWN ordering is deterministic.
+        receive do
+          :die -> :ok
+        end
       end)
 
     assert_receive {:relay_started, relay_pid}
@@ -30,9 +35,10 @@ defmodule Athanor.DaemonTest do
     Athanor.Bus.publish_event("conductor-daemon-test", nil, {:status, :streaming})
     assert_receive {:client_received, {:status, :streaming}}
 
-    # When client_pid exits, relay_pid automatically stops monitoring/subscribing and terminates
+    # Monitor *before* the client exits: when client_pid dies, relay_pid must notice,
+    # unsubscribe, and terminate normally.
     ref = Process.monitor(relay_pid)
-    Process.exit(client_pid, :normal)
+    send(client_pid, :die)
     assert_receive {:DOWN, ^ref, :process, ^relay_pid, :normal}
   end
 
