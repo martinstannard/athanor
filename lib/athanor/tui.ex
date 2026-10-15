@@ -11,7 +11,7 @@ defmodule Athanor.TUI do
   - All events and commands flow through `Athanor.Bus` PubSub (`"deck:events"` and `"agent:<id>:inbox"`).
   """
 
-  alias Athanor.{Agent, Config, Daemon, Markdown}
+  alias Athanor.{Agent, Config, Daemon, Markdown, Theme}
   alias Termite.{Screen, Style, Terminal}
 
   defstruct [
@@ -19,6 +19,7 @@ defmodule Athanor.TUI do
     :daemon_node,
     :active_id,
     :model,
+    :theme,
     width: 80,
     height: 24,
     sessions: %{},
@@ -49,6 +50,7 @@ defmodule Athanor.TUI do
           daemon_node: node() | nil,
           active_id: String.t(),
           model: String.t(),
+          theme: Theme.t(),
           width: pos_integer(),
           height: pos_integer(),
           sessions: %{String.t() => session_view()},
@@ -75,7 +77,7 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, Tab to switch sessions."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, Tab to switch sessions."}
       ],
       streaming_buffer: nil
     }
@@ -85,6 +87,7 @@ defmodule Athanor.TUI do
       daemon_node: daemon_node,
       active_id: active_id,
       model: model,
+      theme: Theme.resolve(Keyword.get(opts, :theme)),
       width: Keyword.get(opts, :width, 80),
       height: Keyword.get(opts, :height, 24),
       sessions: %{active_id => initial_session},
@@ -191,6 +194,7 @@ defmodule Athanor.TUI do
         daemon_node: target_node,
         active_id: main_id,
         model: model,
+        theme: Keyword.get(opts, :theme),
         width: term.size.width,
         height: term.size.height,
         hydrated_sessions: hydrated_sessions
@@ -248,6 +252,9 @@ defmodule Athanor.TUI do
           {:cancel, tui} ->
             _ = Daemon.cancel_session(target_node, tui.active_id)
             loop(term, tui)
+
+          {:theme, name, tui} ->
+            loop(term, apply_theme(tui, name))
 
           {:cont, tui} ->
             loop(term, tui)
@@ -364,6 +371,7 @@ defmodule Athanor.TUI do
           | {:submit, String.t(), t()}
           | {:spawn_subagent, String.t(), String.t(), t()}
           | {:spawn_conductor, String.t(), t()}
+          | {:theme, String.t() | nil, t()}
           | {:cancel, t()}
           | {:cont, t()}
   # Ctrl+C (<<3>>), Ctrl+D (<<4>>), or Ctrl+Q (<<17>>) detaches/quits TUI client
@@ -406,6 +414,10 @@ defmodule Athanor.TUI do
     cond do
       trimmed in ["/quit", "/exit", "/detach"] ->
         {:quit, %{tui | input: ""}}
+
+      String.starts_with?(trimmed, "/theme") ->
+        rest = String.trim(String.replace_prefix(trimmed, "/theme", ""))
+        {:theme, if(rest == "", do: nil, else: rest), %{tui | input: ""}}
 
       String.starts_with?(trimmed, "/conductor ") ->
         title = String.trim(String.replace_prefix(trimmed, "/conductor ", ""))
@@ -476,7 +488,7 @@ defmodule Athanor.TUI do
 
     border_char =
       Style.ansi256()
-      |> Style.foreground(238)
+      |> Style.foreground(Theme.colour(tui.theme, :border))
       |> Style.render_to_string("│")
 
     middle_rows =
@@ -506,21 +518,27 @@ defmodule Athanor.TUI do
 
   defp render_header(tui, width) do
     session_count = map_size(tui.sessions)
-    left = " ⚗ ATHANOR │ model: #{tui.model} │ sessions: #{session_count}"
+    theme = tui.theme
+    left = " ⚗ ATHANOR │ model: #{tui.model} │ theme: #{theme.key} │ sessions: #{session_count}"
     right = "Tab: switch session "
     gap = max(1, width - String.length(left) - String.length(right))
     bar = String.slice(left <> String.duplicate(" ", gap) <> right, 0, width)
     padded = String.pad_trailing(bar, width)
 
     Style.ansi256()
-    |> Style.background(236)
-    |> Style.foreground(214)
+    |> Style.background(Theme.colour(theme, :surface))
+    |> Style.foreground(Theme.colour(theme, :accent))
     |> Style.bold()
     |> Style.render_to_string(padded)
   end
 
   defp render_sidebar(tui, sidebar_w, height) do
-    header_style = Style.ansi256() |> Style.foreground(244) |> Style.bold()
+    theme = tui.theme
+
+    header_style =
+      Style.ansi256()
+      |> Style.foreground(Theme.colour(theme, :muted))
+      |> Style.bold()
 
     header_line =
       Style.render_to_string(header_style, String.pad_trailing(" DECK SESSIONS", sidebar_w))
@@ -541,13 +559,18 @@ defmodule Athanor.TUI do
         style =
           cond do
             selected? ->
-              Style.ansi256() |> Style.background(237) |> Style.foreground(214) |> Style.bold()
+              Style.ansi256()
+              |> Style.background(Theme.colour(theme, :selection_bg))
+              |> Style.foreground(Theme.colour(theme, :selected_fg))
+              |> Style.bold()
 
             session.role == :conductor ->
-              Style.ansi256() |> Style.foreground(252) |> Style.bold()
+              Style.ansi256()
+              |> Style.foreground(Theme.colour(theme, :text))
+              |> Style.bold()
 
             true ->
-              Style.ansi256() |> Style.foreground(246)
+              Style.ansi256() |> Style.foreground(Theme.colour(theme, :muted))
           end
 
         Style.render_to_string(style, String.slice(padded, 0, sidebar_w))
@@ -591,26 +614,27 @@ defmodule Athanor.TUI do
 
   defp render_status_bar(tui, width) do
     status = active_status(tui)
+    theme = tui.theme
     active = Map.get(tui.sessions, tui.active_id)
     role_tag = if active && active.role == :conductor, do: "conductor", else: "sub-agent"
 
-    {status_label, fg_color} =
+    {status_label, colour} =
       case status do
-        :idle -> {"○ IDLE", 114}
-        :streaming -> {"● STREAMING… (Esc cancel)", 214}
-        :executing_tools -> {"● RUNNING TOOLS… (Esc cancel)", 81}
-        :error -> {"✕ ERROR", 203}
+        :idle -> {"○ IDLE", Theme.colour(theme, :success)}
+        :streaming -> {"● STREAMING… (Esc cancel)", Theme.colour(theme, :warning)}
+        :executing_tools -> {"● RUNNING TOOLS… (Esc cancel)", Theme.colour(theme, :info)}
+        :error -> {"✕ ERROR", Theme.colour(theme, :error)}
       end
 
     left = " #{status_label} │ [#{role_tag}] #{tui.active_id}"
-    right = "Tab: switch │ ↑/↓: scroll │ /quit "
+    right = "Tab: switch │ ↑/↓: scroll │ /theme │ /quit "
     gap = max(1, width - String.length(left) - String.length(right))
     bar = String.slice(left <> String.duplicate(" ", gap) <> right, 0, width)
     padded = String.pad_trailing(bar, width)
 
     Style.ansi256()
-    |> Style.background(235)
-    |> Style.foreground(fg_color)
+    |> Style.background(Theme.colour(theme, :surface))
+    |> Style.foreground(colour)
     |> Style.render_to_string(padded)
   end
 
@@ -628,7 +652,7 @@ defmodule Athanor.TUI do
 
     styled_prefix =
       Style.ansi256()
-      |> Style.foreground(214)
+      |> Style.foreground(Theme.colour(tui.theme, :accent))
       |> Style.bold()
       |> Style.render_to_string(prefix)
 
@@ -652,7 +676,7 @@ defmodule Athanor.TUI do
 
     wrapped_lines =
       Enum.flat_map(all_entries, fn entry ->
-        format_entry_lines(entry, max(10, width - 2))
+        format_entry_lines(entry, max(10, width - 2), tui.theme)
       end)
 
     total = length(wrapped_lines)
@@ -665,8 +689,9 @@ defmodule Athanor.TUI do
     visible ++ List.duplicate("", padding_count)
   end
 
-  defp format_entry_lines({:user, text}, max_w) do
-    style = Style.ansi256() |> Style.foreground(117) |> Style.bold()
+  defp format_entry_lines({:user, text}, max_w, theme) do
+    style =
+      Style.ansi256() |> Style.foreground(Theme.colour(theme, :user)) |> Style.bold()
 
     text
     |> wrap_text(max(5, max_w - 6))
@@ -678,13 +703,15 @@ defmodule Athanor.TUI do
     |> Kernel.++([""])
   end
 
-  defp format_entry_lines({:assistant, text}, max_w) do
-    label_style = Style.ansi256() |> Style.foreground(214) |> Style.bold()
+  defp format_entry_lines({:assistant, text}, max_w, theme) do
+    label_style =
+      Style.ansi256() |> Style.foreground(Theme.colour(theme, :assistant)) |> Style.bold()
+
     prefix = " " <> Style.render_to_string(label_style, "Athanor: ")
     indent = String.duplicate(" ", 10)
 
     text
-    |> Markdown.render(max(5, max_w - 10))
+    |> Markdown.render(max(5, max_w - 10), theme)
     |> Enum.with_index()
     |> Enum.map(fn
       {line, 0} -> prefix <> line
@@ -693,16 +720,17 @@ defmodule Athanor.TUI do
     |> Kernel.++([""])
   end
 
-  defp format_entry_lines({:tool, text}, max_w) do
-    style = Style.ansi256() |> Style.foreground(245)
+  defp format_entry_lines({:tool, text}, max_w, theme) do
+    style = Style.ansi256() |> Style.foreground(Theme.colour(theme, :tool))
 
     text
     |> wrap_text(max(5, max_w - 3))
     |> Enum.map(fn line -> "   " <> Style.render_to_string(style, line) end)
   end
 
-  defp format_entry_lines({:system, text}, max_w) do
-    style = Style.ansi256() |> Style.foreground(244) |> Style.italic()
+  defp format_entry_lines({:system, text}, max_w, theme) do
+    style =
+      Style.ansi256() |> Style.foreground(Theme.colour(theme, :system)) |> Style.italic()
 
     text
     |> wrap_text(max(5, max_w - 2))
@@ -710,8 +738,8 @@ defmodule Athanor.TUI do
     |> Kernel.++([""])
   end
 
-  defp format_entry_lines({:error, text}, max_w) do
-    style = Style.ansi256() |> Style.foreground(203) |> Style.bold()
+  defp format_entry_lines({:error, text}, max_w, theme) do
+    style = Style.ansi256() |> Style.foreground(Theme.colour(theme, :error)) |> Style.bold()
 
     ("Error: " <> text)
     |> wrap_text(max(5, max_w - 2))
@@ -757,6 +785,29 @@ defmodule Athanor.TUI do
       %{parent_id: parent_id} when is_binary(parent_id) -> parent_id
       _ -> tui.active_id
     end
+  end
+
+  @doc """
+  Applies a theme change from `/theme`. `nil` lists the available themes instead.
+  """
+  @spec apply_theme(t(), String.t() | nil) :: t()
+  def apply_theme(tui, nil) do
+    names = Theme.list() |> Enum.map_join(", ", fn {key, label, _} -> "#{key} (#{label})" end)
+    add_system(tui, "Themes: " <> names)
+  end
+
+  def apply_theme(tui, name) do
+    case Theme.fetch(name) do
+      {:ok, theme} ->
+        add_system(%{tui | theme: theme}, "Theme set to #{theme.label} (#{theme.key}).")
+
+      :error ->
+        add_system(tui, "Unknown theme: #{name} — use /theme to list them.")
+    end
+  end
+
+  defp add_system(tui, text) do
+    update_session(tui, tui.active_id, fn s -> %{s | entries: s.entries ++ [{:system, text}]} end)
   end
 
   defp ensure_session(tui, session_id, meta) do

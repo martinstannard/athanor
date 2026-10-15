@@ -2,17 +2,17 @@
 
 **Athanor** (named after the self-feeding alchemical furnace used for long-running digestions) is an Elixir-based AI agent harness and multi-agent orchestrator built on the BEAM.
 
-## Vision
+## Status
 
-1. **Phase 1: Core Agent Loop & TUI**
-   - A responsive, pure-Elixir terminal UI built with `Termite`.
-   - Streaming LLM completions and tool execution loop powered by OpenCode Go.
-   - Clean, fault-tolerant process architecture.
+Phases 1 (core agent loop & TUI), 2 (Conductors, Sub-Agents and the PubSub bus) and 3 (persistent
+daemon, remote attach and Markdown rendering) are **implemented**. See `docs/architecture.md` for the
+realised module structure and `docs/design.md` §7 for what is still planned.
 
-2. **Phase 2: Background Multi-Agent Orchestrator**
-   - OTP supervision trees managing concurrent, isolated agent processes.
-   - PubSub/message-passing coordination between parent and child agents.
-   - Live TUI inspection and steering of background agent workstreams.
+- A responsive, pure-Elixir terminal UI built with `Termite`.
+- Streaming LLM completions and a tool execution loop powered by OpenCode Go.
+- OTP supervision trees managing concurrent, isolated agent processes.
+- PubSub/message-passing coordination between parent Conductors and child Sub-Agents.
+- A persistent daemon node you can attach to and detach from local or SSH terminals.
 
 ## Getting Started
 
@@ -22,15 +22,51 @@ mix test
 mix athanor
 ```
 
+`mix athanor` attaches to the background daemon (`athanor_daemon@127.0.0.1`), auto-starting it if it
+is not already running. Manage it with `mix athanor.daemon --status` / `--stop` / `--restart`, or run
+fully in-process with `mix athanor --local`.
+
 To select a specific OpenCode Go model:
 
 ```bash
 mix athanor --model gemini-4-argon-contributor
 ```
 
+## Themes
+
+Athanor ships with 13 colour themes: `default` (the original palette, unchanged) plus 12 popular
+ones — `dracula`, `nord`, `gruvbox_dark`, `gruvbox_light`, `tokyo_night`, `catppuccin_mocha`,
+`one_dark`, `solarized_dark`, `solarized_light`, `monokai`, `everforest_dark`, `kanagawa`, and
+`github_light`.
+
+Pick one at launch, or switch live inside the TUI:
+
+```bash
+mix athanor --theme dracula
+ATHANOR_THEME="gruvbox dark" mix athanor
+```
+
+```text
+/theme            # list the available themes
+/theme nord       # restyle the whole deck, status bar, output and Markdown
+```
+
+Themes are declared as `#RRGGBB` palettes and rendered in 24-bit colour by default; set
+`config :athanor, theme_mode: :ansi256` (or `ATHANOR_THEME_MODE=ansi256`) to quantise to the
+xterm-256 palette for older terminals. Names are matched forgivingly, so `"gruvbox"`,
+`"Solarized Light"` and `"tokyo-night"` all resolve. Themes are a client-side concern, so an SSH
+client can pick a different theme from a local one while both watch the same daemon.
+
 ## Architecture
 
-- **`Athanor.Agent`** — GenServer holding conversation state, streaming responses, and executing tool calls.
+- **`Athanor.Agent`** — GenServer holding conversation state, streaming responses, and executing tool calls (for both Conductors and Sub-Agents).
+- **`Athanor.Orchestrator`** — Spawns, looks up, and steers supervised sessions.
+- **`Athanor.Bus`** — PubSub backbone over `Athanor.PubSub` (`"agent:<id>:inbox"`, `"agent:<id>:events"`, `"conductor:<id>:children"`, `"deck:events"`).
 - **`Athanor.LLM`** — Client for OpenCode Go chat completions and tool-calling streaming.
 - **`Athanor.Tools`** — Tool definitions and execution sandbox.
 - **`Athanor.TUI`** — Terminal user interface powered by `Termite`.
+- **`Athanor.Theme`** — Semantic colour roles and the built-in theme palettes.
+- **`Athanor.Markdown`** — Terminal Markdown renderer used by the TUI (theme-aware).
+- **`Athanor.Daemon`** — Persistent BEAM node plus attach/detach bridge for remote clients.
+
+See `docs/architecture.md` for the full supervision tree and message flow.

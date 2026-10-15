@@ -27,6 +27,7 @@ defmodule Athanor.Markdown do
   stops and ANSI escapes (which have zero display width) never skew layout.
   """
 
+  alias Athanor.Theme
   alias Termite.Style
 
   @type styled_line :: String.t()
@@ -35,17 +36,27 @@ defmodule Athanor.Markdown do
 
   @doc """
   Renders `text` as Markdown into a list of ANSI-styled lines, each wrapped to
-  at most `width` visible columns.
+  at most `width` visible columns, using the default theme.
   """
   @spec render(String.t(), pos_integer()) :: [styled_line()]
-  def render(text, width) when is_binary(text) and is_integer(width) and width > 0 do
+  def render(text, width) when is_binary(text) do
+    render(text, width, Theme.default())
+  end
+
+  @doc """
+  Renders `text` as Markdown using `theme` for all colours (headings, code,
+  links, tables, list markers, rules, and quotes).
+  """
+  @spec render(String.t(), pos_integer(), Theme.t()) :: [styled_line()]
+  def render(text, width, %Theme{} = theme)
+      when is_binary(text) and is_integer(width) and width > 0 do
     text
     |> String.replace("\r\n", "\n")
     |> String.replace("\r", "\n")
     |> String.replace("\t", "    ")
     |> String.split("\n")
     |> parse_blocks()
-    |> Enum.flat_map(&render_block(&1, width))
+    |> Enum.flat_map(&render_block(&1, width, theme))
   end
 
   # -- Block parsing ---------------------------------------------------------
@@ -172,57 +183,79 @@ defmodule Athanor.Markdown do
 
   # -- Block rendering -------------------------------------------------------
 
-  defp render_block({:code, lang, lines}, width) do
+  defp render_block({:code, lang, lines}, width, theme) do
     label =
       if String.trim(lang) == "" do
         []
       else
-        [" " <> Style.render_to_string(style(italic: true, fg: 244), String.trim(lang))]
+        [
+          " "
+          |> Kernel.<>(
+            Style.render_to_string(
+              style([{:fg, Theme.colour(theme, :muted)}, {:italic, true}]),
+              String.trim(lang)
+            )
+          )
+        ]
       end
 
-    label ++ Enum.flat_map(lines, &code_line(&1, width))
+    label ++ Enum.flat_map(lines, &code_line(&1, width, theme))
   end
 
-  defp render_block({:heading, level, text}, width) do
+  defp render_block({:heading, level, text}, width, theme) do
     text
     |> demark()
-    |> wrap_plain(max(1, width))
-    |> Enum.map(fn line -> Style.render_to_string(heading_style(level), line) end)
+    |> wrap_plain(max(1, width), theme)
+    |> Enum.map(fn line -> Style.render_to_string(heading_style(theme, level), line) end)
   end
 
-  defp render_block(:rule, width) do
-    [" " <> Style.render_to_string(style(fg: 238), String.duplicate("─", max(1, width - 2)))]
+  defp render_block(:rule, width, theme) do
+    [
+      " "
+      |> Kernel.<>(
+        Style.render_to_string(
+          style([{:fg, Theme.colour(theme, :border)}]),
+          String.duplicate("─", max(1, width - 2))
+        )
+      )
+    ]
   end
 
-  defp render_block({:quote, text}, width) do
-    bar = " " <> Style.render_to_string(style(fg: 244), "│ ")
-    wrap_inline(text, max(1, width - 3), bar, bar)
+  defp render_block({:quote, text}, width, theme) do
+    bar = " " <> Style.render_to_string(style([{:fg, Theme.colour(theme, :muted)}]), "│ ")
+    wrap_inline(text, max(1, width - 3), bar, bar, theme)
   end
 
-  defp render_block({:bullet, text}, width) do
-    marker = " " <> Style.render_to_string(style(fg: 214), "• ")
-    wrap_inline(text, max(1, width - 3), marker, "   ")
+  defp render_block({:bullet, text}, width, theme) do
+    marker = " " <> Style.render_to_string(style([{:fg, Theme.colour(theme, :bullet)}]), "• ")
+    wrap_inline(text, max(1, width - 3), marker, "   ", theme)
   end
 
-  defp render_block({:ordered, num, text}, width) do
-    marker = " " <> Style.render_to_string(style(fg: 214), String.pad_leading("#{num}. ", 4))
-    wrap_inline(text, max(1, width - 5), marker, "     ")
+  defp render_block({:ordered, num, text}, width, theme) do
+    marker =
+      " " <>
+        Style.render_to_string(
+          style([{:fg, Theme.colour(theme, :bullet)}]),
+          String.pad_leading("#{num}. ", 4)
+        )
+
+    wrap_inline(text, max(1, width - 5), marker, "     ", theme)
   end
 
-  defp render_block({:para, text}, width) do
+  defp render_block({:para, text}, width, theme) do
     if String.trim(text) == "" do
       [""]
     else
-      wrap_inline(text, max(1, width), "", "")
+      wrap_inline(text, max(1, width), "", "", theme)
     end
   end
 
-  defp render_block({:table, aligns, header, body}, width) do
-    render_table(aligns, header, body, max(1, width))
+  defp render_block({:table, aligns, header, body}, width, theme) do
+    render_table(aligns, header, body, max(1, width), theme)
   end
 
-  defp code_line(line, width) do
-    style = style(fg: 252, bg: 236)
+  defp code_line(line, width, theme) do
+    style = style([{:fg, Theme.colour(theme, :text)}, {:bg, Theme.colour(theme, :code_bg)}])
 
     case hard_chunks(line, max(1, width - 2)) do
       [] -> [Style.render_to_string(style, "  ")]
@@ -230,21 +263,21 @@ defmodule Athanor.Markdown do
     end
   end
 
-  defp wrap_inline(text, width, first_prefix, cont_prefix) do
+  defp wrap_inline(text, width, first_prefix, cont_prefix, theme) do
     text
     |> inline_spans()
     |> wrap_spans(width)
     |> Enum.with_index()
     |> Enum.map(fn {line, idx} ->
       prefix = if idx == 0, do: first_prefix, else: cont_prefix
-      prefix <> join_line(line)
+      prefix <> join_line(line, theme)
     end)
   end
 
-  defp wrap_plain(text, width) do
+  defp wrap_plain(text, width, theme) do
     [{text, :plain}]
     |> wrap_spans(width)
-    |> Enum.map(&join_line/1)
+    |> Enum.map(&join_line(&1, theme))
   end
 
   # -- Table rendering -------------------------------------------------------
@@ -257,7 +290,7 @@ defmodule Athanor.Markdown do
   # left intact. Cells then wrap within their column and rows grow to the height
   # of their tallest cell.
 
-  defp render_table(aligns, header, body, width) do
+  defp render_table(aligns, header, body, width, theme) do
     rows = [header | body]
     ncols = rows |> Enum.map(&length/1) |> Enum.max(fn -> 0 end)
 
@@ -268,16 +301,16 @@ defmodule Athanor.Markdown do
       [header | body] = Enum.map(rows, &normalize_row(&1, ncols))
       widths = column_widths([header | body], ncols, width)
 
-      border_style = style(fg: 238)
-      bold = style(bold: true)
-      muted = style(fg: 250)
+      border_style = style([{:fg, Theme.colour(theme, :border)}])
+      bold = Style.bold(Style.ansi256())
+      muted = style([{:fg, Theme.colour(theme, :table_cell)}])
 
       [
         table_border("┌", "┬", "┐", widths, border_style)
-        | table_row_lines(header, widths, aligns, bold)
+        | table_row_lines(header, widths, aligns, bold, theme)
       ] ++
         [table_border("├", "┼", "┤", widths, border_style)] ++
-        Enum.flat_map(body, &table_row_lines(&1, widths, aligns, muted)) ++
+        Enum.flat_map(body, &table_row_lines(&1, widths, aligns, muted, theme)) ++
         [table_border("└", "┴", "┘", widths, border_style)]
     end
   end
@@ -343,15 +376,15 @@ defmodule Athanor.Markdown do
     Style.render_to_string(border_style, left <> Enum.join(segments, mid) <> right)
   end
 
-  defp table_row_lines(cells, widths, aligns, fallback) do
+  defp table_row_lines(cells, widths, aligns, fallback, theme) do
     wrapped =
       cells
       |> Enum.zip(widths)
       |> Enum.zip(aligns)
-      |> Enum.map(fn {{cell, w}, align} -> {wrap_cell(cell, w, fallback), w, align} end)
+      |> Enum.map(fn {{cell, w}, align} -> {wrap_cell(cell, w, fallback, theme), w, align} end)
 
     height = wrapped |> Enum.map(fn {lines, _, _} -> length(lines) end) |> Enum.max(fn -> 1 end)
-    joint = Style.render_to_string(style(fg: 238), "│")
+    joint = Style.render_to_string(style([{:fg, Theme.colour(theme, :border)}]), "│")
 
     Enum.map(0..(height - 1), fn i ->
       body =
@@ -366,21 +399,23 @@ defmodule Athanor.Markdown do
   # Each cell line is kept as `{styled_text, visible_width}` so alignment is
   # computed on display width while inline styling (code, bold, …) survives.
   # Plain text is tinted with the row's fallback style; inline spans keep theirs.
-  defp wrap_cell(text, width, fallback) do
+  defp wrap_cell(text, width, fallback, theme) do
     case wrap_spans(inline_spans(text), max(1, width)) do
       [] ->
         [{"", 0}]
 
       lines ->
         Enum.map(lines, fn spans ->
-          styled = Enum.map_join(spans, "", &render_cell_span(&1, fallback))
+          styled = Enum.map_join(spans, "", &render_cell_span(&1, fallback, theme))
           {styled, line_width(spans)}
         end)
     end
   end
 
-  defp render_cell_span({seg, :plain}, fallback), do: Style.render_to_string(fallback, seg)
-  defp render_cell_span({seg, kind}, _fallback), do: paint(seg, kind)
+  defp render_cell_span({seg, :plain}, fallback, _theme),
+    do: Style.render_to_string(fallback, seg)
+
+  defp render_cell_span({seg, kind}, _fallback, theme), do: paint(seg, kind, theme)
 
   defp pad_cell({content, visible}, width, align) do
     deficit = max(0, width - visible)
@@ -531,7 +566,8 @@ defmodule Athanor.Markdown do
 
   defp line_width(segs), do: Enum.reduce(segs, 0, fn {s, _}, acc -> acc + String.length(s) end)
 
-  defp join_line(line), do: Enum.map_join(line, "", fn {seg, kind} -> paint(seg, kind) end)
+  defp join_line(line, theme),
+    do: Enum.map_join(line, "", fn {seg, kind} -> paint(seg, kind, theme) end)
 
   defp hard_chunks(str, width) do
     str |> String.graphemes() |> Enum.chunk_every(max(1, width)) |> Enum.map(&Enum.join/1)
@@ -539,20 +575,42 @@ defmodule Athanor.Markdown do
 
   # -- Styling ---------------------------------------------------------------
 
-  defp paint(text, :plain), do: text
-  defp paint(text, :bold), do: Style.render_to_string(style(bold: true), text)
-  defp paint(text, :italic), do: Style.render_to_string(style(italic: true), text)
-  defp paint(text, :code), do: Style.render_to_string(style(fg: 81, bg: 236), text)
-  defp paint(text, :strike), do: Style.render_to_string(style(faint: true, strike: true), text)
-  defp paint(text, :link), do: Style.render_to_string(style(fg: 75, underline: true), text)
-  defp paint(text, :link_url), do: Style.render_to_string(style(fg: 244), text)
+  defp paint(text, :plain, _theme), do: text
 
-  defp heading_style(1), do: style(bold: true, fg: 214)
-  defp heading_style(2), do: style(bold: true, fg: 220)
-  defp heading_style(3), do: style(bold: true, fg: 81)
-  defp heading_style(4), do: style(bold: true, fg: 141)
-  defp heading_style(5), do: style(bold: true, fg: 111)
-  defp heading_style(_level), do: style(bold: true, fg: 246)
+  # Bold/italic/scrike stay attribute-only so they inherit the terminal foreground
+  # (and so existing style assertions keep working).
+  defp paint(text, :bold, _theme), do: Style.render_to_string(style([{:bold, true}]), text)
+
+  defp paint(text, :italic, _theme), do: Style.render_to_string(style([{:italic, true}]), text)
+
+  defp paint(text, :code, theme),
+    do:
+      Style.render_to_string(
+        style([{:fg, Theme.colour(theme, :code_fg)}, {:bg, Theme.colour(theme, :code_bg)}]),
+        text
+      )
+
+  defp paint(text, :strike, _theme),
+    do: Style.render_to_string(style([{:faint, true}, {:strike, true}]), text)
+
+  defp paint(text, :link, theme),
+    do:
+      Style.render_to_string(
+        style([{:fg, Theme.colour(theme, :link)}, {:underline, true}]),
+        text
+      )
+
+  defp paint(text, :link_url, theme),
+    do: Style.render_to_string(style([{:fg, Theme.colour(theme, :link_url)}]), text)
+
+  defp heading_style(theme, 1), do: style([{:bold, true}, {:fg, Theme.colour(theme, :heading_1)}])
+  defp heading_style(theme, 2), do: style([{:bold, true}, {:fg, Theme.colour(theme, :heading_2)}])
+  defp heading_style(theme, 3), do: style([{:bold, true}, {:fg, Theme.colour(theme, :heading_3)}])
+  defp heading_style(theme, 4), do: style([{:bold, true}, {:fg, Theme.colour(theme, :heading_4)}])
+  defp heading_style(theme, 5), do: style([{:bold, true}, {:fg, Theme.colour(theme, :heading_5)}])
+
+  defp heading_style(theme, _level),
+    do: style([{:bold, true}, {:fg, Theme.colour(theme, :heading_6)}])
 
   defp demark(text) do
     text

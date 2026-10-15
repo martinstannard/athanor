@@ -34,6 +34,50 @@ defmodule Athanor.TUITest do
       assert {:cancel, _} = TUI.handle_key(tui, "\e")
     end
 
+    test "switches themes with /theme and lists them with a bare /theme" do
+      tui = TUI.new()
+      original = tui.theme.key
+
+      typed = elem(TUI.handle_key(tui, "/theme dracula"), 1)
+      {:theme, "dracula", cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      typed = elem(TUI.handle_key(tui, "/theme"), 1)
+      {:theme, nil, _} = TUI.handle_key(typed, "\r")
+
+      listed = TUI.apply_theme(tui, nil)
+      entries = listed.sessions["conductor-main"].entries
+
+      assert Enum.any?(entries, fn
+               {:system, msg} -> msg =~ "Themes:"
+               _ -> false
+             end)
+
+      applied = TUI.apply_theme(tui, "nord")
+      assert applied.theme.key == :nord
+
+      unknown = TUI.apply_theme(tui, "not-a-theme")
+      assert unknown.theme.key == original
+
+      assert Enum.any?(
+               unknown.sessions["conductor-main"].entries,
+               fn
+                 {:system, msg} -> msg =~ "Unknown theme"
+                 _ -> false
+               end
+             )
+    end
+
+    test "renders with a selected theme's colours" do
+      tui = TUI.new(theme: "dracula", width: 100, height: 24)
+      assert tui.theme.key == :dracula
+
+      frame = TUI.render_frame(tui)
+      {r, g, b} = Athanor.Theme.colour!(tui.theme, :accent)
+      assert frame =~ "38;2;#{r};#{g};#{b}"
+      assert frame =~ "theme: dracula"
+    end
+
     test "cycles between conductor and sub-agents on Tab and supports /spawn and /conductor" do
       tui =
         TUI.new()

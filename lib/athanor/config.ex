@@ -5,6 +5,7 @@ defmodule Athanor.Config do
 
   @default_base_url "https://opencode.ai/zen/go/v1"
   @default_model "deepseek-v4.1-flash"
+  @default_theme :default
   @opencode_auth_path "~/.local/share/opencode/auth.json"
 
   @doc """
@@ -27,6 +28,38 @@ defmodule Athanor.Config do
         Application.get_env(:athanor, :model, @default_model)
 
     String.replace_prefix(raw, "opencode-go/", "")
+  end
+
+  @doc """
+  Returns the configured TUI theme name, resolved from:
+  1. `ATHANOR_THEME` environment variable
+  2. `:athanor, :theme` application config
+  3. `:default`
+  """
+  @spec theme() :: atom() | String.t()
+  def theme do
+    System.get_env("ATHANOR_THEME") ||
+      Application.get_env(:athanor, :theme, @default_theme)
+  end
+
+  @doc """
+  Returns the colour encoding for themes:
+
+    * `:truecolor` (default) — 24-bit RGB
+    * `:ansi256` — quantised to the xterm-256 palette
+
+  Resolved from `ATHANOR_THEME_MODE`, then `:athanor, :theme_mode`.
+  """
+  @spec theme_mode() :: :truecolor | :ansi256
+  def theme_mode do
+    raw =
+      System.get_env("ATHANOR_THEME_MODE") ||
+        Application.get_env(:athanor, :theme_mode, :truecolor)
+
+    case to_string(raw) do
+      "ansi256" -> :ansi256
+      _ -> :truecolor
+    end
   end
 
   @doc """

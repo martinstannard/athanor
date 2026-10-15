@@ -17,8 +17,8 @@ defmodule Mix.Tasks.Athanor do
 
     {opts, _rest, _invalid} =
       OptionParser.parse(args,
-        strict: [model: :string, local: :boolean, restart: :boolean],
-        aliases: [m: :model, r: :restart]
+        strict: [model: :string, local: :boolean, restart: :boolean, theme: :string],
+        aliases: [m: :model, r: :restart, t: :theme]
       )
 
     if Keyword.get(opts, :restart, false) do
