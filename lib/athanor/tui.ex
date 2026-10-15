@@ -166,14 +166,16 @@ defmodule Athanor.TUI do
     model = Keyword.get(opts, :model, Config.model())
     local? = Keyword.get(opts, :local, false)
 
-    target_node =
-      if local? do
-        Node.self()
-      else
-        case Daemon.connect_or_start_daemon(opts) do
-          {:ok, daemon} -> daemon
-          {:error, _reason} -> Node.self()
-        end
+    {target_node, mode} =
+      cond do
+        local? ->
+          {Node.self(), :local}
+
+        true ->
+          case Daemon.connect_or_start_daemon(opts) do
+            {:ok, daemon} -> {daemon, :daemon}
+            {:error, reason} -> {Node.self(), {:local_fallback, reason}}
+          end
       end
 
     {:ok, relay_pid} = Daemon.attach_subscriber(target_node, self())
@@ -199,6 +201,7 @@ defmodule Athanor.TUI do
         height: term.size.height,
         hydrated_sessions: hydrated_sessions
       )
+      |> add_system(mode_banner(mode, target_node))
 
     try do
       loop(term, tui)
@@ -809,6 +812,25 @@ defmodule Athanor.TUI do
   defp add_system(tui, text) do
     update_session(tui, tui.active_id, fn s -> %{s | entries: s.entries ++ [{:system, text}]} end)
   end
+
+  defp mode_banner(:daemon, node) do
+    "Attached to the Athanor daemon (#{node}). Ctrl+Q / /detach leaves it running."
+  end
+
+  defp mode_banner(:local, _node) do
+    "Stand-alone mode (no daemon). Agents stop when you quit."
+  end
+
+  defp mode_banner({:local_fallback, reason}, _node) do
+    "Daemon unavailable (#{describe_daemon_error(reason)}) — running stand-alone; " <>
+      "agents stop when you quit. Fix with `mix athanor.daemon --restart`."
+  end
+
+  defp describe_daemon_error({:incompatible_daemon, node}),
+    do: "#{node} is running an older Athanor build"
+
+  defp describe_daemon_error(:daemon_start_timeout), do: "daemon did not start in time"
+  defp describe_daemon_error(other), do: inspect(other)
 
   defp ensure_session(tui, session_id, meta) do
     existing =

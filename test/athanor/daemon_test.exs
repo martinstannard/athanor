@@ -36,6 +36,28 @@ defmodule Athanor.DaemonTest do
     assert_receive {:DOWN, ^ref, :process, ^relay_pid, :normal}
   end
 
+  test "build_marker/0 identifies this build" do
+    assert is_binary(Daemon.build_marker())
+    assert Daemon.build_marker() == Daemon.build_marker()
+  end
+
+  test "usable?/1 is true for this node and false for an unreachable one" do
+    assert Daemon.usable?(Node.self())
+    refute Daemon.usable?(:"athanor_no_such_node@127.0.0.1")
+  end
+
+  test "attach_subscriber/2 short-circuits locally instead of calling :erpc" do
+    {:ok, relay} = Daemon.attach_subscriber(Node.self(), self())
+
+    assert is_pid(relay)
+    assert Process.alive?(relay), "local attach must return a local, alive pid"
+
+    Athanor.Bus.publish_event("conductor-local-attach", nil, {:status, :streaming})
+    assert_receive {:agent_event, "conductor-local-attach", {:status, :streaming}}
+
+    send(relay, :detach)
+  end
+
   test "converts historical session messages into TUI entries" do
     messages = [
       %{role: "system", content: "sys"},

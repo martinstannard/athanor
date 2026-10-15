@@ -55,10 +55,43 @@ defmodule Athanor.Daemon do
     end
   end
 
+  @build_marker "athanor-0.1.0"
+
+  @doc """
+  A marker identifying this Athanor build, used to reject attaching to a daemon
+  running an older/incompatible release (which would otherwise fail with a cryptic
+  `:undef` when a newer RPC calls into a module it has never loaded).
+  """
+  @spec build_marker() :: String.t()
+  def build_marker, do: @build_marker
+
+  @doc """
+  True when `node` is reachable over distribution *and* runs a compatible Athanor
+  build. Uses `:erlang.node/0` (a BIF present on every node) to test connectivity
+  first, so a reachable non-Athanor node is reported as incompatible rather than
+  crashing.
+  """
+  @spec usable?(node()) :: boolean()
+  def usable?(node) do
+    node == Node.self() or
+      (Node.connect(node) == true and
+         try do
+           :erpc.call(node, :erlang, :node, [], 5_000) == node and
+             :erpc.call(node, __MODULE__, :build_marker, [], 5_000) == @build_marker
+         rescue
+           _ -> false
+         catch
+           _, _ -> false
+         end)
+  end
+
   @doc """
   Starts Distributed Erlang as a lightweight TUI client node and connects to `target_node`.
-  If `auto_start: true` (default) and the daemon is not yet running, spawns a detached
-  background daemon process and waits for it to come online.
+
+  If the daemon is not running and `auto_start: true` (the default), a detached
+  background daemon is spawned and awaited. If a daemon *is* reachable but runs an
+  incompatible build, returns `{:error, {:incompatible_daemon, target}}` instead of
+  connecting — restart it with `mix athanor.daemon --restart`.
   """
   @spec connect_or_start_daemon(keyword()) :: {:ok, node()} | {:error, term()}
   def connect_or_start_daemon(opts \\ []) do
@@ -77,12 +110,21 @@ defmodule Athanor.Daemon do
         Node.self() == target ->
           {:ok, target}
 
-        Node.connect(target) == true ->
+        usable?(target) ->
           {:ok, target}
+
+        Node.connect(target) == true ->
+          # Reachable but not a compatible Athanor daemon (stale build or a
+          # different application squatting the node name).
+          {:error, {:incompatible_daemon, target}}
 
         auto_start? ->
           spawn_detached_daemon(target)
-          wait_for_daemon(target, Keyword.get(opts, :timeout, 10_000))
+
+          case wait_for_daemon(target, Keyword.get(opts, :timeout, 15_000)) do
+            {:ok, ^target} = ok -> ok
+            other -> other
+          end
 
         true ->
           {:error, :daemon_unreachable}
@@ -100,10 +142,7 @@ defmodule Athanor.Daemon do
   @spec attach_subscriber(node(), pid()) :: {:ok, pid()}
   def attach_subscriber(target_node \\ Node.self(), client_pid \\ self())
       when is_atom(target_node) and is_pid(client_pid) do
-    relay_pid =
-      :erpc.call(target_node, __MODULE__, :start_remote_relay, [client_pid])
-
-    {:ok, relay_pid}
+    {:ok, rpc(target_node, __MODULE__, :start_remote_relay, [client_pid])}
   end
 
   @doc """
@@ -156,10 +195,10 @@ defmodule Athanor.Daemon do
   """
   @spec fetch_full_sessions(node()) :: [map()]
   def fetch_full_sessions(target_node \\ Node.self()) do
-    sessions = :erpc.call(target_node, Orchestrator, :list_sessions, [])
+    sessions = rpc(target_node, Orchestrator, :list_sessions, [])
 
     Enum.map(sessions, fn s ->
-      case :erpc.call(target_node, Orchestrator, :session_output, [s.id]) do
+      case rpc(target_node, Orchestrator, :session_output, [s.id]) do
         {:ok, full} -> Map.merge(s, full)
         _ -> Map.put(s, :messages, [])
       end
@@ -176,7 +215,7 @@ defmodule Athanor.Daemon do
     main_id = Keyword.get(opts, :main_id, "conductor-main")
     model = Keyword.get(opts, :model)
 
-    case :erpc.call(target_node, Orchestrator, :lookup, [main_id]) do
+    case rpc(target_node, Orchestrator, :lookup, [main_id]) do
       {:ok, _pid} ->
         :ok
 
@@ -185,7 +224,7 @@ defmodule Athanor.Daemon do
           [id: main_id, title: main_id]
           |> then(fn base -> if model, do: Keyword.put(base, :model, model), else: base end)
 
-        {:ok, _, _} = :erpc.call(target_node, Orchestrator, :start_conductor, [start_opts])
+        {:ok, _, _} = rpc(target_node, Orchestrator, :start_conductor, [start_opts])
     end
 
     {:ok, main_id, fetch_full_sessions(target_node)}
@@ -225,30 +264,44 @@ defmodule Athanor.Daemon do
     end)
   end
 
-  # Remote-aware Orchestrator RPC wrappers
+  # Remote-aware Orchestrator RPC wrappers.
+  #
+  # Every wrapper goes through `rpc/4`, which short-circuits to a direct local call
+  # when the target is this node. That matters for two reasons: (1) it avoids a
+  # pointless round-trip through the distribution layer in `--local` mode, and
+  # (2) `:erpc.call/5` to a node that has never loaded the module raises a bare
+  # `:undef` — a direct call can never do that.
 
   @spec send_session(node(), String.t(), String.t()) :: :ok | {:error, :not_found}
   def send_session(target_node, session_id, prompt) do
-    :erpc.call(target_node, Orchestrator, :send_session, [session_id, prompt])
+    rpc(target_node, Orchestrator, :send_session, [session_id, prompt])
   end
 
   @spec cancel_session(node(), String.t()) :: :ok | {:error, :not_found}
   def cancel_session(target_node, session_id) do
-    :erpc.call(target_node, Orchestrator, :cancel_session, [session_id])
+    rpc(target_node, Orchestrator, :cancel_session, [session_id])
   end
 
   @spec launch_subagent(node(), String.t(), String.t(), String.t(), keyword()) ::
           {:ok, String.t(), pid()} | {:error, term()}
   def launch_subagent(target_node, parent_id, title, prompt, opts \\ []) do
-    :erpc.call(target_node, Orchestrator, :launch_subagent, [parent_id, title, prompt, opts])
+    rpc(target_node, Orchestrator, :launch_subagent, [parent_id, title, prompt, opts])
   end
 
   @spec start_conductor(node(), keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def start_conductor(target_node, opts \\ []) do
-    :erpc.call(target_node, Orchestrator, :start_conductor, [opts])
+    rpc(target_node, Orchestrator, :start_conductor, [opts])
   end
 
   # Internal Node / Daemon Helpers
+
+  defp rpc(node, module, function, args) do
+    if node == Node.self() do
+      apply(module, function, args)
+    else
+      :erpc.call(node, module, function, args)
+    end
+  end
 
   defp ensure_epmd do
     _ = System.cmd("epmd", ["-daemon"], stderr_to_stdout: true)
@@ -276,12 +329,14 @@ defmodule Athanor.Daemon do
 
     Port.open({:spawn_executable, elixir_bin}, [
       :binary,
+      :hide,
       args: [
+        "--erl",
+        "-detached",
         "--name",
         node_str,
         "--cookie",
         cookie_str,
-        "--detached",
         "-S",
         "mix",
         "run",
@@ -297,15 +352,20 @@ defmodule Athanor.Daemon do
   end
 
   defp do_wait_for_daemon(target_node, deadline) do
-    if Node.connect(target_node) == true do
-      {:ok, target_node}
-    else
-      if System.monotonic_time(:millisecond) >= deadline do
-        {:error, :daemon_start_timeout}
-      else
-        Process.sleep(100)
+    cond do
+      usable?(target_node) ->
+        {:ok, target_node}
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        if Node.connect(target_node) == true do
+          {:error, {:incompatible_daemon, target_node}}
+        else
+          {:error, :daemon_start_timeout}
+        end
+
+      true ->
+        Process.sleep(150)
         do_wait_for_daemon(target_node, deadline)
-      end
     end
   end
 end

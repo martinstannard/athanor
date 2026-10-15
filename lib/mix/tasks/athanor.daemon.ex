@@ -73,6 +73,18 @@ defmodule Mix.Tasks.Athanor.Daemon do
         {:ok, main_id, _} = Daemon.ensure_main_conductor_and_hydrate(target, opts)
         Mix.shell().info("Restarted Athanor daemon at #{target} (main conductor: #{main_id}).")
 
+      {:error, {:incompatible_daemon, node}} ->
+        Mix.raise(
+          "#{node} is still running an older Athanor build and could not be stopped.\n" <>
+            "Kill it manually (e.g. `epmd -names` to find it, then `pkill -f #{node}`) and retry."
+        )
+
+      {:error, :daemon_start_timeout} ->
+        Mix.raise(
+          "Athanor daemon did not come online within the timeout.\n" <>
+            "Start it in the foreground to see the error: `mix athanor.daemon`"
+        )
+
       {:error, reason} ->
         Mix.raise("Failed to restart Athanor daemon: #{inspect(reason)}")
     end
@@ -93,10 +105,20 @@ defmodule Mix.Tasks.Athanor.Daemon do
   end
 
   defp run_foreground_daemon(opts) do
-    {:ok, node_name} = Daemon.start_as_daemon()
-    Mix.Task.run("app.start")
-    {:ok, main_id, _} = Daemon.ensure_main_conductor_and_hydrate(node_name, opts)
-    Mix.shell().info("Athanor daemon running on #{node_name} (main conductor: #{main_id})")
-    Process.sleep(:infinity)
+    case Daemon.start_as_daemon() do
+      {:ok, node_name} ->
+        Mix.Task.run("app.start")
+        {:ok, main_id, _} = Daemon.ensure_main_conductor_and_hydrate(node_name, opts)
+        Mix.shell().info("Athanor daemon running on #{node_name} (main conductor: #{main_id})")
+
+        Mix.shell().info(
+          "Attach from any terminal with `mix athanor`. Ctrl+C here stops the daemon."
+        )
+
+        Process.sleep(:infinity)
+
+      {:error, reason} ->
+        Mix.raise("Could not start the Athanor daemon node: #{inspect(reason)}")
+    end
   end
 end
