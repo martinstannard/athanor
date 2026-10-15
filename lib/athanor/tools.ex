@@ -10,6 +10,7 @@ defmodule Athanor.Tools do
   """
 
   alias Athanor.{Bus, Orchestrator}
+  alias Athanor.Tools.{Glob, Grep}
 
   @default_bash_timeout_ms 30_000
   @default_subagent_wait_timeout_ms 120_000
@@ -111,6 +112,73 @@ defmodule Athanor.Tools do
               }
             },
             "required" => ["command"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "glob",
+          "description" =>
+            "Find files by glob pattern (e.g. \"lib/**/*.ex\") under the session's working directory. " <>
+              "Returns matching paths relative to the search root, one per line. Never spawns a shell and " <>
+              "respects .gitignore and built-in ignores (.git, _build, deps, node_modules).",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "pattern" => %{
+                "type" => "string",
+                "description" => "Glob pattern (`*`, `?`, `**`, `{a,b}`), relative to `path`."
+              },
+              "path" => %{
+                "type" => "string",
+                "description" =>
+                  "Directory to search, relative to the session cd. Defaults to the session cd."
+              },
+              "max_results" => %{
+                "type" => "integer",
+                "description" => "Maximum number of paths to return. Defaults to 200."
+              }
+            },
+            "required" => ["pattern"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "grep",
+          "description" =>
+            "Search file contents with a regular expression and return matches as `path:line:content`. " <>
+              "Never spawns a shell and respects .gitignore and built-in ignores.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "pattern" => %{
+                "type" => "string",
+                "description" => "Elixir-compatible (PCRE) regular expression."
+              },
+              "path" => %{
+                "type" => "string",
+                "description" =>
+                  "File or directory to search, relative to the session cd. Defaults to the session cd."
+              },
+              "glob" => %{
+                "type" => "string",
+                "description" =>
+                  "Optional glob restricting which files are searched (e.g. \"**/*.ex\")."
+              },
+              "ignore" => %{
+                "type" => "array",
+                "items" => %{"type" => "string"},
+                "description" => "Additional glob patterns to skip."
+              },
+              "max_results" => %{
+                "type" => "integer",
+                "description" => "Maximum number of matching lines to return. Defaults to 200."
+              }
+            },
+            "required" => ["pattern"]
           }
         }
       }
@@ -299,6 +367,9 @@ defmodule Athanor.Tools do
     end
   end
 
+  def execute("glob", args, opts) when is_map(args), do: Glob.run(args, opts)
+  def execute("grep", args, opts) when is_map(args), do: Grep.run(args, opts)
+
   def execute("launch_subagent", %{"title" => title, "prompt" => prompt} = args, opts)
       when is_binary(title) and is_binary(prompt) do
     parent_id = Keyword.get(opts, :session_id, "conductor-main")
@@ -388,6 +459,8 @@ defmodule Athanor.Tools do
              "write_file",
              "edit_file",
              "bash",
+             "glob",
+             "grep",
              "launch_subagent",
              "list_sessions",
              "session_output",
@@ -413,7 +486,12 @@ defmodule Athanor.Tools do
     end
   end
 
-  defp resolve_path(path, opts) do
+  @doc """
+  Resolves `path` against the session's working directory (`opts[:cd]`, defaulting to the
+  current directory). Shared by the file and search tools so every tool roots itself the same way.
+  """
+  @spec resolve_path(String.t(), keyword()) :: String.t()
+  def resolve_path(path, opts \\ []) do
     base = Keyword.get(opts, :cd, File.cwd!())
     Path.expand(path, base)
   end

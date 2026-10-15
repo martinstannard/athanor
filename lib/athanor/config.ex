@@ -6,6 +6,17 @@ defmodule Athanor.Config do
   @default_base_url "https://opencode.ai/zen/go/v1"
   @default_model "deepseek-v4.1-flash"
   @default_theme :default
+  @default_search_max_results 200
+  @default_search_max_file_bytes 1_048_576
+  @default_search_ignores [
+    ".git",
+    "_build",
+    "deps",
+    "node_modules",
+    "cover",
+    ".elixir_ls",
+    ".athanor"
+  ]
   @opencode_auth_path "~/.local/share/opencode/auth.json"
 
   @doc """
@@ -40,6 +51,57 @@ defmodule Athanor.Config do
   def theme do
     System.get_env("ATHANOR_THEME") ||
       Application.get_env(:athanor, :theme, @default_theme)
+  end
+
+  @doc """
+  Maximum number of results returned by `glob`/`grep` (default #{@default_search_max_results}).
+  """
+  @spec search_max_results() :: pos_integer()
+  def search_max_results do
+    positive_int("ATHANOR_SEARCH_MAX_RESULTS", :search_max_results, @default_search_max_results)
+  end
+
+  @doc """
+  Maximum file size, in bytes, that `grep` will read (default #{@default_search_max_file_bytes}).
+  """
+  @spec search_max_file_bytes() :: pos_integer()
+  def search_max_file_bytes do
+    positive_int(
+      "ATHANOR_SEARCH_MAX_FILE_BYTES",
+      :search_max_file_bytes,
+      @default_search_max_file_bytes
+    )
+  end
+
+  @doc """
+  Directory names that `glob`/`grep` never descend into.
+
+  Overridable via `ATHANOR_SEARCH_IGNORES` (comma-separated) or `:athanor, :search_ignores`.
+  """
+  @spec search_ignores() :: [String.t()]
+  def search_ignores do
+    case System.get_env("ATHANOR_SEARCH_IGNORES") do
+      nil ->
+        Application.get_env(:athanor, :search_ignores, @default_search_ignores)
+
+      "" ->
+        @default_search_ignores
+
+      csv ->
+        csv
+        |> String.split(",")
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+    end
+  end
+
+  defp positive_int(env, key, default) do
+    raw = System.get_env(env) || Application.get_env(:athanor, key, default)
+
+    case Integer.parse(to_string(raw)) do
+      {value, _rest} when value > 0 -> value
+      _ -> default
+    end
   end
 
   @doc """
