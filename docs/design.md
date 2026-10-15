@@ -132,24 +132,51 @@ Built with `Termite` in raw alternate-screen mode:
 
 ---
 
-## 6. Roadmap & Future Phases
+## 6. Roadmap & Completed Phases
 
 ### Phase 1: Core Single-Agent Loop & TUI (Complete)
 - OpenCode Go SSE streaming client (`Athanor.LLM`) with `x-opencode-session` routing and automatic `~/.local/share/opencode/auth.json` credential discovery.
 - Core workspace tools (`read_file`, `write_file`, `edit_file`, `bash`).
 - Single-agent `GenServer` state machine and `Termite` TUI.
 
-### Phase 2: Conductors, Sub-Agents & PubSub Bus (In Progress)
+### Phase 2: Conductors, Sub-Agents & PubSub Bus (Complete)
 - `Athanor.Bus` PubSub backbone (`"agent:<id>:inbox"`, `"conductor:<id>:children"`, `"deck:events"`).
 - Conductor & Sub-Agent hierarchy in `Athanor.Orchestrator` with completion sentinel parsing (`===ATHANOR_DONE===`) and automatic parent wakeups.
 - Conductor orchestration tools (`launch_subagent`, `list_sessions`, `session_output`, `send_session`).
 - Split-pane `agent-deck`-style TUI with live session tree sidebar and `Tab` switching.
 
-### Phase 3: Worktrees, Goal Verifiers & Watchers (Planned)
-- **Git Worktree Isolation (`Athanor.Worktree`)**: Spawn sub-agents in isolated git worktrees (`--worktree <branch>`) so parallel workers never conflict on the working tree.
-- **Goal-Driven Autonomy & Trust-but-Verify (`Athanor.Goal`)**:
-  - Separate **Worker** (takes bounded steps), **Verifier** (runs deterministic shell done-conditions or independent peer verification sessions), and **Manager** (periodic heartbeat process that checks verifier exit codes and nudges stalled workers).
-- **Inbound Watchers & Channels (`Athanor.Watcher`)**:
-  - Webhook, GitHub event, Slack/Telegram, and timer/heartbeat adapters that publish inbound events directly to a Conductor's `"agent:<id>:inbox"` PubSub topic.
-- **Session Persistence**:
-  - Persist session transcripts, `state.json`, and `task-log.md` to disk so Conductors and Sub-Agents survive VM restarts.
+---
+
+## 7. Future Plans
+
+### 7.1 Git Worktree Isolation (`Athanor.Worktree`)
+- When a Conductor spawns multiple coding sub-agents in parallel, editing the same working directory causes git index and file conflicts.
+- `launch_subagent` will accept `worktree: "feature/branch-name"`, automatically running `git worktree add` into `.athanor/worktrees/<session_id>` and setting the sub-agent's `cd` to that isolated worktree.
+- Provide worktree lifecycle commands (`list_worktrees`, `cleanup_worktrees`) to prune merged or orphaned worktrees once the Conductor verifies the work.
+
+### 7.2 Goal-Driven Autonomy & "Trust-but-Verify" (`Athanor.Goal`)
+Inspired by `agent-deck`'s three-entity Goal architecture, Athanor will separate **doing**, **verifying**, and **managing** into distinct BEAM processes:
+1. **Worker (`Athanor.Agent`, `role: :worker`)**: Takes bounded steps toward a goal and writes progress receipts, but **cannot** declare its own goal closed.
+2. **Verifier (`Athanor.Verifier`)**: Runs deterministic ground-truth checks—either a shell command (`mix test`, `gh pr view ...`) or an independent peer `Athanor.Agent` session (`parent_id: nil`) that re-derives completion claims from scratch without sharing the worker's context or blind spots.
+3. **Goal Manager (`Athanor.GoalManager` GenServer)**: Periodically wakes on a timer, runs the Verifier, nudges the Worker over PubSub (`"agent:<id>:inbox"`) if progress stalls, and escalates to the Conductor/user after `max_nudges`.
+
+### 7.3 Watchers & External Channels (`Athanor.Watcher`)
+Event-driven OTP GenServers ("doorbells, not messengers") that listen for external events and route notifications into a Conductor's PubSub inbox:
+- **Heartbeat / Cron Watcher**: Sends scheduled wakeup nudges to a Conductor for periodic health checks or backlog triage.
+- **GitHub / CI Watcher**: Polls or receives webhooks for PR review comments and CI failures, waking the responsible Conductor to spawn a fix worker.
+- **Remote Chat Channels (Telegram / Slack / Discord)**: Pairs 1-to-1 with a specific Conductor via PubSub so you can message your Conductor and receive escalations from your phone.
+
+### 7.4 Durable Session Persistence & Context Compaction
+- **On-Disk State (`~/.athanor/sessions/<id>/`)**:
+  - Persist `messages.jsonl`, `meta.json`, `task-log.md`, and `LEARNINGS.md` on every turn transition so Conductors and Sub-Agents can be resumed across VM restarts.
+- **Context Compaction**:
+  - When a long-running Conductor approaches its context window limit, automatically summarize older turns into a compact handoff block while preserving pinned state (`task-log.md`).
+
+### 7.5 Richer Codebase & MCP Tooling
+- **Built-in `glob` and `grep` tools**: Fast file discovery and regex search without shelling out to `bash`.
+- **Tool Guard & Prelude-Read Enforcement**: Track read files per session and require `read_file` before `edit_file` / `write_file` on existing files to prevent blind overwrites.
+- **MCP Client (`Athanor.MCP`)**: Attach stdio or SSE Model Context Protocol servers (e.g., Linear, Datadog, Postgres, Exa) per Conductor or Sub-Agent profile.
+
+### 7.6 Distributed BEAM Clustering
+- Because `Athanor.Bus` and `Athanor.Agent` use standard Erlang message passing, multiple Athanor nodes across machines (e.g., `host-a`, `host-b`, `host-c`) can join an Erlang cluster (`Node.connect/1`) and supervise/inspect sub-agents running on remote hosts from a single TUI.
+
