@@ -46,6 +46,7 @@ defmodule Athanor.LLM do
         }
         |> maybe_put_tools(tools)
 
+      session_id = Keyword.get(opts, :session_id, default_session_id())
       initial_acc = new_stream_state()
 
       req_opts = [
@@ -54,7 +55,8 @@ defmodule Athanor.LLM do
         auth: {:bearer, api_key},
         headers: [
           {"content-type", "application/json"},
-          {"accept", "text/event-stream"}
+          {"accept", "text/event-stream"},
+          {"x-opencode-session", session_id}
         ],
         body: JSON.encode!(body),
         receive_timeout: Keyword.get(opts, :receive_timeout, 120_000),
@@ -74,9 +76,19 @@ defmodule Athanor.LLM do
 
           {:ok, finalize_message(final_acc)}
 
-        {:ok, %Req.Response{status: status, body: resp_body} = resp} ->
-          acc = Map.get(resp.private, :sse_acc, initial_acc)
-          err_text = if acc.raw_error != "", do: acc.raw_error, else: inspect(resp_body)
+        {:ok, %Req.Response{status: status} = resp} ->
+          final_acc =
+            resp.private
+            |> Map.get(:sse_acc, initial_acc)
+            |> flush_buffer(caller_pid)
+
+          err_text =
+            cond do
+              final_acc.raw_error != "" -> String.trim(final_acc.raw_error)
+              is_binary(resp.body) and resp.body != "" -> String.trim(resp.body)
+              true -> inspect(resp.body)
+            end
+
           {:error, "HTTP #{status}: #{err_text}"}
 
         {:error, exception} ->
@@ -230,6 +242,10 @@ defmodule Athanor.LLM do
       key when is_binary(key) and key != "" -> {:ok, key}
       _ -> Config.api_key()
     end
+  end
+
+  defp default_session_id do
+    "ses_athanor_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
   end
 
   defp maybe_put_tools(body, []), do: body

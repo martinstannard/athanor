@@ -23,6 +23,7 @@ defmodule Athanor.Agent do
 
   defstruct [
     :subscriber,
+    :session_id,
     :model,
     :cd,
     :llm_fn,
@@ -98,12 +99,18 @@ defmodule Athanor.Agent do
     cd = Keyword.get(opts, :cd, File.cwd!())
     max_turns = Keyword.get(opts, :max_turns, @default_max_turns)
 
+    session_id =
+      Keyword.get_lazy(opts, :session_id, fn ->
+        "ses_athanor_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+      end)
+
     default_llm_fn = fn messages, tools, caller_pid ->
-      LLM.stream(messages, tools, caller_pid, model: model)
+      LLM.stream(messages, tools, caller_pid, model: model, session_id: session_id)
     end
 
     state = %__MODULE__{
       subscriber: Keyword.fetch!(opts, :subscriber),
+      session_id: session_id,
       model: model,
       cd: cd,
       max_turns: max_turns,

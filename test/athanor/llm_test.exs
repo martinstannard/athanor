@@ -58,5 +58,14 @@ defmodule Athanor.LLMTest do
                ]
              }
     end
+
+    test "captures non-newline-terminated JSON error payloads on flush" do
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(~s({"error":{"message":"MissingSessionID"}}), self())
+        |> LLM.flush_buffer(self())
+
+      assert state.raw_error == ~s({"error":{"message":"MissingSessionID"}})
+    end
   end
 end
