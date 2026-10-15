@@ -26,16 +26,46 @@ defmodule Athanor.TUITest do
       assert {:quit, _} = TUI.handle_key(tui, "\r")
     end
 
-    test "cancels on Esc when agent is busy" do
-      tui = %{TUI.new() | status: :streaming}
+    test "cancels on Esc when active session is busy" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event({:status, :streaming})
+
       assert {:cancel, _} = TUI.handle_key(tui, "\e")
+    end
+
+    test "cycles between conductor and sub-agents on Tab and supports /spawn and /conductor" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started,
+           %{id: "worker-1", title: "Audit", role: :worker, parent_id: "conductor-main"}}
+        )
+
+      assert tui.active_id == "conductor-main"
+      {:cont, tui} = TUI.handle_key(tui, "\t")
+      assert tui.active_id == "worker-1"
+      {:cont, tui} = TUI.handle_key(tui, "\t")
+      assert tui.active_id == "conductor-main"
+
+      {:cont, tui} = TUI.handle_key(tui, "/spawn Docs :: Check README")
+      assert {:spawn_subagent, "Docs", "Check README", tui} = TUI.handle_key(tui, "\r")
+
+      {:cont, tui} = TUI.handle_key(tui, "/conductor ops")
+      assert {:spawn_conductor, "ops", _} = TUI.handle_key(tui, "\r")
     end
   end
 
-  describe "handle_agent_event/2 and render_frame/1" do
-    test "streams deltas, records tool execution, and renders frame" do
+  describe "handle_agent_event/3 and render_frame/1" do
+    test "streams deltas, records tool execution, and renders split-pane deck frame" do
       tui =
-        TUI.new(model: "deepseek-v4.1-flash", width: 80, height: 24)
+        TUI.new(model: "deepseek-v4.1-flash", width: 100, height: 24)
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started,
+           %{id: "worker-1", title: "test-runner", role: :worker, parent_id: "conductor-main"}}
+        )
         |> TUI.handle_agent_event({:user_message, "Read mix.exs"})
         |> TUI.handle_agent_event({:status, :executing_tools})
         |> TUI.handle_agent_event({:tool_start, "read_file", ~s({"path":"mix.exs"})})
@@ -46,13 +76,14 @@ defmodule Athanor.TUITest do
 
       frame_streaming = TUI.render_frame(tui)
       assert frame_streaming =~ "ATHANOR"
+      assert frame_streaming =~ "DECK SESSIONS"
+      assert frame_streaming =~ "test-runner"
       assert frame_streaming =~ "Read mix.exs"
       assert frame_streaming =~ "read_file"
       assert frame_streaming =~ "It uses Elixir 1.19.▍"
 
       tui_done = TUI.handle_agent_event(tui, {:turn_complete, "It uses Elixir 1.19."})
-      assert tui_done.streaming_buffer == nil
-      assert tui_done.status == :idle
+      assert TUI.active_status(tui_done) == :idle
 
       frame_done = TUI.render_frame(tui_done)
       assert frame_done =~ "IDLE"

@@ -2,21 +2,24 @@ defmodule Athanor.TUI do
   @moduledoc """
   Pure-Elixir Terminal UI for Athanor built on `Termite`.
 
-  Provides a pure state/rendering pipeline (`new/1`, `handle_agent_event/2`,
-  `handle_key/2`, `render_frame/1`) and an interactive terminal loop (`run/1`).
+  Features an `agent-deck`-style split-pane layout:
+  - Left sidebar: Hierarchical tree of Conductors (`♦`) and child Sub-Agents (`├─`/`└─`)
+    with live status indicators (`●` running, `○` idle, `✕` error).
+  - Right viewport: Streaming conversation and tool execution trace for the selected session.
+  - All events and commands flow through `Athanor.Bus` PubSub (`"deck:events"` and `"agent:<id>:inbox"`).
   """
 
-  alias Athanor.{Agent, Config}
+  alias Athanor.{Agent, Config, Orchestrator}
   alias Termite.{Screen, Style, Terminal}
 
   defstruct [
     :agent,
+    :active_id,
     :model,
     width: 80,
     height: 24,
-    status: :idle,
-    entries: [],
-    streaming_buffer: nil,
+    sessions: %{},
+    session_order: [],
     input: "",
     scroll_offset: 0
   ]
@@ -28,50 +31,95 @@ defmodule Athanor.TUI do
           | {:system, String.t()}
           | {:error, String.t()}
 
+  @type session_view :: %{
+          id: String.t(),
+          title: String.t(),
+          role: Agent.role(),
+          parent_id: String.t() | nil,
+          status: Agent.status(),
+          entries: [entry()],
+          streaming_buffer: String.t() | nil
+        }
+
   @type t :: %__MODULE__{
           agent: GenServer.server() | nil,
+          active_id: String.t(),
           model: String.t(),
           width: pos_integer(),
           height: pos_integer(),
-          status: Agent.status(),
-          entries: [entry()],
-          streaming_buffer: String.t() | nil,
+          sessions: %{String.t() => session_view()},
+          session_order: [String.t()],
           input: String.t(),
           scroll_offset: non_neg_integer()
         }
 
   @doc """
-  Creates a new TUI state struct.
+  Creates a new TUI state struct with an initial root Conductor session.
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
-    %__MODULE__{
-      agent: Keyword.get(opts, :agent),
-      model: Keyword.get(opts, :model, Config.model()),
-      width: Keyword.get(opts, :width, 80),
-      height: Keyword.get(opts, :height, 24),
+    active_id = Keyword.get(opts, :active_id, "conductor-main")
+    title = Keyword.get(opts, :title, "conductor-main")
+    model = Keyword.get(opts, :model, Config.model())
+
+    initial_session = %{
+      id: active_id,
+      title: title,
+      role: :conductor,
+      parent_id: nil,
+      status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt and press Enter. Press Esc to cancel, Ctrl+C to quit."}
-      ]
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, Tab to switch sessions."}
+      ],
+      streaming_buffer: nil
+    }
+
+    %__MODULE__{
+      agent: Keyword.get(opts, :agent),
+      active_id: active_id,
+      model: model,
+      width: Keyword.get(opts, :width, 80),
+      height: Keyword.get(opts, :height, 24),
+      sessions: %{active_id => initial_session},
+      session_order: [active_id]
     }
   end
 
+  # Convenience accessors for active session (keeps tests and callers ergonomic)
+
   @doc """
-  Starts the interactive TUI loop connected to an `Athanor.Agent`.
+  Returns the status of the currently active session.
+  """
+  @spec active_status(t()) :: Agent.status()
+  def active_status(%__MODULE__{active_id: id, sessions: sessions}) do
+    case Map.get(sessions, id) do
+      %{status: st} -> st
+      nil -> :idle
+    end
+  end
+
+  @doc """
+  Starts the interactive TUI loop subscribed to `Athanor.Bus` (`"deck:events"`).
   """
   @spec run(keyword()) :: :ok
   def run(opts \\ []) do
     model = Keyword.get(opts, :model, Config.model())
+    :ok = Orchestrator.subscribe()
 
-    {:ok, agent} =
-      case Keyword.get(opts, :agent) do
-        nil ->
-          Agent.start_link(subscriber: self(), model: model)
+    main_id = "conductor-main"
 
-        existing ->
-          :ok = Agent.subscribe(existing, self())
-          {:ok, existing}
+    {:ok, ^main_id, agent} =
+      case Orchestrator.lookup(main_id) do
+        {:ok, pid} ->
+          {:ok, main_id, pid}
+
+        :error ->
+          Orchestrator.start_conductor(
+            id: main_id,
+            title: "conductor-main",
+            model: model
+          )
       end
 
     term =
@@ -82,6 +130,7 @@ defmodule Athanor.TUI do
     tui =
       new(
         agent: agent,
+        active_id: main_id,
         model: model,
         width: term.size.width,
         height: term.size.height
@@ -110,11 +159,30 @@ defmodule Athanor.TUI do
             :ok
 
           {:submit, prompt, tui} ->
-            if tui.agent, do: _ = Agent.prompt(tui.agent, prompt)
+            _ = Orchestrator.send_session(tui.active_id, prompt)
+            loop(term, tui)
+
+          {:spawn_subagent, title, prompt, tui} ->
+            parent_id = resolve_parent_conductor(tui)
+            {:ok, child_id, _pid} = Orchestrator.launch_subagent(parent_id, title, prompt)
+
+            tui =
+              ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
+
+            loop(term, tui)
+
+          {:spawn_conductor, title, tui} ->
+            {:ok, cond_id, _pid} = Orchestrator.start_conductor(title: title, model: tui.model)
+
+            tui =
+              tui
+              |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
+              |> Map.put(:active_id, cond_id)
+
             loop(term, tui)
 
           {:cancel, tui} ->
-            if tui.agent, do: _ = Agent.cancel(tui.agent)
+            _ = Orchestrator.cancel_session(tui.active_id)
             loop(term, tui)
 
           {:cont, tui} ->
@@ -126,87 +194,126 @@ defmodule Athanor.TUI do
         tui = %{tui | width: term.size.width, height: term.size.height}
         loop(term, tui)
 
+      {:agent_event, session_id, event} ->
+        tui = handle_agent_event(tui, session_id, event)
+        loop(term, tui)
+
       {:agent_event, event} ->
-        tui = handle_agent_event(tui, event)
+        tui = handle_agent_event(tui, tui.active_id, event)
         loop(term, tui)
     end
   end
 
   @doc """
-  Updates the TUI state in response to an `{:agent_event, event}` message.
+  Updates the TUI state for the active session (2-arity convenience wrapper).
   """
   @spec handle_agent_event(t(), term()) :: t()
-  def handle_agent_event(tui, {:user_message, text}) do
-    %{tui | entries: tui.entries ++ [{:user, text}], scroll_offset: 0}
+  def handle_agent_event(%__MODULE__{active_id: active_id} = tui, event) do
+    handle_agent_event(tui, active_id, event)
   end
 
-  def handle_agent_event(tui, {:status, status}) do
-    %{tui | status: status}
+  @doc """
+  Updates the TUI state in response to an `{:agent_event, session_id, event}` PubSub message.
+  """
+  @spec handle_agent_event(t(), String.t(), term()) :: t()
+  def handle_agent_event(tui, session_id, {:session_started, meta}) do
+    ensure_session(tui, session_id, meta)
   end
 
-  def handle_agent_event(tui, {:text_delta, chunk}) do
-    current = tui.streaming_buffer || ""
-    %{tui | streaming_buffer: current <> chunk, scroll_offset: 0}
+  def handle_agent_event(tui, session_id, {:user_message, text}) do
+    update_session(tui, session_id, fn s ->
+      %{s | entries: s.entries ++ [{:user, text}]}
+    end)
   end
 
-  def handle_agent_event(tui, {:turn_complete, content}) do
-    final_text = tui.streaming_buffer || content || ""
-
-    entries =
-      if String.trim(final_text) != "" do
-        tui.entries ++ [{:assistant, final_text}]
-      else
-        tui.entries
-      end
-
-    %{tui | entries: entries, streaming_buffer: nil, status: :idle}
+  def handle_agent_event(tui, session_id, {:status, status}) do
+    update_session(tui, session_id, fn s ->
+      %{s | status: status}
+    end)
   end
 
-  def handle_agent_event(tui, {:tool_start, name, raw_args}) do
-    tui = flush_streaming_buffer(tui)
-    summary = format_tool_args(raw_args)
-    %{tui | entries: tui.entries ++ [{:tool, "⚙ #{name}(#{summary}) …"}], scroll_offset: 0}
+  def handle_agent_event(tui, session_id, {:text_delta, chunk}) do
+    update_session(tui, session_id, fn s ->
+      current = s.streaming_buffer || ""
+      %{s | streaming_buffer: current <> chunk}
+    end)
   end
 
-  def handle_agent_event(tui, {:tool_end, name, {:ok, output}}) do
-    preview = preview_line(output)
-    replace_last_tool_entry(tui, "✓ #{name} → #{preview}")
+  def handle_agent_event(tui, session_id, {:turn_complete, content}) do
+    update_session(tui, session_id, fn s ->
+      final_text = s.streaming_buffer || content || ""
+
+      entries =
+        if String.trim(final_text) != "" do
+          s.entries ++ [{:assistant, final_text}]
+        else
+          s.entries
+        end
+
+      %{s | entries: entries, streaming_buffer: nil, status: :idle}
+    end)
   end
 
-  def handle_agent_event(tui, {:tool_end, name, {:error, err}}) do
-    preview = preview_line(err)
-    replace_last_tool_entry(tui, "✗ #{name} → #{preview}")
+  def handle_agent_event(tui, session_id, {:tool_start, name, raw_args}) do
+    update_session(tui, session_id, fn s ->
+      s = flush_session_buffer(s)
+      summary = format_tool_args(raw_args)
+      %{s | entries: s.entries ++ [{:tool, "⚙ #{name}(#{summary}) …"}]}
+    end)
   end
 
-  def handle_agent_event(tui, :cancelled) do
-    tui = flush_streaming_buffer(tui)
-    %{tui | entries: tui.entries ++ [{:system, "[cancelled]"}], status: :idle}
+  def handle_agent_event(tui, session_id, {:tool_end, name, {:ok, output}}) do
+    update_session(tui, session_id, fn s ->
+      preview = preview_line(output)
+      replace_last_tool_entry(s, "✓ #{name} → #{preview}")
+    end)
   end
 
-  def handle_agent_event(tui, {:error, reason}) do
-    tui = flush_streaming_buffer(tui)
-    %{tui | entries: tui.entries ++ [{:error, reason}], status: :idle}
+  def handle_agent_event(tui, session_id, {:tool_end, name, {:error, err}}) do
+    update_session(tui, session_id, fn s ->
+      preview = preview_line(err)
+      replace_last_tool_entry(s, "✗ #{name} → #{preview}")
+    end)
   end
 
-  def handle_agent_event(tui, _other), do: tui
+  def handle_agent_event(tui, session_id, :cancelled) do
+    update_session(tui, session_id, fn s ->
+      s = flush_session_buffer(s)
+      %{s | entries: s.entries ++ [{:system, "[cancelled]"}], status: :idle}
+    end)
+  end
+
+  def handle_agent_event(tui, session_id, {:error, reason}) do
+    update_session(tui, session_id, fn s ->
+      s = flush_session_buffer(s)
+      %{s | entries: s.entries ++ [{:error, reason}], status: :error}
+    end)
+  end
+
+  def handle_agent_event(tui, _session_id, _other), do: tui
 
   @doc """
   Handles raw keyboard input from `Termite`.
-  Returns:
-  - `{:quit, tui}`
-  - `{:submit, prompt, tui}`
-  - `{:cancel, tui}`
-  - `{:cont, tui}`
   """
   @spec handle_key(t(), binary()) ::
-          {:quit, t()} | {:submit, String.t(), t()} | {:cancel, t()} | {:cont, t()}
+          {:quit, t()}
+          | {:submit, String.t(), t()}
+          | {:spawn_subagent, String.t(), String.t(), t()}
+          | {:spawn_conductor, String.t(), t()}
+          | {:cancel, t()}
+          | {:cont, t()}
   # Ctrl+C (<<3>>) or Ctrl+D (<<4>>)
   def handle_key(tui, <<3>>), do: {:quit, tui}
   def handle_key(tui, <<4>>), do: {:quit, tui}
 
-  # Escape key cancels in-flight turn
+  # Tab switches active session in the deck
+  def handle_key(tui, "\t") do
+    {:cont, cycle_session(tui)}
+  end
+
+  # Escape key cancels in-flight turn on the active session
   def handle_key(tui, "\e") do
-    if tui.status != :idle do
+    if active_status(tui) != :idle do
       {:cancel, tui}
     else
       {:cont, tui}
@@ -235,11 +342,26 @@ defmodule Athanor.TUI do
       trimmed in ["/quit", "/exit"] ->
         {:quit, %{tui | input: ""}}
 
-      trimmed == "" or tui.status != :idle ->
+      String.starts_with?(trimmed, "/conductor ") ->
+        title = String.trim(String.replace_prefix(trimmed, "/conductor ", ""))
+        {:spawn_conductor, if(title == "", do: "conductor", else: title), %{tui | input: ""}}
+
+      String.starts_with?(trimmed, "/spawn ") ->
+        rest = String.trim(String.replace_prefix(trimmed, "/spawn ", ""))
+
+        case String.split(rest, "::", parts: 2) do
+          [title, prompt] ->
+            {:spawn_subagent, String.trim(title), String.trim(prompt), %{tui | input: ""}}
+
+          [prompt] ->
+            {:spawn_subagent, "worker", String.trim(prompt), %{tui | input: ""}}
+        end
+
+      trimmed == "" or active_status(tui) in [:streaming, :executing_tools] ->
         {:cont, tui}
 
       true ->
-        {:submit, trimmed, %{tui | input: ""}}
+        {:submit, trimmed, %{tui | input: "", scroll_offset: 0}}
     end
   end
 
@@ -257,7 +379,7 @@ defmodule Athanor.TUI do
     {:cont, %{tui | input: updated}}
   end
 
-  # Printable UTF-8 text (including pasted text)
+  # Printable UTF-8 text
   def handle_key(tui, data) when is_binary(data) do
     if String.valid?(data) do
       clean =
@@ -272,27 +394,36 @@ defmodule Athanor.TUI do
   end
 
   @doc """
-  Renders the complete screen frame as an ANSI string.
-  Layout:
-  - Row 1: Header bar
-  - Rows 2..(height - 2): Scrollable message viewport
-  - Row (height - 1): Status bar
-  - Row height: Input prompt line
+  Renders the complete split-pane screen frame as an ANSI string.
   """
   @spec render_frame(t()) :: String.t()
   def render_frame(%__MODULE__{width: width, height: height} = tui) do
-    width = max(width, 20)
-    height = max(height, 6)
+    width = max(width, 40)
+    height = max(height, 8)
     viewport_height = height - 3
 
+    sidebar_w = min(26, max(18, div(width, 4)))
+    main_w = max(20, width - sidebar_w - 1)
+
     header = render_header(tui, width)
-    viewport_lines = render_viewport(tui, width, viewport_height)
+    sidebar_lines = render_sidebar(tui, sidebar_w, viewport_height)
+    viewport_lines = render_viewport(tui, main_w, viewport_height)
+
+    border_char =
+      Style.ansi256()
+      |> Style.foreground(238)
+      |> Style.render_to_string("│")
+
+    middle_rows =
+      Enum.zip(sidebar_lines, viewport_lines)
+      |> Enum.map(fn {left, right} ->
+        left <> border_char <> right
+      end)
+
     status_bar = render_status_bar(tui, width)
     {input_line, cursor_col} = render_input_line(tui, width)
 
-    rows =
-      [header | viewport_lines] ++
-        [status_bar, input_line]
+    rows = [header | middle_rows] ++ [status_bar, input_line]
 
     body =
       rows
@@ -309,8 +440,12 @@ defmodule Athanor.TUI do
   end
 
   defp render_header(tui, width) do
-    title = " ⚗ ATHANOR │ model: #{tui.model} "
-    padded = String.pad_trailing(String.slice(title, 0, width), width)
+    session_count = map_size(tui.sessions)
+    left = " ⚗ ATHANOR │ model: #{tui.model} │ sessions: #{session_count}"
+    right = "Tab: switch session "
+    gap = max(1, width - String.length(left) - String.length(right))
+    bar = String.slice(left <> String.duplicate(" ", gap) <> right, 0, width)
+    padded = String.pad_trailing(bar, width)
 
     Style.ansi256()
     |> Style.background(236)
@@ -319,16 +454,91 @@ defmodule Athanor.TUI do
     |> Style.render_to_string(padded)
   end
 
+  defp render_sidebar(tui, sidebar_w, height) do
+    header_style = Style.ansi256() |> Style.foreground(244) |> Style.bold()
+
+    header_line =
+      Style.render_to_string(header_style, String.pad_trailing(" DECK SESSIONS", sidebar_w))
+
+    tree_entries = ordered_tree_entries(tui)
+
+    item_lines =
+      Enum.map(tree_entries, fn {session, prefix} ->
+        selected? = session.id == tui.active_id
+        pointer = if selected?, do: "▸", else: " "
+        badge = status_badge(session.status)
+        role_icon = if session.role == :conductor, do: "♦ ", else: prefix
+        avail_title = max(4, sidebar_w - String.length(pointer) - String.length(role_icon) - 4)
+        short_title = String.slice(session.title, 0, avail_title)
+        raw = "#{pointer} #{role_icon}#{short_title}"
+        padded = String.pad_trailing(raw, max(1, sidebar_w - 2)) <> badge <> " "
+
+        style =
+          cond do
+            selected? ->
+              Style.ansi256() |> Style.background(237) |> Style.foreground(214) |> Style.bold()
+
+            session.role == :conductor ->
+              Style.ansi256() |> Style.foreground(252) |> Style.bold()
+
+            true ->
+              Style.ansi256() |> Style.foreground(246)
+          end
+
+        Style.render_to_string(style, String.slice(padded, 0, sidebar_w))
+      end)
+
+    lines = [header_line | item_lines] |> Enum.take(height)
+    pad = max(0, height - length(lines))
+    blank = String.duplicate(" ", sidebar_w)
+    lines ++ List.duplicate(blank, pad)
+  end
+
+  defp ordered_tree_entries(tui) do
+    sessions =
+      tui.session_order
+      |> Enum.map(&Map.get(tui.sessions, &1))
+      |> Enum.reject(&is_nil/1)
+
+    conductors = Enum.filter(sessions, &(&1.role == :conductor or is_nil(&1.parent_id)))
+    workers = Enum.reject(sessions, &(&1.role == :conductor or is_nil(&1.parent_id)))
+
+    Enum.flat_map(conductors, fn cond_session ->
+      children = Enum.filter(workers, &(&1.parent_id == cond_session.id))
+      child_count = length(children)
+
+      child_rows =
+        children
+        |> Enum.with_index(1)
+        |> Enum.map(fn {child, idx} ->
+          branch = if idx == child_count, do: "└─ ", else: "├─ "
+          {child, branch}
+        end)
+
+      [{cond_session, ""} | child_rows]
+    end)
+  end
+
+  defp status_badge(:idle), do: "○"
+  defp status_badge(:streaming), do: "●"
+  defp status_badge(:executing_tools), do: "●"
+  defp status_badge(:error), do: "✕"
+
   defp render_status_bar(tui, width) do
+    status = active_status(tui)
+    active = Map.get(tui.sessions, tui.active_id)
+    role_tag = if active && active.role == :conductor, do: "conductor", else: "sub-agent"
+
     {status_label, fg_color} =
-      case tui.status do
-        :idle -> {"● IDLE", 114}
-        :streaming -> {"◉ STREAMING… (Esc to cancel)", 214}
-        :executing_tools -> {"⚙ RUNNING TOOLS… (Esc to cancel)", 81}
+      case status do
+        :idle -> {"○ IDLE", 114}
+        :streaming -> {"● STREAMING… (Esc cancel)", 214}
+        :executing_tools -> {"● RUNNING TOOLS… (Esc cancel)", 81}
+        :error -> {"✕ ERROR", 203}
       end
 
-    right = "↑/↓ scroll │ /quit or Ctrl+C exit "
-    left = " #{status_label}"
+    left = " #{status_label} │ [#{role_tag}] #{tui.active_id}"
+    right = "Tab: switch │ ↑/↓: scroll │ /quit "
     gap = max(1, width - String.length(left) - String.length(right))
     bar = String.slice(left <> String.duplicate(" ", gap) <> right, 0, width)
     padded = String.pad_trailing(bar, width)
@@ -362,11 +572,17 @@ defmodule Athanor.TUI do
   end
 
   defp render_viewport(tui, width, viewport_height) do
+    session =
+      Map.get(tui.sessions, tui.active_id, %{
+        entries: [],
+        streaming_buffer: nil
+      })
+
     all_entries =
-      case tui.streaming_buffer do
-        nil -> tui.entries
-        "" -> tui.entries
-        buf -> tui.entries ++ [{:assistant, buf <> "▍"}]
+      case session.streaming_buffer do
+        nil -> session.entries
+        "" -> session.entries
+        buf -> session.entries ++ [{:assistant, buf <> "▍"}]
       end
 
     wrapped_lines =
@@ -388,11 +604,11 @@ defmodule Athanor.TUI do
     style = Style.ansi256() |> Style.foreground(117) |> Style.bold()
 
     text
-    |> wrap_text(max_w - 4)
+    |> wrap_text(max(5, max_w - 6))
     |> Enum.with_index()
     |> Enum.map(fn
-      {line, 0} -> Style.render_to_string(style, "You: ") <> line
-      {line, _} -> "     " <> line
+      {line, 0} -> " " <> Style.render_to_string(style, "You: ") <> line
+      {line, _} -> "      " <> line
     end)
     |> Kernel.++([""])
   end
@@ -401,11 +617,11 @@ defmodule Athanor.TUI do
     style = Style.ansi256() |> Style.foreground(214) |> Style.bold()
 
     text
-    |> wrap_text(max_w - 9)
+    |> wrap_text(max(5, max_w - 10))
     |> Enum.with_index()
     |> Enum.map(fn
-      {line, 0} -> Style.render_to_string(style, "Athanor: ") <> line
-      {line, _} -> "         " <> line
+      {line, 0} -> " " <> Style.render_to_string(style, "Athanor: ") <> line
+      {line, _} -> "          " <> line
     end)
     |> Kernel.++([""])
   end
@@ -414,16 +630,16 @@ defmodule Athanor.TUI do
     style = Style.ansi256() |> Style.foreground(245)
 
     text
-    |> wrap_text(max_w - 2)
-    |> Enum.map(fn line -> "  " <> Style.render_to_string(style, line) end)
+    |> wrap_text(max(5, max_w - 3))
+    |> Enum.map(fn line -> "   " <> Style.render_to_string(style, line) end)
   end
 
   defp format_entry_lines({:system, text}, max_w) do
     style = Style.ansi256() |> Style.foreground(244) |> Style.italic()
 
     text
-    |> wrap_text(max_w)
-    |> Enum.map(&Style.render_to_string(style, &1))
+    |> wrap_text(max(5, max_w - 2))
+    |> Enum.map(fn line -> " " <> Style.render_to_string(style, line) end)
     |> Kernel.++([""])
   end
 
@@ -431,8 +647,8 @@ defmodule Athanor.TUI do
     style = Style.ansi256() |> Style.foreground(203) |> Style.bold()
 
     ("Error: " <> text)
-    |> wrap_text(max_w)
-    |> Enum.map(&Style.render_to_string(style, &1))
+    |> wrap_text(max(5, max_w - 2))
+    |> Enum.map(fn line -> " " <> Style.render_to_string(style, line) end)
     |> Kernel.++([""])
   end
 
@@ -460,20 +676,72 @@ defmodule Athanor.TUI do
     |> Enum.to_list()
   end
 
-  defp flush_streaming_buffer(%{streaming_buffer: nil} = tui), do: tui
-  defp flush_streaming_buffer(%{streaming_buffer: ""} = tui), do: %{tui | streaming_buffer: nil}
+  defp cycle_session(%__MODULE__{session_order: []} = tui), do: tui
 
-  defp flush_streaming_buffer(%{streaming_buffer: buf} = tui) do
-    %{tui | entries: tui.entries ++ [{:assistant, buf}], streaming_buffer: nil}
+  defp cycle_session(%__MODULE__{session_order: order, active_id: active} = tui) do
+    idx = Enum.find_index(order, &(&1 == active)) || 0
+    next_id = Enum.at(order, rem(idx + 1, length(order)))
+    %{tui | active_id: next_id, scroll_offset: 0}
   end
 
-  defp replace_last_tool_entry(tui, replacement) do
+  defp resolve_parent_conductor(tui) do
+    case Map.get(tui.sessions, tui.active_id) do
+      %{role: :conductor, id: id} -> id
+      %{parent_id: parent_id} when is_binary(parent_id) -> parent_id
+      _ -> tui.active_id
+    end
+  end
+
+  defp ensure_session(tui, session_id, meta) do
+    existing =
+      Map.get(tui.sessions, session_id, %{
+        id: session_id,
+        title: Map.get(meta, :title, session_id),
+        role: Map.get(meta, :role, :worker),
+        parent_id: Map.get(meta, :parent_id),
+        status: Map.get(meta, :status, :idle),
+        entries: [],
+        streaming_buffer: nil
+      })
+
+    updated = %{
+      existing
+      | title: Map.get(meta, :title, existing.title),
+        role: Map.get(meta, :role, existing.role),
+        parent_id: Map.get(meta, :parent_id, existing.parent_id)
+    }
+
+    order =
+      if session_id in tui.session_order do
+        tui.session_order
+      else
+        tui.session_order ++ [session_id]
+      end
+
+    %{tui | sessions: Map.put(tui.sessions, session_id, updated), session_order: order}
+  end
+
+  defp update_session(tui, session_id, fun) do
+    tui = ensure_session(tui, session_id, %{})
+    session = Map.fetch!(tui.sessions, session_id)
+    updated = fun.(session)
+    %{tui | sessions: Map.put(tui.sessions, session_id, updated)}
+  end
+
+  defp flush_session_buffer(%{streaming_buffer: nil} = s), do: s
+  defp flush_session_buffer(%{streaming_buffer: ""} = s), do: %{s | streaming_buffer: nil}
+
+  defp flush_session_buffer(%{streaming_buffer: buf} = s) do
+    %{s | entries: s.entries ++ [{:assistant, buf}], streaming_buffer: nil}
+  end
+
+  defp replace_last_tool_entry(session, replacement) do
     updated =
-      tui.entries
+      session.entries
       |> Enum.reverse()
       |> replace_first_tool(replacement, [])
 
-    %{tui | entries: updated}
+    %{session | entries: updated}
   end
 
   defp replace_first_tool([], replacement, acc), do: Enum.reverse([{:tool, replacement} | acc])
@@ -490,6 +758,7 @@ defmodule Athanor.TUI do
     case JSON.decode(raw_args) do
       {:ok, %{"path" => path}} -> inspect(path)
       {:ok, %{"command" => cmd}} -> inspect(preview_line(cmd))
+      {:ok, %{"title" => title}} -> inspect(title)
       _ -> preview_line(raw_args)
     end
   end
