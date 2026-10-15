@@ -19,6 +19,13 @@
 ```bash
 mix deps.get
 mix test
+mix athanor
+```
+
+To select a specific OpenCode Go model:
+
+```bash
+mix athanor --model gemini-4-argon-contributor
 ```
 
 ## Architecture
