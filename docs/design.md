@@ -405,4 +405,138 @@ worktree), and unimplementable in full without §7.4 (receipts outliving the man
 - **Every step must leave `mix format --check-formatted`, `mix compile --warnings-as-errors` and
   `mix test` green** (`AGENTS.md`), and each plan's own milestones already encode that.
 
+---
+
+## 10. Tmux-like Session Semantics
+
+The goal is **tmux's lifecycle and durability model without tmux's input model**. This is timely
+because the TUI has just gained deck focus and `j`/`k` navigation, which is already the tmux
+idiom for moving around a session list.
+
+### 10.1 What already matches
+
+| tmux | Athanor today |
+|---|---|
+| `tmux detach` (session keeps running) | `Ctrl+Q` / `/detach`; agents keep running |
+| attach from several terminals | N TUI clients on one daemon, live-mirrored |
+| `tmux ls` | `mix athanor.daemon --status` |
+| survives an SSH drop | yes — the relay dies with the client, the agents do not |
+| session-list navigation | `Tab` focuses the deck; `j`/`k` + `Enter` navigate |
+| **survives a reboot** | **no — nothing is persisted** |
+| `attach -t`, `rename-session`, `kill-session` | **no** |
+| one input per session | **no — every attached client can prompt the same agent** |
+
+### 10.2 The prerequisite is §7.4
+
+tmux itself only survives *client* detach; without a resurrect-style plugin it loses everything on a
+machine restart. So "tmux-like" and the §9 goal are the same goal: **persistence is what makes
+`attach` meaningful.** Naming, rename and kill verbs are cheap and can land any time; durable attach
+cannot happen before §7.4.
+
+### 10.3 Adopt the vocabulary, not the keystrokes
+
+tmux needs a `Ctrl-b` prefix because it multiplexes *foreign* programs and must distinguish its keys
+from theirs. Athanor owns the screen and parses its own input, so a modal prefix would only add
+friction to typing prompts. The `/`-commands are already the equivalent of tmux's `:` command
+prompt — extend those instead:
+
+| Verb | CLI | TUI |
+|---|---|---|
+| list | `mix athanor.daemon --status` *(exists)* | `/sessions` |
+| attach (select) | `mix athanor attach <id\|name>` | `/attach <id\|name>` |
+| detach | *(n/a — the process exits)* | `Ctrl+Q` / `/detach` *(exists)* |
+| rename | `mix athanor rename <id> <name>` | `/rename <name>` |
+| kill | `mix athanor kill <id>` | `/kill <id>` |
+| new | `mix athanor conductor <name>` | `/conductor <name>` *(exists)* |
+
+`kill` must reuse §7.2's rule that only a managed, verified path may terminate work — killing a
+session with an unfinished turn should require the same explicitness as deleting a dirty worktree.
+
+### 10.4 Granularity: the client is a *server* view, not a session
+
+tmux nests session ⊃ windows ⊃ panes — one session, many views of it. Athanor is the inverse: **one
+client, N independent sessions, each with its own transcript**, plus a sidebar. So `mix athanor`
+attaches to *the server*; `attach -t <id>` should merely **preselect** a session rather than scope
+the client to it. This is strictly more capable (watch three workers by switching), and it means:
+
+- **No panes or splits.** A session's unit is a transcript, and the deck already gives multi-session
+  overview. Splitting would duplicate the sidebar.
+- **Workers are peers in the deck, not panes of the conductor.** The conductor↔worker relation is
+  provenance (`parent_id`), not containment.
+
+### 10.5 Identity: `id` vs `name` vs `title`
+
+| | Purpose | Stability | Unique | Charset |
+|---|---|---|---|---|
+| `id` | Immutable identity: `Registry` key, §7.4 directory name, §7.1 branch component | generated once, never changes | yes (by construction) | `[a-z0-9_-]`, path/ref-safe |
+| `name` | Human handle for `attach -t` / `kill` | user-chosen, renameable | **must be** | **missing today** |
+| `title` | Free-text display label in the deck | mutable | no | anything |
+
+`tmux attach -t work` works because a tmux name is both stable *and* human-chosen. Athanor has two
+of the three properties already; `name` is the gap. If added:
+
+- uniqueness enforced the same way as `id` — a `{:name, name}` key in `Athanor.AgentRegistry`, with a
+  duplicate refused loudly rather than shadowed;
+- same safe charset as `id`, so a name can never become a path traversal or a bad git ref;
+- **`id` remains the path/branch component.** A rename must never move a session's directory or
+  branch, or §7.4/§7.1 would silently orphan state.
+
+### 10.6 Multi-client input semantics
+
+Today every attached client can call `send_session/2` on the same agent, so two clients can inject
+prompts into one transcript. tmux never allows this: a session has exactly one input.
+
+| Option | Behaviour | Cost |
+|---|---|---|
+| **(a) status quo** | any client can write | fine for one human; interleaved and confusing with two |
+| **(b) single writer** *(recommended)* | first attached client holds the write lock; others are read-only viewers; `/take-control` transfers it | small amount of new state; the common case (phone = watch) works by default |
+| **(c) shared input echo** | one logical input line mirrored to all clients | closest to tmux; unpleasant over a laggy SSH link |
+
+Recommendation **(b)**: it makes "attach to monitor" the safe default, which is exactly what you
+want when attaching from a phone or a second machine. Detach should release the lock, and the
+lock holder should be visible in the status bar.
+
+### 10.7 Deliberately *not* copying
+
+- **No prefix key** (§10.3).
+- **No "smallest client wins" resize.** tmux shrinks a session to the smallest attached terminal;
+  Athanor has each client lay out its own frame over the same text, so a 40-column phone attach does
+  not reflow anyone else's view. This is an advantage worth stating so it is not "fixed" later.
+- **No panes/splits** (§10.4) and **no copy-mode paste buffers** — the existing `↑`/`↓` scroll plus
+  the terminal's own scrollback/selection covers it; tmux buffers exist because tmux owns the
+  alternate screen, which Athanor already releases on detach.
+- **One daemon per machine.** tmux has a server per socket; Athanor's answer to "several machines"
+  is §7.8 clustering, not multiple local servers.
+
+### 10.8 Where it lands
+
+| Piece | Depends on |
+|---|---|
+| durable attach | **§7.4** (prerequisite, §10.2) |
+| `name` + `/rename` + `/kill` verbs | nothing (small: registry key + TUI commands) |
+| writer lock | `name`/attach work being settled |
+| `attach -t <id\|name>` preselect | `name` |
+
+Suggested order: land §7.4 first (it is §9's step 1 anyway), then the naming and verb surface, then
+the writer lock. The verbs are a good "while you're in there" addition to the §7.7 daemon surface
+rather than a reason to reorder §9.
+
+### 10.9 Open questions
+
+- **T1 — one identifier or two?** Keep `id` + add a unique `name` (recommended), or collapse `title`
+  into a single renameable identifier that doubles as the attach handle? The second is simpler but
+  conflates two different contracts (immutable identity vs mutable label) and risks §10.5's
+  path/branch hazard.
+- **T2 — input model:** (a) status quo / (b) single writer + read-only viewers / (c) shared input
+  echo? Recommended: (b).
+- **T3 — what does `/rename` rename?** The `name` only (recommended, per §10.5), or also `title`
+  together? Two labels with no visible distinction would be confusing.
+- **T4 — does detaching release the writer lock?** Recommended: yes, on a short grace period, so an
+  SSH flap does not lock everyone else out.
+- **T5 — is `kill` modelled as `terminate_child` only, or as a tombstone?** With §7.4, a killed
+  session could linger as a resumable transcript. Recommended: kill the process, **keep** the
+  transcript, and let `/resume` offer it — matching the §9 principle that destroying state is never
+  the default.
+
+
 
