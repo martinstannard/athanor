@@ -194,6 +194,17 @@ A layered memory system so Conductors and Sub-Agents accumulate durable knowledg
 - **Tool Guard & Prelude-Read Enforcement**: Track read files per session and require `read_file` before `edit_file` / `write_file` on existing files to prevent blind overwrites.
 - **MCP Client (`Athanor.MCP`)**: Attach stdio or SSE Model Context Protocol servers (e.g., Linear, Datadog, Postgres, Exa) per Conductor or Sub-Agent profile.
 
-### 7.7 Distributed BEAM Clustering
-- Because `Athanor.Bus` and `Athanor.Agent` use standard Erlang message passing, multiple Athanor nodes across machines (e.g., `host-a`, `host-b`, `host-c`) can join an Erlang cluster (`Node.connect/1`) and supervise/inspect sub-agents running on remote hosts from a single TUI.
+### 7.7 Persistent Daemon & Live Remote Attach (`Athanor.Daemon`)
+So you can SSH into the machine from anywhere, run `athanor`, and immediately attach to the live running server without interrupting active agents:
+1. **Long-Lived Background Node (`athanord`)**:
+   - Runs as a persistent named BEAM daemon (`athanor@127.0.0.1`, managed via `systemd --user` or auto-started on first launch) that owns `Athanor.AgentSupervisor`, `Athanor.AgentRegistry`, `Athanor.Bus` PubSub, and all active Conductors/Sub-Agents.
+2. **Thin TUI Attach/Detach Client (`mix athanor` / `athanor attach`)**:
+   - When you SSH in and run `athanor`, it boots a lightweight TUI client node (`athanor_tui_<rand>@127.0.0.1`), connects to `athanor@127.0.0.1` via Distributed Erlang (`Node.connect/1` / `:erpc`), fetches the live session tree and message history, and subscribes the local `Termite` process to the daemon's `Athanor.Bus`.
+   - **Multi-Client Mirroring**: Multiple TUI clients (e.g., your local desktop monitor and an SSH session from a laptop or phone) can attach to the same daemon simultaneously and watch live token streams in sync.
+   - **Safe Detach (`Ctrl+Q` / `/detach` / SSH drop)**: Closing the TUI or dropping an SSH connection only terminates the thin TUI client; Conductors and Sub-Agents keep running uninterrupted in the daemon.
+3. **Optional Native OTP `:ssh` Subsystem**:
+   - Leverage Erlang's built-in `:ssh.daemon/2` to expose a dedicated SSH port (e.g., `ssh -p 2222 host`) that spawns an `Athanor.TUI` session directly over the SSH channel.
+
+### 7.8 Multi-Host Distributed BEAM Clustering
+- Because `Athanor.Bus` and `Athanor.Agent` use standard Erlang message passing, multiple Athanor daemons across machines (e.g., `host-a`, `host-b`, `host-c`) can join an Erlang cluster (`Node.connect/1`) and supervise/inspect sub-agents running on remote hosts from a single TUI.
 
