@@ -13,7 +13,7 @@ defmodule Athanor.Agent do
 
   alias Athanor.{Bus, Config, LLM, Tools}
 
-  @default_max_turns 20
+  @default_max_turns 100
 
   @default_conductor_prompt """
   You are an Athanor Conductor — a persistent orchestrator on Elixir/OTP.

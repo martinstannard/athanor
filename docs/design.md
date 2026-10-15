@@ -166,17 +166,34 @@ Event-driven OTP GenServers ("doorbells, not messengers") that listen for extern
 - **GitHub / CI Watcher**: Polls or receives webhooks for PR review comments and CI failures, waking the responsible Conductor to spawn a fix worker.
 - **Remote Chat Channels (Telegram / Slack / Discord)**: Pairs 1-to-1 with a specific Conductor via PubSub so you can message your Conductor and receive escalations from your phone.
 
-### 7.4 Durable Session Persistence & Context Compaction
-- **On-Disk State (`~/.athanor/sessions/<id>/`)**:
-  - Persist `messages.jsonl`, `meta.json`, `task-log.md`, and `LEARNINGS.md` on every turn transition so Conductors and Sub-Agents can be resumed across VM restarts.
+### 7.4 Session History, Resumability & Context Compaction (`Athanor.Store`)
+To ensure Athanor can restart cleanly without losing in-progress work or re-learning context from scratch:
+- **Append-Only Session Transcripts (`~/.athanor/sessions/<session_id>/`)**:
+  - `meta.json` — Session metadata (`id`, `title`, `role`, `parent_id`, `model`, `cd`, `session_id` for OpenCode Go, timestamps, and last status).
+  - `transcript.jsonl` — Append-only JSON Lines log of every user prompt, assistant response, tool call, and tool output as it happens.
+  - `HANDOFF.md` — Rolling structured summary of current goal, completed steps, open blockers, and active sub-agents.
+- **Seamless Session Resume (`mix athanor --resume` / `/resume <id>`)**:
+  - On startup, `Athanor.Orchestrator` can rehydrate Conductors and their child Sub-Agent tree from `~/.athanor/sessions/`, restoring both the TUI viewport and the `Athanor.Agent` message history.
 - **Context Compaction**:
-  - When a long-running Conductor approaches its context window limit, automatically summarize older turns into a compact handoff block while preserving pinned state (`task-log.md`).
+  - When a long-running Conductor approaches its token limit, Athanor compacts older `transcript.jsonl` turns into `HANDOFF.md` while keeping recent turns intact.
 
-### 7.5 Richer Codebase & MCP Tooling
+### 7.5 Hierarchical Memory System (`Athanor.Memory`)
+A layered memory system so Conductors and Sub-Agents accumulate durable knowledge across sessions without polluting every prompt:
+1. **Workspace / Project Memory (`.athanor/MEMORY.md` & `.athanor/learnings.jsonl`)**:
+   - Project-specific facts, architecture notes, recurring gotchas, and user preferences ("how we do things in this repo").
+   - Automatically injected into the system prompt of Conductors and Sub-Agents working in that repository.
+2. **Global User Memory (`~/.athanor/memory/`)**:
+   - Cross-project facts, preferred workflows, machine setup notes, and links to external knowledge graphs (e.g., Martin's Logseq graph at `~/Documents/logseq`).
+3. **Episodic & Semantic Recall Tools (`remember`, `recall`, `forget`)**:
+   - First-class tools allowing an agent to explicitly record a durable learning (`remember(category, fact)`) or search past session transcripts and learnings (`recall(query)`) via keyword/FTS or embeddings.
+4. **Post-Session Distillation**:
+   - When a Sub-Agent finishes a complex task (`===ATHANOR_DONE===`), the Conductor can distill non-obvious bug root causes or codebase conventions into `.athanor/MEMORY.md` so future workers never have to rediscover them.
+
+### 7.6 Richer Codebase & MCP Tooling
 - **Built-in `glob` and `grep` tools**: Fast file discovery and regex search without shelling out to `bash`.
 - **Tool Guard & Prelude-Read Enforcement**: Track read files per session and require `read_file` before `edit_file` / `write_file` on existing files to prevent blind overwrites.
 - **MCP Client (`Athanor.MCP`)**: Attach stdio or SSE Model Context Protocol servers (e.g., Linear, Datadog, Postgres, Exa) per Conductor or Sub-Agent profile.
 
-### 7.6 Distributed BEAM Clustering
+### 7.7 Distributed BEAM Clustering
 - Because `Athanor.Bus` and `Athanor.Agent` use standard Erlang message passing, multiple Athanor nodes across machines (e.g., `host-a`, `host-b`, `host-c`) can join an Erlang cluster (`Node.connect/1`) and supervise/inspect sub-agents running on remote hosts from a single TUI.
 
