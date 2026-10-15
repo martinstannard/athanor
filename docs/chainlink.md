@@ -215,17 +215,23 @@ chainlink issue next           # or let it suggest
 chainlink session work <id>
 ```
 
-The roadmap from [`docs/design.md`](design.md) §7 is seeded here as:
+The roadmap from [`docs/design.md`](design.md) §7 is seeded here as an epic with
+subissues. Dependencies follow the authoritative graph in design §9.2.
 
 - **#1** *(epic)* Add post-Phase-3 roadmap capabilities from the design doc
   - **#2** §7.1 Git worktree isolation (`Athanor.Worktree`)
-  - **#3** §7.2 Goal-driven autonomy + verification (`Athanor.Goal`)
+  - **#3** §7.2 Goal-driven autonomy + verification (`Athanor.Goal`) — *blocked by #2*
   - **#4** §7.3 Watchers & external channels (`Athanor.Watcher`)
   - **#5** §7.4 Session history, resumability & compaction (`Athanor.Store`)
   - **#6** §7.5 Hierarchical memory (`Athanor.Memory`) — *blocked by #5*
-  - **#7** §7.6 glob/grep, tool guard & MCP (`Athanor.MCP`)
+  - **#7** §7.6 Tool guard & MCP client (`Athanor.MCP`) — glob/grep already shipped
   - **#8** §7.7 Daemon auto-start, remote attach & SSH (`Athanor.Daemon`) — partly implemented
-  - **#9** §7.8 Multi-host BEAM clustering (`Athanor.Cluster`) — *blocked by #8*
+  - **#9** §7.8 Multi-host BEAM clustering (`Athanor.Cluster`) — *blocked by #5*
+  - **#11** §10 Tmux-like session semantics (name/rename/kill/attach, writer lock)
 
 Each issue's description points at the corresponding detailed plan under
-`docs/plans/7.x-*.md`.
+`docs/plans/7.x-*.md` (or `docs/design.md` §10 for #11).
+
+**Recommended build order** (design §9.3): 1) #5 Store → 2) #2 Worktrees →
+3) #3 Goals → 4) #6 Memory → 5) #7 Tool guard + MCP → 6) #4 Watchers → 7) #9 Cluster.
+Steps 2 and 5 are independent and parallelisable.
