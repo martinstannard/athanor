@@ -85,7 +85,7 @@ defmodule Athanor.TUITest do
       assert frame =~ "theme: dracula"
     end
 
-    test "cycles between conductor and sub-agents on Tab and supports /spawn and /conductor" do
+    test "Tab switches focus between input and the session deck, and j/k + Enter navigate it" do
       tui =
         TUI.new()
         |> TUI.handle_agent_event(
@@ -94,11 +94,46 @@ defmodule Athanor.TUITest do
            %{id: "worker-1", title: "Audit", role: :worker, parent_id: "conductor-main"}}
         )
 
+      assert tui.focus == :input
       assert tui.active_id == "conductor-main"
+
+      # Tab moves focus to the deck without changing the active session
       {:cont, tui} = TUI.handle_key(tui, "\t")
+      assert tui.focus == :sessions
+      assert tui.active_id == "conductor-main"
+
+      # 'j' moves the highlight down, Enter selects and returns focus to input
+      {:cont, tui} = TUI.handle_key(tui, "j")
+      assert tui.sidebar_index == 1
+      {:cont, tui} = TUI.handle_key(tui, "\r")
+      assert tui.focus == :input
       assert tui.active_id == "worker-1"
+
+      # 'k' navigates back up; Enter selects conductor-main and returns focus to input
       {:cont, tui} = TUI.handle_key(tui, "\t")
+      assert tui.focus == :sessions
+      # focus follows the active session
+      assert tui.sidebar_index == 1
+      {:cont, tui} = TUI.handle_key(tui, "k")
+      assert tui.sidebar_index == 0
+      {:cont, tui} = TUI.handle_key(tui, "\r")
+      assert tui.focus == :input
       assert tui.active_id == "conductor-main"
+
+      # Arrow keys also navigate the deck
+      {:cont, tui} = TUI.handle_key(tui, "\t")
+      {:cont, tui} = TUI.handle_key(tui, "\e[B")
+      assert tui.sidebar_index == 1
+      {:cont, tui} = TUI.handle_key(tui, "\e[A")
+      assert tui.sidebar_index == 0
+
+      # Printable keys are swallowed while the deck is focused
+      {:cont, tui} = TUI.handle_key(tui, "x")
+      assert tui.input == ""
+
+      # Return focus to the input line before typing commands
+      {:cont, tui} = TUI.handle_key(tui, "\t")
+      assert tui.focus == :input
 
       {:cont, tui} = TUI.handle_key(tui, "/spawn Docs :: Check README")
       assert {:spawn_subagent, "Docs", "Check README", tui} = TUI.handle_key(tui, "\r")
