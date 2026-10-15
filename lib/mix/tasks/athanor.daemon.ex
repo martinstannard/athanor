@@ -39,8 +39,20 @@ defmodule Mix.Tasks.Athanor.Daemon do
   end
 
   defp print_status do
-    case Daemon.connect_or_start_daemon(auto_start: false) do
-      {:ok, target} ->
+    target = Daemon.daemon_node()
+    :ok = Daemon.ensure_client_node()
+
+    cond do
+      not Daemon.reachable?(target) ->
+        Mix.shell().info("Athanor daemon is not running (#{target}).")
+
+      Daemon.incompatible?(target) ->
+        Mix.shell().info(
+          "Athanor daemon at #{target} is running an older Athanor build — restart it:\n" <>
+            "  mix athanor.daemon --restart   (or `pkill -f #{target}` then `mix athanor`)"
+        )
+
+      Daemon.usable?(target) ->
         sessions = Daemon.fetch_full_sessions(target)
         Mix.shell().info("Athanor daemon online at #{target} (#{length(sessions)} sessions):")
 
@@ -48,20 +60,25 @@ defmodule Mix.Tasks.Athanor.Daemon do
           Mix.shell().info("  - [#{s.role}] #{s.id} (#{s.title}) status=#{s.status}")
         end
 
-      {:error, _} ->
-        Mix.shell().info("Athanor daemon is not running (#{Daemon.daemon_node()}).")
+      true ->
+        Mix.shell().info(
+          "Athanor daemon at #{target} is reachable but its supervision tree is not up yet."
+        )
     end
   end
 
   defp stop_daemon do
-    case Daemon.connect_or_start_daemon(auto_start: false) do
-      {:ok, target} ->
-        :erpc.cast(target, :init, :stop, [])
-        wait_until_stopped(target, 5_000)
-        Mix.shell().info("Stopped Athanor daemon at #{target}.")
+    target = Daemon.daemon_node()
+    :ok = Daemon.ensure_client_node()
 
-      {:error, _} ->
-        Mix.shell().info("Athanor daemon is not running.")
+    # `:init.stop/0` is stdlib, so this works even against a stale daemon whose own
+    # modules we cannot call.
+    if Daemon.reachable?(target) do
+      :erpc.cast(target, :init, :stop, [])
+      wait_until_stopped(target, 5_000)
+      Mix.shell().info("Stopped Athanor daemon at #{target}.")
+    else
+      Mix.shell().info("Athanor daemon is not running (#{target}).")
     end
   end
 
@@ -70,8 +87,7 @@ defmodule Mix.Tasks.Athanor.Daemon do
 
     case Daemon.connect_or_start_daemon(Keyword.put(opts, :auto_start, true)) do
       {:ok, target} ->
-        {:ok, main_id, _} = Daemon.ensure_main_conductor_and_hydrate(target, opts)
-        Mix.shell().info("Restarted Athanor daemon at #{target} (main conductor: #{main_id}).")
+        hydrate(target, opts)
 
       {:error, {:incompatible_daemon, node}} ->
         Mix.raise(
@@ -85,9 +101,37 @@ defmodule Mix.Tasks.Athanor.Daemon do
             "Start it in the foreground to see the error: `mix athanor.daemon`"
         )
 
+      {:error, :daemon_not_ready} ->
+        Mix.raise(
+          "Athanor daemon is reachable but its supervision tree never came up.\n" <>
+            "Start it in the foreground to see the error: `mix athanor.daemon`"
+        )
+
       {:error, reason} ->
         Mix.raise("Failed to restart Athanor daemon: #{inspect(reason)}")
     end
+  end
+
+  # Hydration touches Orchestrator, which needs the daemon's registries. Fail with an
+  # actionable message rather than surfacing a raw ErlangError from a remote `:erpc` call.
+  defp hydrate(target, opts) do
+    case Daemon.ensure_main_conductor_and_hydrate(target, opts) do
+      {:ok, main_id, _sessions} ->
+        Mix.shell().info("Restarted Athanor daemon at #{target} (main conductor: #{main_id}).")
+
+      other ->
+        Mix.raise(
+          "Athanor daemon is up at #{target} but could not be initialised: #{inspect(other)}\n" <>
+            "Start it in the foreground to see the error: `mix athanor.daemon`"
+        )
+    end
+  rescue
+    error ->
+      Mix.raise(
+        "Athanor daemon is up at #{target} but could not be initialised: " <>
+          Exception.message(error) <>
+          "\nStart it in the foreground to see the error: `mix athanor.daemon`"
+      )
   end
 
   defp wait_until_stopped(target, timeout_ms) do

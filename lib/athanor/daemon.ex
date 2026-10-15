@@ -55,7 +55,11 @@ defmodule Athanor.Daemon do
     end
   end
 
-  @build_marker "athanor-0.1.0"
+  # Bump @handshake whenever the daemon/TUI RPC or readiness surface changes. A running
+  # daemon from an older build then reports as *incompatible* instead of being probed with
+  # functions it does not have (which would look like "still booting" forever).
+  @handshake 2
+  @build_marker "athanor-0.1.0-h#{@handshake}"
 
   @doc """
   A marker identifying this Athanor build, used to reject attaching to a daemon
@@ -66,23 +70,85 @@ defmodule Athanor.Daemon do
   def build_marker, do: @build_marker
 
   @doc """
-  True when `node` is reachable over distribution *and* runs a compatible Athanor
-  build. Uses `:erlang.node/0` (a BIF present on every node) to test connectivity
-  first, so a reachable non-Athanor node is reported as incompatible rather than
-  crashing.
+  True when `node` is reachable, runs a compatible Athanor build, **and its supervision tree is
+  already up**.
+
+  The last condition is essential: a freshly spawned daemon becomes reachable, and its modules
+  callable, roughly **300 ms before** `Athanor.Application.start/2` has created
+  `Athanor.AgentRegistry` (measured: reachable +90 ms, modules callable +1943 ms, registry up
+  +2262 ms). Attaching inside that window fails with `unknown registry: Athanor.AgentRegistry`.
   """
   @spec usable?(node()) :: boolean()
   def usable?(node) do
-    node == Node.self() or
-      (Node.connect(node) == true and
-         try do
-           :erpc.call(node, :erlang, :node, [], 5_000) == node and
-             :erpc.call(node, __MODULE__, :build_marker, [], 5_000) == @build_marker
-         rescue
-           _ -> false
-         catch
-           _, _ -> false
-         end)
+    cond do
+      node == Node.self() -> started?()
+      reachable?(node) -> remote_ready?(node)
+      true -> false
+    end
+  end
+
+  @doc """
+  True when the Athanor supervision tree is running **on this node**.
+
+  Safe to call on a node that has the code but never started the application (returns `false`
+  rather than raising), which is exactly what makes it usable as a remote readiness probe.
+  """
+  @spec started?() :: boolean()
+  def started? do
+    Process.whereis(Athanor.AgentSupervisor) != nil and
+      Process.whereis(Athanor.AgentRegistry) != nil
+  end
+
+  @doc "True when `node` is reachable over distribution at all."
+  @spec reachable?(node()) :: boolean()
+  def reachable?(node), do: Node.connect(node) == true
+
+  @doc """
+  True when `node` is reachable but is **not** a compatible Athanor daemon — a different build, an
+  older release, or an unrelated application squatting the node name.
+
+  Unlike `usable?/1`, this ignores whether the tree is up, so a *booting* daemon is not
+  misreported as incompatible.
+  """
+  @spec incompatible?(node()) :: boolean()
+  def incompatible?(node) do
+    reachable?(node) and remote_build(node) != @build_marker
+  end
+
+  # True when the remote build matches AND its supervision tree is up.
+  defp remote_ready?(node) do
+    remote_build(node) == @build_marker and safe_erpc(node, __MODULE__, :started?, []) == true
+  end
+
+  defp remote_build(node), do: safe_erpc(node, __MODULE__, :build_marker, [])
+
+  defp safe_erpc(node, module, function, args) do
+    :erpc.call(node, module, function, args, 5_000)
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  @doc """
+  Makes the current VM a distributed Athanor client node (starting epmd and setting the
+  cookie) without connecting to anything.
+
+  Used by the CLI verbs that must act on *whatever* is on the daemon node name — including a
+  stale daemon from an older build that `connect_or_start_daemon/1` would refuse.
+  """
+  @spec ensure_client_node() :: :ok | {:error, term()}
+  def ensure_client_node do
+    ensure_epmd()
+
+    with :ok <- ensure_distributed_node(client_node_name()) do
+      Node.set_cookie(cookie())
+      :ok
+    end
+  end
+
+  defp client_node_name do
+    :"athanor_tui_#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}@127.0.0.1"
   end
 
   @doc """
@@ -98,14 +164,7 @@ defmodule Athanor.Daemon do
     target = Keyword.get(opts, :daemon_node, daemon_node())
     auto_start? = Keyword.get(opts, :auto_start, true)
 
-    ensure_epmd()
-
-    client_name =
-      :"athanor_tui_#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}@127.0.0.1"
-
-    with :ok <- ensure_distributed_node(client_name) do
-      Node.set_cookie(cookie())
-
+    with :ok <- ensure_client_node() do
       cond do
         Node.self() == target ->
           {:ok, target}
@@ -113,23 +172,29 @@ defmodule Athanor.Daemon do
         usable?(target) ->
           {:ok, target}
 
-        Node.connect(target) == true ->
-          # Reachable but not a compatible Athanor daemon (stale build or a
-          # different application squatting the node name).
+        # Reachable with a *different* build: no point waiting, no point spawning a
+        # second node with the same name.
+        incompatible?(target) ->
           {:error, {:incompatible_daemon, target}}
 
         auto_start? ->
-          spawn_detached_daemon(target)
+          start_or_wait(target, Keyword.get(opts, :timeout, 15_000))
 
-          case wait_for_daemon(target, Keyword.get(opts, :timeout, 15_000)) do
-            {:ok, ^target} = ok -> ok
-            other -> other
-          end
+        # Reachable and compatible but still booting, with auto-start disabled.
+        reachable?(target) ->
+          {:error, :daemon_not_ready}
 
         true ->
           {:error, :daemon_unreachable}
       end
     end
+  end
+
+  # Only spawn when nothing is listening on the name yet; otherwise just wait for the
+  # booting daemon's supervision tree to come up.
+  defp start_or_wait(target, timeout_ms) do
+    unless reachable?(target), do: spawn_detached_daemon(target)
+    wait_for_daemon(target, timeout_ms)
   end
 
   @doc """
@@ -357,10 +422,10 @@ defmodule Athanor.Daemon do
         {:ok, target_node}
 
       System.monotonic_time(:millisecond) >= deadline ->
-        if Node.connect(target_node) == true do
-          {:error, {:incompatible_daemon, target_node}}
-        else
-          {:error, :daemon_start_timeout}
+        cond do
+          incompatible?(target_node) -> {:error, {:incompatible_daemon, target_node}}
+          reachable?(target_node) -> {:error, :daemon_not_ready}
+          true -> {:error, :daemon_start_timeout}
         end
 
       true ->

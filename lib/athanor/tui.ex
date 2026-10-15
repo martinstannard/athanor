@@ -25,7 +25,9 @@ defmodule Athanor.TUI do
     sessions: %{},
     session_order: [],
     input: "",
-    scroll_offset: 0
+    scroll_offset: 0,
+    focus: :input,
+    sidebar_index: 0
   ]
 
   @type entry ::
@@ -45,6 +47,8 @@ defmodule Athanor.TUI do
           streaming_buffer: String.t() | nil
         }
 
+  @type focus :: :input | :sessions
+
   @type t :: %__MODULE__{
           agent: GenServer.server() | nil,
           daemon_node: node() | nil,
@@ -56,7 +60,9 @@ defmodule Athanor.TUI do
           sessions: %{String.t() => session_view()},
           session_order: [String.t()],
           input: String.t(),
-          scroll_offset: non_neg_integer()
+          scroll_offset: non_neg_integer(),
+          focus: focus(),
+          sidebar_index: non_neg_integer()
         }
 
   @doc """
@@ -77,7 +83,7 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, Tab to switch sessions."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
       streaming_buffer: nil
     }
@@ -382,10 +388,47 @@ defmodule Athanor.TUI do
   def handle_key(tui, <<4>>), do: {:quit, tui}
   def handle_key(tui, <<17>>), do: {:quit, tui}
 
-  # Tab switches active session in the deck
+  # Tab toggles focus between the input line and the session deck
   def handle_key(tui, "\t") do
-    {:cont, cycle_session(tui)}
+    {:cont, set_focus(tui, if(tui.focus == :input, do: :sessions, else: :input))}
   end
+
+  # --- Session deck navigation (focus: :sessions) ---
+  # `j` / Down move the highlight down the deck
+  def handle_key(%__MODULE__{focus: :sessions} = tui, key) when key in ["j", "\e[B"] do
+    {:cont, move_sidebar(tui, 1)}
+  end
+
+  # `k` / Up move the highlight up the deck
+  def handle_key(%__MODULE__{focus: :sessions} = tui, key) when key in ["k", "\e[A"] do
+    {:cont, move_sidebar(tui, -1)}
+  end
+
+  # `g` / `G` jump to the top / bottom of the deck (vim-style)
+  def handle_key(%__MODULE__{focus: :sessions} = tui, "g") do
+    {:cont, set_sidebar_index(tui, 0)}
+  end
+
+  def handle_key(%__MODULE__{focus: :sessions} = tui, "G") do
+    {:cont, set_sidebar_index(tui, length(ordered_tree_entries(tui)) - 1)}
+  end
+
+  # Enter selects the highlighted session and returns focus to the input line
+  def handle_key(%__MODULE__{focus: :sessions} = tui, key) when key in ["\r", "\n"] do
+    {:cont, select_sidebar_session(tui)}
+  end
+
+  # Esc leaves the deck without changing the active session
+  def handle_key(%__MODULE__{focus: :sessions} = tui, "\e") do
+    {:cont, set_focus(tui, :input)}
+  end
+
+  # Ignore any other escape sequences while navigating the deck
+  def handle_key(%__MODULE__{focus: :sessions} = tui, "\e" <> _), do: {:cont, tui}
+
+  # Swallow all other keys while navigating the deck so they never reach the input
+  def handle_key(%__MODULE__{focus: :sessions} = tui, data) when is_binary(data),
+    do: {:cont, tui}
 
   # Escape key cancels in-flight turn on the active session
   def handle_key(tui, "\e") do
@@ -397,14 +440,17 @@ defmodule Athanor.TUI do
   end
 
   # PageUp / Up arrow scrolls up
-  def handle_key(tui, "\e[5~"), do: {:cont, %{tui | scroll_offset: tui.scroll_offset + 5}}
-  def handle_key(tui, "\e[A"), do: {:cont, %{tui | scroll_offset: tui.scroll_offset + 1}}
+  def handle_key(%__MODULE__{focus: :input} = tui, "\e[5~"),
+    do: {:cont, %{tui | scroll_offset: tui.scroll_offset + 5}}
+
+  def handle_key(%__MODULE__{focus: :input} = tui, "\e[A"),
+    do: {:cont, %{tui | scroll_offset: tui.scroll_offset + 1}}
 
   # PageDown / Down arrow scrolls down
-  def handle_key(tui, "\e[6~"),
+  def handle_key(%__MODULE__{focus: :input} = tui, "\e[6~"),
     do: {:cont, %{tui | scroll_offset: max(0, tui.scroll_offset - 5)}}
 
-  def handle_key(tui, "\e[B"),
+  def handle_key(%__MODULE__{focus: :input} = tui, "\e[B"),
     do: {:cont, %{tui | scroll_offset: max(0, tui.scroll_offset - 1)}}
 
   # Ignore other escape sequences
@@ -523,7 +569,7 @@ defmodule Athanor.TUI do
     session_count = map_size(tui.sessions)
     theme = tui.theme
     left = " ⚗ ATHANOR │ model: #{tui.model} │ theme: #{theme.key} │ sessions: #{session_count}"
-    right = "Tab: switch session "
+    right = "Tab: input/deck "
     gap = max(1, width - String.length(left) - String.length(right))
     bar = String.slice(left <> String.duplicate(" ", gap) <> right, 0, width)
     padded = String.pad_trailing(bar, width)
@@ -537,21 +583,29 @@ defmodule Athanor.TUI do
 
   defp render_sidebar(tui, sidebar_w, height) do
     theme = tui.theme
+    focused? = tui.focus == :sessions
 
     header_style =
       Style.ansi256()
       |> Style.foreground(Theme.colour(theme, :muted))
       |> Style.bold()
 
+    header_label =
+      if focused?, do: " DECK SESSIONS [nav]", else: " DECK SESSIONS"
+
     header_line =
-      Style.render_to_string(header_style, String.pad_trailing(" DECK SESSIONS", sidebar_w))
+      Style.render_to_string(header_style, String.pad_trailing(header_label, sidebar_w))
 
     tree_entries = ordered_tree_entries(tui)
+    highlight_idx = min(tui.sidebar_index, max(0, length(tree_entries) - 1))
 
     item_lines =
-      Enum.map(tree_entries, fn {session, prefix} ->
+      tree_entries
+      |> Enum.with_index()
+      |> Enum.map(fn {{session, prefix}, idx} ->
         selected? = session.id == tui.active_id
-        pointer = if selected?, do: "▸", else: " "
+        highlighted? = focused? and idx == highlight_idx
+        pointer = if highlighted?, do: "▸", else: if(selected?, do: "•", else: " ")
         badge = status_badge(session.status)
         role_icon = if session.role == :conductor, do: "♦ ", else: prefix
         avail_title = max(4, sidebar_w - String.length(pointer) - String.length(role_icon) - 4)
@@ -561,10 +615,15 @@ defmodule Athanor.TUI do
 
         style =
           cond do
-            selected? ->
+            highlighted? ->
               Style.ansi256()
               |> Style.background(Theme.colour(theme, :selection_bg))
               |> Style.foreground(Theme.colour(theme, :selected_fg))
+              |> Style.bold()
+
+            selected? ->
+              Style.ansi256()
+              |> Style.foreground(Theme.colour(theme, :text))
               |> Style.bold()
 
             session.role == :conductor ->
@@ -630,7 +689,13 @@ defmodule Athanor.TUI do
       end
 
     left = " #{status_label} │ [#{role_tag}] #{tui.active_id}"
-    right = "Tab: switch │ ↑/↓: scroll │ /theme │ /quit "
+
+    right =
+      case tui.focus do
+        :sessions -> "j/k or ↑/↓: move │ Enter: select │ Tab: back "
+        :input -> "Tab: deck │ ↑/↓: scroll │ /theme │ /quit "
+      end
+
     gap = max(1, width - String.length(left) - String.length(right))
     bar = String.slice(left <> String.duplicate(" ", gap) <> right, 0, width)
     padded = String.pad_trailing(bar, width)
@@ -642,7 +707,8 @@ defmodule Athanor.TUI do
   end
 
   defp render_input_line(tui, width) do
-    prefix = "❯ "
+    deck_focused? = tui.focus == :sessions
+    prefix = if deck_focused?, do: "  ", else: "❯ "
     avail = max(1, width - String.length(prefix) - 1)
     input_len = String.length(tui.input)
 
@@ -654,10 +720,16 @@ defmodule Athanor.TUI do
       end
 
     styled_prefix =
-      Style.ansi256()
-      |> Style.foreground(Theme.colour(tui.theme, :accent))
-      |> Style.bold()
-      |> Style.render_to_string(prefix)
+      if deck_focused? do
+        Style.ansi256()
+        |> Style.foreground(Theme.colour(tui.theme, :muted))
+        |> Style.render_to_string(prefix)
+      else
+        Style.ansi256()
+        |> Style.foreground(Theme.colour(tui.theme, :accent))
+        |> Style.bold()
+        |> Style.render_to_string(prefix)
+      end
 
     cursor_col = String.length(prefix) + String.length(visible_input) + 1
     {styled_prefix <> visible_input, min(cursor_col, width)}
@@ -774,13 +846,44 @@ defmodule Athanor.TUI do
     |> Enum.to_list()
   end
 
-  defp cycle_session(%__MODULE__{session_order: []} = tui), do: tui
+  defp set_focus(%__MODULE__{} = tui, focus) when focus in [:input, :sessions] do
+    sidebar_index =
+      if focus == :sessions do
+        case Enum.find_index(ordered_tree_entries(tui), fn {s, _} -> s.id == tui.active_id end) do
+          nil -> 0
+          idx -> idx
+        end
+      else
+        tui.sidebar_index
+      end
 
-  defp cycle_session(%__MODULE__{session_order: order, active_id: active} = tui) do
-    idx = Enum.find_index(order, &(&1 == active)) || 0
-    next_id = Enum.at(order, rem(idx + 1, length(order)))
-    %{tui | active_id: next_id, scroll_offset: 0}
+    %{tui | focus: focus, sidebar_index: sidebar_index}
   end
+
+  defp entry_count(tui), do: length(ordered_tree_entries(tui))
+
+  defp set_sidebar_index(%__MODULE__{} = tui, index) do
+    %{tui | sidebar_index: clamp(index, 0, max(0, entry_count(tui) - 1))}
+  end
+
+  defp move_sidebar(%__MODULE__{} = tui, delta) do
+    set_sidebar_index(tui, tui.sidebar_index + delta)
+  end
+
+  defp select_sidebar_session(%__MODULE__{} = tui) do
+    entries = ordered_tree_entries(tui)
+    idx = min(tui.sidebar_index, max(0, length(entries) - 1))
+
+    case Enum.at(entries, idx) do
+      {session, _prefix} ->
+        %{tui | active_id: session.id, scroll_offset: 0, focus: :input}
+
+      nil ->
+        set_focus(tui, :input)
+    end
+  end
+
+  defp clamp(value, low, high), do: value |> max(low) |> min(high)
 
   defp resolve_parent_conductor(tui) do
     case Map.get(tui.sessions, tui.active_id) do
@@ -830,6 +933,7 @@ defmodule Athanor.TUI do
     do: "#{node} is running an older Athanor build"
 
   defp describe_daemon_error(:daemon_start_timeout), do: "daemon did not start in time"
+  defp describe_daemon_error(:daemon_not_ready), do: "daemon is still starting up"
   defp describe_daemon_error(other), do: inspect(other)
 
   defp ensure_session(tui, session_id, meta) do

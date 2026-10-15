@@ -47,9 +47,112 @@ defmodule Athanor.DaemonTest do
     assert Daemon.build_marker() == Daemon.build_marker()
   end
 
+  test "started?/0 reports the supervision tree of this node" do
+    assert Daemon.started?()
+  end
+
   test "usable?/1 is true for this node and false for an unreachable one" do
     assert Daemon.usable?(Node.self())
     refute Daemon.usable?(:"athanor_no_such_node@127.0.0.1")
+  end
+
+  test "reachable?/1 and incompatible?/1 are false for an unreachable node" do
+    bogus = :"athanor_no_such_node@127.0.0.1"
+
+    refute Daemon.reachable?(bogus)
+    refute Daemon.incompatible?(bogus)
+  end
+
+  test "connect_or_start_daemon/1 reports an unreachable daemon without spawning one" do
+    assert {:error, :daemon_unreachable} =
+             Daemon.connect_or_start_daemon(
+               daemon_node: :"athanor_no_such_node@127.0.0.1",
+               auto_start: false
+             )
+  end
+
+  @tag :external_node
+  test "a reachable-compatible node whose app never started is NOT usable (the boot race)" do
+    # Regression for: `mix athanor.daemon --restart` attaching inside the window where the
+    # daemon's modules are callable but `Athanor.AgentRegistry` does not exist yet.
+    # `mix run --no-start` loads the code without starting the application — precisely that
+    # window, deterministically, with no timing luck involved.
+    node = :"athanor_nostart_probe@127.0.0.1"
+    cookie = Athanor.Daemon.cookie()
+    elixir = System.find_executable("elixir")
+
+    System.cmd(
+      elixir,
+      [
+        "--erl",
+        "-detached",
+        "--name",
+        Atom.to_string(node),
+        "--cookie",
+        Atom.to_string(cookie),
+        "-S",
+        "mix",
+        "run",
+        "--no-start",
+        "--no-halt"
+      ],
+      cd: File.cwd!()
+    )
+
+    {:ok, _} = ensure_distribution(:"athanor_nostart_client@127.0.0.1")
+    Node.set_cookie(cookie)
+
+    # Wait until the remote code is fully loaded but the app still has not started.
+    if wait_for(fn -> remote_build(node) != nil end, 30_000) do
+      try do
+        # The code is loadable and the build matches...
+        assert remote_build(node) == Daemon.build_marker()
+
+        # ...but the tree is not up (and never will be, with --no-start), so it must not
+        # be treated as ready, and must not be misreported as an incompatible build.
+        refute :erpc.call(node, Daemon, :started?, [], 5_000)
+        refute Daemon.usable?(node)
+        refute Daemon.incompatible?(node)
+
+        assert {:error, :daemon_not_ready} =
+                 Daemon.connect_or_start_daemon(daemon_node: node, auto_start: false)
+      after
+        :erpc.cast(node, :init, :stop, [])
+      end
+    else
+      flunk("probe node #{node} never loaded Athanor's code; cannot exercise the boot race")
+    end
+  end
+
+  defp remote_build(node) do
+    :erpc.call(node, Daemon, :build_marker, [], 5_000)
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp ensure_distribution(name) do
+    if Node.alive?(), do: {:ok, Node.self()}, else: Node.start(name, :longnames)
+  end
+
+  defp wait_for(fun, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for(fun, deadline)
+  end
+
+  defp do_wait_for(fun, deadline) do
+    cond do
+      fun.() ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(50)
+        do_wait_for(fun, deadline)
+    end
   end
 
   test "attach_subscriber/2 short-circuits locally instead of calling :erpc" do
