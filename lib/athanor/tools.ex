@@ -1,15 +1,36 @@
 defmodule Athanor.Tools do
   @moduledoc """
-  Tool definitions (JSON Schemas) and local execution engine for Athanor agents.
+  Tool definitions (JSON Schemas) and local execution engine for Athanor Conductors
+  and Sub-Agents.
+
+  Includes:
+  - Workspace tools (`read_file`, `write_file`, `edit_file`, `bash`) available to all sessions.
+  - Orchestration tools (`launch_subagent`, `list_sessions`, `session_output`, `send_session`)
+    available to `:conductor` sessions.
   """
 
+  alias Athanor.{Bus, Orchestrator}
+
   @default_bash_timeout_ms 30_000
+  @default_subagent_wait_timeout_ms 120_000
 
   @doc """
   Returns the OpenAI-compatible tool definitions sent to the LLM.
+  Options:
+  - `:role` — `:conductor` (includes orchestration tools) or `:worker` (workspace tools only).
+    Defaults to `:worker` for backwards compatibility when called with no args.
   """
-  @spec schemas() :: [map()]
-  def schemas do
+  @spec schemas(keyword()) :: [map()]
+  def schemas(opts \\ []) do
+    role = Keyword.get(opts, :role, :worker)
+
+    case role do
+      :conductor -> workspace_schemas() ++ conductor_schemas()
+      _ -> workspace_schemas()
+    end
+  end
+
+  defp workspace_schemas do
     [
       %{
         "type" => "function",
@@ -96,11 +117,91 @@ defmodule Athanor.Tools do
     ]
   end
 
+  defp conductor_schemas do
+    [
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "launch_subagent",
+          "description" =>
+            "Spawn a supervised child sub-agent worker to execute a task in the background (or wait for its result if wait=true).",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "title" => %{
+                "type" => "string",
+                "description" => "Short descriptive title for the sub-agent (e.g. 'Audit tests')."
+              },
+              "prompt" => %{
+                "type" => "string",
+                "description" => "Detailed task instructions for the sub-agent."
+              },
+              "wait" => %{
+                "type" => "boolean",
+                "description" =>
+                  "If true, block until the sub-agent completes its turn and return its output. Defaults to false (fire-and-forget; parent is notified via PubSub when done)."
+              }
+            },
+            "required" => ["title", "prompt"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "list_sessions",
+          "description" =>
+            "List all active Conductors and Sub-Agents with their IDs, titles, roles, parent IDs, and status.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{}
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "session_output",
+          "description" => "Get the current status and latest output from a session by ID.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "session_id" => %{
+                "type" => "string",
+                "description" => "ID of the sub-agent or conductor session."
+              }
+            },
+            "required" => ["session_id"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "send_session",
+          "description" =>
+            "Send a follow-up message or prompt to an existing sub-agent or conductor over PubSub.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "session_id" => %{
+                "type" => "string",
+                "description" => "Target session ID."
+              },
+              "message" => %{
+                "type" => "string",
+                "description" => "Message to enqueue/send to the session."
+              }
+            },
+            "required" => ["session_id", "message"]
+          }
+        }
+      }
+    ]
+  end
+
   @doc """
   Executes a named tool with a map of string-keyed arguments (or a JSON-encoded string).
-  Options:
-  - `:cd` — base working directory for resolving relative paths and running bash commands (defaults to `File.cwd!()`).
-  - `:timeout` — timeout in milliseconds for `bash` (defaults to `30_000`).
   """
   @spec execute(String.t(), map() | String.t(), keyword()) ::
           {:ok, String.t()} | {:error, String.t()}
@@ -198,13 +299,118 @@ defmodule Athanor.Tools do
     end
   end
 
+  def execute("launch_subagent", %{"title" => title, "prompt" => prompt} = args, opts)
+      when is_binary(title) and is_binary(prompt) do
+    parent_id = Keyword.get(opts, :session_id, "conductor-main")
+    cd = Keyword.get(opts, :cd, File.cwd!())
+    wait? = Map.get(args, "wait", false) == true
+    wait_timeout = Keyword.get(opts, :wait_timeout, @default_subagent_wait_timeout_ms)
+
+    child_id =
+      "worker-#{Registry.count(Athanor.AgentRegistry) + 1}-" <>
+        Base.encode16(:crypto.strong_rand_bytes(2), case: :lower)
+
+    if wait? do
+      Bus.subscribe("agent:#{child_id}:events")
+    end
+
+    spawn_opts = [
+      id: child_id,
+      cd: cd,
+      notify_parent_on_done: not wait?
+    ]
+
+    case Orchestrator.launch_subagent(parent_id, title, prompt, spawn_opts) do
+      {:ok, ^child_id, _pid} ->
+        if wait? do
+          result = await_subagent(child_id, wait_timeout)
+          Bus.unsubscribe("agent:#{child_id}:events")
+          result
+        else
+          {:ok,
+           "Spawned sub-agent '#{title}' with session_id=#{child_id} (running in background; you will receive a [DONE] notification when it finishes)."}
+        end
+
+      {:error, reason} ->
+        if wait?, do: Bus.unsubscribe("agent:#{child_id}:events")
+        {:error, "Failed to launch sub-agent: #{inspect(reason)}"}
+    end
+  end
+
+  def execute("list_sessions", _args, _opts) do
+    sessions =
+      Orchestrator.list_sessions()
+      |> Enum.map(fn s ->
+        %{
+          id: s.id,
+          title: s.title,
+          role: s.role,
+          parent_id: s.parent_id,
+          status: s.status,
+          last_assistant: String.slice(s.last_assistant, 0, 120)
+        }
+      end)
+
+    {:ok, JSON.encode!(sessions)}
+  end
+
+  def execute("session_output", %{"session_id" => session_id}, _opts)
+      when is_binary(session_id) do
+    case Orchestrator.session_output(session_id) do
+      {:ok, info} ->
+        payload = %{
+          id: info.id,
+          title: info.title,
+          role: info.role,
+          parent_id: info.parent_id,
+          status: info.status,
+          last_assistant: info.last_assistant
+        }
+
+        {:ok, JSON.encode!(payload)}
+
+      {:error, :not_found} ->
+        {:error, "Session not found: #{session_id}"}
+    end
+  end
+
+  def execute("send_session", %{"session_id" => session_id, "message" => message}, _opts)
+      when is_binary(session_id) and is_binary(message) do
+    case Orchestrator.send_session(session_id, message) do
+      :ok -> {:ok, "Sent message to session #{session_id} via PubSub"}
+      {:error, :not_found} -> {:error, "Session not found: #{session_id}"}
+    end
+  end
+
   def execute(tool_name, _args, _opts)
-      when tool_name in ["read_file", "write_file", "edit_file", "bash"] do
+      when tool_name in [
+             "read_file",
+             "write_file",
+             "edit_file",
+             "bash",
+             "launch_subagent",
+             "list_sessions",
+             "session_output",
+             "send_session"
+           ] do
     {:error, "Missing or invalid required arguments for tool #{tool_name}"}
   end
 
   def execute(unknown_tool, _args, _opts) do
     {:error, "Unknown tool: #{unknown_tool}"}
+  end
+
+  defp await_subagent(child_id, timeout) do
+    receive do
+      {:agent_event, ^child_id, {:turn_complete, output}} ->
+        {:ok, output}
+
+      {:agent_event, ^child_id, {:error, reason}} ->
+        {:error, "Sub-agent #{child_id} failed: #{reason}"}
+    after
+      timeout ->
+        {:error, "Timed out waiting for sub-agent #{child_id} after #{timeout}ms"}
+    end
   end
 
   defp resolve_path(path, opts) do

@@ -8,12 +8,11 @@ defmodule Athanor.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: Athanor.Worker.start_link(arg)
-      # {Athanor.Worker, arg}
+      {Registry, keys: :unique, name: Athanor.AgentRegistry},
+      {Registry, keys: :duplicate, name: Athanor.PubSub},
+      {DynamicSupervisor, strategy: :one_for_one, name: Athanor.AgentSupervisor}
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Athanor.Supervisor]
     Supervisor.start_link(children, opts)
   end

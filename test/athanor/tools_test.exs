@@ -5,13 +5,24 @@ defmodule Athanor.ToolsTest do
 
   @moduletag :tmp_dir
 
-  describe "schemas/0" do
-    test "returns tool schemas for all 4 core tools" do
+  describe "schemas/0 and schemas/1" do
+    test "returns tool schemas for all 4 core workspace tools by default" do
       names =
         Tools.schemas()
         |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
 
       assert names == ["read_file", "write_file", "edit_file", "bash"]
+    end
+
+    test "includes conductor orchestration tools when role: :conductor" do
+      names =
+        Tools.schemas(role: :conductor)
+        |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
+
+      assert "launch_subagent" in names
+      assert "list_sessions" in names
+      assert "session_output" in names
+      assert "send_session" in names
     end
   end
 

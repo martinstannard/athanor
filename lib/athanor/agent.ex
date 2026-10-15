@@ -1,27 +1,45 @@
 defmodule Athanor.Agent do
   @moduledoc """
-  GenServer implementing the core recursive agent loop.
+  GenServer implementing the core recursive agent loop for both Conductors
+  and Sub-Agents (workers).
 
-  Maintains conversation history, spawns non-blocking LLM streaming tasks,
-  executes requested tool calls via `Athanor.Tools`, and broadcasts real-time
-  `{:agent_event, event}` messages to its subscriber (e.g. `Athanor.TUI`).
+  All inter-agent control and event notifications flow through `Athanor.Bus` PubSub:
+  - Subscribes to `"agent:<id>:inbox"` for commands (`{:prompt, text}`, `:cancel`, etc.)
+  - Conductors subscribe to `"conductor:<id>:children"` to receive sub-agent completion events
+  - Publishes all streaming deltas, tool events, and lifecycle transitions via `Athanor.Bus.publish_event/3`
   """
 
   use GenServer
 
-  alias Athanor.{Config, LLM, Tools}
+  alias Athanor.{Bus, Config, LLM, Tools}
 
   @default_max_turns 20
 
-  @default_system_prompt """
-  You are Athanor, a concise and capable AI coding agent running on Elixir/OTP.
-  Use the provided tools (read_file, write_file, edit_file, bash) to inspect files,
-  make edits, and run commands when needed.
+  @default_conductor_prompt """
+  You are an Athanor Conductor — a persistent orchestrator on Elixir/OTP.
+  You can handle tasks directly using file/bash tools, or delegate parallel/isolated
+  workstreams to child sub-agents using `launch_subagent`, `list_sessions`,
+  `session_output`, and `send_session`.
+  When a background sub-agent finishes, you will automatically receive a
+  `[DONE] Sub-agent ...` notification message.
   """
 
-  @type status :: :idle | :streaming | :executing_tools
+  @default_worker_prompt """
+  You are an Athanor Sub-Agent worker spawned by a parent Conductor.
+  Complete your assigned task thoroughly using the provided tools.
+  When your task is completely finished, end your final message with:
+  ===ATHANOR_DONE=== status=ok summary=<one-line summary of what you accomplished>
+  (or status=fail if blocked).
+  """
+
+  @type role :: :conductor | :worker
+  @type status :: :idle | :streaming | :executing_tools | :error
 
   defstruct [
+    :id,
+    :title,
+    :role,
+    :parent_id,
     :subscriber,
     :session_id,
     :model,
@@ -29,23 +47,17 @@ defmodule Athanor.Agent do
     :llm_fn,
     :current_task,
     :max_turns,
+    :notify_parent_on_done,
     status: :idle,
     turn_count: 0,
-    messages: []
+    messages: [],
+    prompt_queue: :queue.new()
   ]
 
   # Client API
 
   @doc """
   Starts an `Athanor.Agent` process.
-
-  Options:
-  - `:subscriber` — PID to receive `{:agent_event, event}` messages (defaults to caller).
-  - `:system_prompt` — Initial system prompt.
-  - `:model` — Model name (defaults to `Athanor.Config.model()`).
-  - `:cd` — Working directory for tool execution (defaults to `File.cwd!()`).
-  - `:llm_fn` — Custom LLM streaming function `fn messages, tools, agent_pid -> ... end` (useful for testing).
-  - `:name` — Optional GenServer registration name.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -58,46 +70,114 @@ defmodule Athanor.Agent do
   end
 
   @doc """
-  Submits a user prompt to the agent and starts the agent loop.
+  Submits a user prompt to the agent (accepts a PID, registered name, or session ID string).
   Returns `:ok` or `{:error, :busy}` if a turn is already in progress.
   """
-  @spec prompt(GenServer.server(), String.t()) :: :ok | {:error, :busy}
+  @spec prompt(GenServer.server() | String.t(), String.t()) :: :ok | {:error, :busy}
+  def prompt(agent_id, text) when is_binary(agent_id) and is_binary(text) do
+    Bus.send_command(agent_id, {:prompt, text})
+  end
+
   def prompt(agent, text) when is_binary(text) do
     GenServer.call(agent, {:prompt, text})
   end
 
   @doc """
+  Enqueues a message over PubSub (or via GenServer cast) to be processed immediately
+  if `:idle`, or as soon as the current turn finishes.
+  """
+  @spec enqueue_prompt(GenServer.server() | String.t(), String.t()) :: :ok
+  def enqueue_prompt(agent_id, text) when is_binary(agent_id) and is_binary(text) do
+    Bus.send_command(agent_id, {:enqueue_prompt, text})
+  end
+
+  def enqueue_prompt(agent, text) when is_binary(text) do
+    GenServer.cast(agent, {:enqueue_prompt, text})
+  end
+
+  @doc """
   Cancels any in-flight LLM stream or tool execution and returns the agent to `:idle`.
   """
-  @spec cancel(GenServer.server()) :: :ok
+  @spec cancel(GenServer.server() | String.t()) :: :ok
+  def cancel(agent_id) when is_binary(agent_id) do
+    Bus.send_command(agent_id, :cancel)
+  end
+
   def cancel(agent) do
     GenServer.call(agent, :cancel)
   end
 
   @doc """
-  Updates the subscriber PID receiving `{:agent_event, event}` messages.
+  Updates the direct subscriber PID receiving `{:agent_event, event}` messages.
   """
-  @spec subscribe(GenServer.server(), pid()) :: :ok
-  def subscribe(agent, pid) when is_pid(pid) do
+  @spec subscribe(GenServer.server(), pid() | nil) :: :ok
+  def subscribe(agent, pid) when is_pid(pid) or is_nil(pid) do
     GenServer.call(agent, {:subscribe, pid})
   end
 
   @doc """
-  Returns the current state snapshot (`%{status: ..., messages: ..., model: ...}`).
+  Returns the current state snapshot.
   """
   @spec get_state(GenServer.server()) :: map()
   def get_state(agent) do
     GenServer.call(agent, :get_state)
   end
 
+  @doc """
+  Parses an `===ATHANOR_DONE===` or `===AGENTDECK_DONE===` completion sentinel line
+  from an assistant message if present.
+  """
+  @spec parse_done_sentinel(String.t()) ::
+          {:ok, %{status: String.t(), summary: String.t()}} | :none
+  def parse_done_sentinel(text) when is_binary(text) do
+    regex = ~r/===(?:ATHANOR|AGENTDECK)_DONE===\s+status=(ok|fail)\s+summary=(.+)$/m
+
+    case Regex.run(regex, text) do
+      [_, status, summary] ->
+        {:ok, %{status: status, summary: String.trim(summary)}}
+
+      _ ->
+        :none
+    end
+  end
+
   # GenServer Callbacks
 
   @impl true
   def init(opts) do
-    system_prompt = Keyword.get(opts, :system_prompt, @default_system_prompt)
+    id = Keyword.get(opts, :id, "conductor-main")
+    parent_id = Keyword.get(opts, :parent_id)
+    role = Keyword.get(opts, :role, if(parent_id, do: :worker, else: :conductor))
+    title = Keyword.get(opts, :title) || Keyword.get(opts, :label) || id
+
+    default_prompt =
+      case role do
+        :conductor -> @default_conductor_prompt
+        :worker -> @default_worker_prompt
+      end
+
+    system_prompt = Keyword.get(opts, :system_prompt, default_prompt)
     model = Keyword.get(opts, :model, Config.model())
     cd = Keyword.get(opts, :cd, File.cwd!())
     max_turns = Keyword.get(opts, :max_turns, @default_max_turns)
+    notify_parent = Keyword.get(opts, :notify_parent_on_done, parent_id != nil)
+
+    if Keyword.get(opts, :register, false) and Process.whereis(Athanor.AgentRegistry) do
+      Registry.register(Athanor.AgentRegistry, id, %{
+        title: title,
+        role: role,
+        parent_id: parent_id,
+        model: model
+      })
+    end
+
+    # Subscribe to our own PubSub control inbox
+    Bus.subscribe("agent:#{id}:inbox")
+
+    # Conductors subscribe to their children's lifecycle topic
+    if role == :conductor do
+      Bus.subscribe("conductor:#{id}:children")
+    end
 
     session_id =
       Keyword.get_lazy(opts, :session_id, fn ->
@@ -109,35 +189,36 @@ defmodule Athanor.Agent do
     end
 
     state = %__MODULE__{
-      subscriber: Keyword.fetch!(opts, :subscriber),
+      id: id,
+      title: title,
+      role: role,
+      parent_id: parent_id,
+      subscriber: Keyword.get(opts, :subscriber),
       session_id: session_id,
       model: model,
       cd: cd,
       max_turns: max_turns,
+      notify_parent_on_done: notify_parent,
       llm_fn: Keyword.get(opts, :llm_fn, default_llm_fn),
       messages: [%{role: "system", content: String.trim(system_prompt)}]
     }
 
+    notify(state, {:session_started, snapshot_meta(state)})
     {:ok, state}
   end
 
   @impl true
-  def handle_call({:prompt, _text}, _from, %{status: status} = state) when status != :idle do
+  def handle_call({:prompt, _text}, _from, %{status: status} = state)
+      when status in [:streaming, :executing_tools] do
     {:reply, {:error, :busy}, state}
   end
 
   def handle_call({:prompt, text}, _from, state) do
-    user_msg = %{role: "user", content: text}
-    state = %{state | messages: state.messages ++ [user_msg], turn_count: 0}
-    notify(state, {:user_message, text})
-    {:reply, :ok, start_llm_turn(state)}
+    {:reply, :ok, begin_user_turn(state, text)}
   end
 
   def handle_call(:cancel, _from, state) do
-    state = kill_current_task(state)
-    state = set_status(state, :idle)
-    notify(state, :cancelled)
-    {:reply, :ok, state}
+    {:reply, :ok, do_cancel(state)}
   end
 
   def handle_call({:subscribe, pid}, _from, state) do
@@ -146,6 +227,11 @@ defmodule Athanor.Agent do
 
   def handle_call(:get_state, _from, state) do
     snapshot = %{
+      id: state.id,
+      title: state.title,
+      label: state.title,
+      role: state.role,
+      parent_id: state.parent_id,
       status: state.status,
       messages: state.messages,
       model: state.model,
@@ -156,6 +242,41 @@ defmodule Athanor.Agent do
   end
 
   @impl true
+  def handle_cast({:enqueue_prompt, text}, state) do
+    {:noreply, do_enqueue_prompt(state, text)}
+  end
+
+  @impl true
+  # PubSub commands arriving on "agent:<id>:inbox"
+  def handle_info({:bus_command, {:prompt, text}}, %{status: status} = state)
+      when status in [:idle, :error] do
+    {:noreply, begin_user_turn(state, text)}
+  end
+
+  def handle_info({:bus_command, {:prompt, text}}, state) do
+    {:noreply, do_enqueue_prompt(state, text)}
+  end
+
+  def handle_info({:bus_command, {:enqueue_prompt, text}}, state) do
+    {:noreply, do_enqueue_prompt(state, text)}
+  end
+
+  def handle_info({:bus_command, :cancel}, state) do
+    {:noreply, do_cancel(state)}
+  end
+
+  # Child completion event arriving on "conductor:<id>:children"
+  def handle_info(
+        {:agent_event, _child_id,
+         {:child_done, %{child_id: cid, title: ctitle, status: cstatus, summary: csummary}}},
+        %{role: :conductor} = state
+      ) do
+    msg =
+      "[DONE] Sub-agent '#{ctitle}' (#{cid}) finished: status=#{cstatus} summary=#{csummary}"
+
+    {:noreply, do_enqueue_prompt(state, msg)}
+  end
+
   def handle_info({:llm_delta, chunk}, state) do
     notify(state, {:text_delta, chunk})
     {:noreply, state}
@@ -169,7 +290,8 @@ defmodule Athanor.Agent do
       [] ->
         state = set_status(state, :idle)
         notify(state, {:turn_complete, assistant_msg.content})
-        {:noreply, state}
+        maybe_publish_child_done(state, assistant_msg.content)
+        {:noreply, drain_prompt_queue(state)}
 
       tool_calls when is_list(tool_calls) ->
         {:noreply, start_tool_execution(state, tool_calls)}
@@ -178,7 +300,7 @@ defmodule Athanor.Agent do
 
   def handle_info({:llm_result, {:error, reason}}, %{current_task: {_pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
-    state = %{state | current_task: nil} |> set_status(:idle)
+    state = %{state | current_task: nil} |> set_status(:error)
     notify(state, {:error, reason})
     {:noreply, state}
   end
@@ -194,7 +316,7 @@ defmodule Athanor.Agent do
     }
 
     if state.turn_count >= state.max_turns do
-      state = set_status(state, :idle)
+      state = set_status(state, :error)
       notify(state, {:error, "Reached maximum tool-call turns (#{state.max_turns})"})
       {:noreply, state}
     else
@@ -211,10 +333,12 @@ defmodule Athanor.Agent do
     state = %{state | current_task: nil} |> set_status(:idle)
 
     if reason != :normal do
+      state = set_status(state, :error)
       notify(state, {:error, "Task crashed: #{inspect(reason)}"})
+      {:noreply, state}
+    else
+      {:noreply, state}
     end
-
-    {:noreply, state}
   end
 
   def handle_info(_msg, state) do
@@ -223,11 +347,43 @@ defmodule Athanor.Agent do
 
   # Internal Helpers
 
+  defp do_enqueue_prompt(%{status: status} = state, text) when status in [:idle, :error] do
+    begin_user_turn(state, text)
+  end
+
+  defp do_enqueue_prompt(state, text) do
+    %{state | prompt_queue: :queue.in(text, state.prompt_queue)}
+  end
+
+  defp do_cancel(state) do
+    state = kill_current_task(state)
+    state = set_status(state, :idle)
+    notify(state, :cancelled)
+    state
+  end
+
+  defp begin_user_turn(state, text) do
+    user_msg = %{role: "user", content: text}
+    state = %{state | messages: state.messages ++ [user_msg], turn_count: 0}
+    notify(state, {:user_message, text})
+    start_llm_turn(state)
+  end
+
+  defp drain_prompt_queue(state) do
+    case :queue.out(state.prompt_queue) do
+      {{:value, next_prompt}, rest} ->
+        begin_user_turn(%{state | prompt_queue: rest}, next_prompt)
+
+      {:empty, _} ->
+        state
+    end
+  end
+
   defp start_llm_turn(state) do
     state = set_status(state, :streaming)
     agent_pid = self()
     messages = state.messages
-    tools = Tools.schemas()
+    tools = Tools.schemas(role: state.role)
     llm_fn = state.llm_fn
 
     {pid, ref} =
@@ -242,6 +398,7 @@ defmodule Athanor.Agent do
     state = set_status(state, :executing_tools)
     agent_pid = self()
     cd = state.cd
+    session_id = state.id
 
     {pid, ref} =
       spawn_monitor(fn ->
@@ -253,7 +410,7 @@ defmodule Athanor.Agent do
             send(agent_pid, {:tool_event, {:tool_start, name, raw_args}})
 
             output =
-              case Tools.execute(name, raw_args, cd: cd) do
+              case Tools.execute(name, raw_args, cd: cd, session_id: session_id) do
                 {:ok, res} ->
                   send(agent_pid, {:tool_event, {:tool_end, name, {:ok, res}}})
                   res
@@ -276,6 +433,40 @@ defmodule Athanor.Agent do
     %{state | current_task: {pid, ref}}
   end
 
+  defp maybe_publish_child_done(
+         %{parent_id: parent_id, notify_parent_on_done: true} = state,
+         content
+       )
+       when is_binary(parent_id) do
+    {done_status, summary} =
+      case parse_done_sentinel(content || "") do
+        {:ok, %{status: st, summary: sum}} ->
+          {st, sum}
+
+        :none ->
+          first_line =
+            (content || "")
+            |> String.trim()
+            |> String.split("\n")
+            |> List.first("Turn completed")
+            |> String.slice(0, 120)
+
+          {"ok", first_line}
+      end
+
+    done_event = %{
+      child_id: state.id,
+      title: state.title,
+      status: done_status,
+      summary: summary,
+      output: content
+    }
+
+    notify(state, {:child_done, done_event})
+  end
+
+  defp maybe_publish_child_done(_state, _content), do: :ok
+
   defp kill_current_task(%{current_task: nil} = state), do: state
 
   defp kill_current_task(%{current_task: {pid, ref}} = state) do
@@ -290,9 +481,22 @@ defmodule Athanor.Agent do
     updated
   end
 
-  defp notify(%{subscriber: pid}, event) when is_pid(pid) do
-    send(pid, {:agent_event, event})
+  defp snapshot_meta(state) do
+    %{
+      id: state.id,
+      title: state.title,
+      role: state.role,
+      parent_id: state.parent_id,
+      model: state.model,
+      status: state.status
+    }
   end
 
-  defp notify(_state, _event), do: :ok
+  defp notify(state, event) do
+    if is_pid(state.subscriber) do
+      send(state.subscriber, {:agent_event, event})
+    end
+
+    Bus.publish_event(state.id, state.parent_id, event)
+  end
 end
