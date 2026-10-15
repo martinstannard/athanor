@@ -112,11 +112,21 @@ defmodule Athanor.Daemon do
   """
   @spec start_remote_relay(pid()) :: pid()
   def start_remote_relay(client_pid) when is_pid(client_pid) do
-    spawn(fn ->
-      ref = Process.monitor(client_pid)
-      Bus.subscribe("deck:events")
-      relay_loop(client_pid, ref)
-    end)
+    caller = self()
+
+    pid =
+      spawn(fn ->
+        ref = Process.monitor(client_pid)
+        Bus.subscribe("deck:events")
+        send(caller, {:relay_ready, self()})
+        relay_loop(client_pid, ref)
+      end)
+
+    receive do
+      {:relay_ready, ^pid} -> pid
+    after
+      5_000 -> pid
+    end
   end
 
   defp relay_loop(client_pid, ref) do

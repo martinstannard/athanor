@@ -19,8 +19,8 @@ defmodule Mix.Tasks.Athanor.Daemon do
   def run(args) do
     {opts, _rest, _invalid} =
       OptionParser.parse(args,
-        strict: [status: :boolean, stop: :boolean, model: :string],
-        aliases: [m: :model]
+        strict: [status: :boolean, stop: :boolean, restart: :boolean, model: :string],
+        aliases: [m: :model, r: :restart]
       )
 
     cond do
@@ -29,6 +29,9 @@ defmodule Mix.Tasks.Athanor.Daemon do
 
       Keyword.get(opts, :stop, false) ->
         stop_daemon()
+
+      Keyword.get(opts, :restart, false) ->
+        restart_daemon(opts)
 
       true ->
         run_foreground_daemon(opts)
@@ -54,10 +57,38 @@ defmodule Mix.Tasks.Athanor.Daemon do
     case Daemon.connect_or_start_daemon(auto_start: false) do
       {:ok, target} ->
         :erpc.cast(target, :init, :stop, [])
+        wait_until_stopped(target, 5_000)
         Mix.shell().info("Stopped Athanor daemon at #{target}.")
 
       {:error, _} ->
         Mix.shell().info("Athanor daemon is not running.")
+    end
+  end
+
+  defp restart_daemon(opts) do
+    stop_daemon()
+
+    case Daemon.connect_or_start_daemon(Keyword.put(opts, :auto_start, true)) do
+      {:ok, target} ->
+        {:ok, main_id, _} = Daemon.ensure_main_conductor_and_hydrate(target, opts)
+        Mix.shell().info("Restarted Athanor daemon at #{target} (main conductor: #{main_id}).")
+
+      {:error, reason} ->
+        Mix.raise("Failed to restart Athanor daemon: #{inspect(reason)}")
+    end
+  end
+
+  defp wait_until_stopped(target, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_stopped(target, deadline)
+  end
+
+  defp do_wait_stopped(target, deadline) do
+    if :net_adm.ping(target) == :pang or System.monotonic_time(:millisecond) >= deadline do
+      :ok
+    else
+      Process.sleep(50)
+      do_wait_stopped(target, deadline)
     end
   end
 

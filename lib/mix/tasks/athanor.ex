@@ -17,9 +17,13 @@ defmodule Mix.Tasks.Athanor do
 
     {opts, _rest, _invalid} =
       OptionParser.parse(args,
-        strict: [model: :string, local: :boolean],
-        aliases: [m: :model]
+        strict: [model: :string, local: :boolean, restart: :boolean],
+        aliases: [m: :model, r: :restart]
       )
+
+    if Keyword.get(opts, :restart, false) do
+      Mix.Tasks.Athanor.Daemon.run(["--restart"])
+    end
 
     Athanor.TUI.run(opts)
   end
