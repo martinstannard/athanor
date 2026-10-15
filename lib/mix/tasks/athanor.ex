@@ -17,7 +17,7 @@ defmodule Mix.Tasks.Athanor do
 
     {opts, _rest, _invalid} =
       OptionParser.parse(args,
-        strict: [model: :string],
+        strict: [model: :string, local: :boolean],
         aliases: [m: :model]
       )
 

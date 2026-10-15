@@ -6,14 +6,17 @@ defmodule Athanor.TUI do
   - Left sidebar: Hierarchical tree of Conductors (`♦`) and child Sub-Agents (`├─`/`└─`)
     with live status indicators (`●` running, `○` idle, `✕` error).
   - Right viewport: Streaming conversation and tool execution trace for the selected session.
+    Assistant output is rendered through `Athanor.Markdown`, so headings, emphasis,
+    inline/code blocks, links, lists, and box-drawing tables are syntax-highlighted inline.
   - All events and commands flow through `Athanor.Bus` PubSub (`"deck:events"` and `"agent:<id>:inbox"`).
   """
 
-  alias Athanor.{Agent, Config, Orchestrator}
+  alias Athanor.{Agent, Config, Daemon, Markdown}
   alias Termite.{Screen, Style, Terminal}
 
   defstruct [
     :agent,
+    :daemon_node,
     :active_id,
     :model,
     width: 80,
@@ -43,6 +46,7 @@ defmodule Athanor.TUI do
 
   @type t :: %__MODULE__{
           agent: GenServer.server() | nil,
+          daemon_node: node() | nil,
           active_id: String.t(),
           model: String.t(),
           width: pos_integer(),
@@ -61,6 +65,7 @@ defmodule Athanor.TUI do
     active_id = Keyword.get(opts, :active_id, "conductor-main")
     title = Keyword.get(opts, :title, "conductor-main")
     model = Keyword.get(opts, :model, Config.model())
+    daemon_node = Keyword.get(opts, :daemon_node, Node.self())
 
     initial_session = %{
       id: active_id,
@@ -75,8 +80,9 @@ defmodule Athanor.TUI do
       streaming_buffer: nil
     }
 
-    %__MODULE__{
+    base = %__MODULE__{
       agent: Keyword.get(opts, :agent),
+      daemon_node: daemon_node,
       active_id: active_id,
       model: model,
       width: Keyword.get(opts, :width, 80),
@@ -84,6 +90,53 @@ defmodule Athanor.TUI do
       sessions: %{active_id => initial_session},
       session_order: [active_id]
     }
+
+    case Keyword.get(opts, :hydrated_sessions) do
+      sessions when is_list(sessions) and sessions != [] ->
+        hydrate_sessions(base, sessions)
+
+      _ ->
+        base
+    end
+  end
+
+  @doc """
+  Populates the TUI state from a list of live daemon session snapshots (including message history).
+  """
+  @spec hydrate_sessions(t(), [map()]) :: t()
+  def hydrate_sessions(%__MODULE__{} = tui, sessions) when is_list(sessions) do
+    Enum.reduce(sessions, tui, fn s, acc ->
+      entries =
+        case Daemon.messages_to_tui_entries(Map.get(s, :messages, [])) do
+          [] when s.id == acc.active_id ->
+            [
+              {:system,
+               "Attached to live Athanor daemon (#{acc.daemon_node}). Press Ctrl+Q or /detach to detach without stopping agents."}
+            ]
+
+          other ->
+            other
+        end
+
+      view = %{
+        id: s.id,
+        title: Map.get(s, :title, s.id),
+        role: Map.get(s, :role, :worker),
+        parent_id: Map.get(s, :parent_id),
+        status: Map.get(s, :status, :idle),
+        entries: entries,
+        streaming_buffer: nil
+      }
+
+      order =
+        if s.id in acc.session_order do
+          acc.session_order
+        else
+          acc.session_order ++ [s.id]
+        end
+
+      %{acc | sessions: Map.put(acc.sessions, s.id, view), session_order: order}
+    end)
   end
 
   # Convenience accessors for active session (keeps tests and callers ergonomic)
@@ -101,26 +154,32 @@ defmodule Athanor.TUI do
 
   @doc """
   Starts the interactive TUI loop subscribed to `Athanor.Bus` (`"deck:events"`).
+  By default (`daemon: true`), connects to (or auto-starts) the persistent background
+  `athanor_daemon@127.0.0.1` node so SSH and local sessions share the same live server.
+  Pass `local: true` to run in-process without a separate daemon.
   """
   @spec run(keyword()) :: :ok
   def run(opts \\ []) do
     model = Keyword.get(opts, :model, Config.model())
-    :ok = Orchestrator.subscribe()
+    local? = Keyword.get(opts, :local, false)
 
-    main_id = "conductor-main"
-
-    {:ok, ^main_id, agent} =
-      case Orchestrator.lookup(main_id) do
-        {:ok, pid} ->
-          {:ok, main_id, pid}
-
-        :error ->
-          Orchestrator.start_conductor(
-            id: main_id,
-            title: "conductor-main",
-            model: model
-          )
+    target_node =
+      if local? do
+        Node.self()
+      else
+        case Daemon.connect_or_start_daemon(opts) do
+          {:ok, daemon} -> daemon
+          {:error, _reason} -> Node.self()
+        end
       end
+
+    {:ok, relay_pid} = Daemon.attach_subscriber(target_node, self())
+
+    {:ok, main_id, hydrated_sessions} =
+      Daemon.ensure_main_conductor_and_hydrate(target_node,
+        main_id: "conductor-main",
+        model: model
+      )
 
     term =
       Terminal.start()
@@ -129,16 +188,19 @@ defmodule Athanor.TUI do
 
     tui =
       new(
-        agent: agent,
+        daemon_node: target_node,
         active_id: main_id,
         model: model,
         width: term.size.width,
-        height: term.size.height
+        height: term.size.height,
+        hydrated_sessions: hydrated_sessions
       )
 
     try do
       loop(term, tui)
     after
+      send(relay_pid, :detach)
+
       term
       |> Screen.show_cursor()
       |> Screen.exit_alt_screen()
@@ -151,6 +213,7 @@ defmodule Athanor.TUI do
   defp loop(term, tui) do
     term = Terminal.write(term, render_frame(tui))
     reader_ref = term.reader
+    target_node = tui.daemon_node || Node.self()
 
     receive do
       {^reader_ref, {:data, key}} ->
@@ -159,12 +222,12 @@ defmodule Athanor.TUI do
             :ok
 
           {:submit, prompt, tui} ->
-            _ = Orchestrator.send_session(tui.active_id, prompt)
+            _ = Daemon.send_session(target_node, tui.active_id, prompt)
             loop(term, tui)
 
           {:spawn_subagent, title, prompt, tui} ->
             parent_id = resolve_parent_conductor(tui)
-            {:ok, child_id, _pid} = Orchestrator.launch_subagent(parent_id, title, prompt)
+            {:ok, child_id, _pid} = Daemon.launch_subagent(target_node, parent_id, title, prompt)
 
             tui =
               ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
@@ -172,7 +235,8 @@ defmodule Athanor.TUI do
             loop(term, tui)
 
           {:spawn_conductor, title, tui} ->
-            {:ok, cond_id, _pid} = Orchestrator.start_conductor(title: title, model: tui.model)
+            {:ok, cond_id, _pid} =
+              Daemon.start_conductor(target_node, title: title, model: tui.model)
 
             tui =
               tui
@@ -182,7 +246,7 @@ defmodule Athanor.TUI do
             loop(term, tui)
 
           {:cancel, tui} ->
-            _ = Orchestrator.cancel_session(tui.active_id)
+            _ = Daemon.cancel_session(target_node, tui.active_id)
             loop(term, tui)
 
           {:cont, tui} ->
@@ -302,9 +366,10 @@ defmodule Athanor.TUI do
           | {:spawn_conductor, String.t(), t()}
           | {:cancel, t()}
           | {:cont, t()}
-  # Ctrl+C (<<3>>) or Ctrl+D (<<4>>)
+  # Ctrl+C (<<3>>), Ctrl+D (<<4>>), or Ctrl+Q (<<17>>) detaches/quits TUI client
   def handle_key(tui, <<3>>), do: {:quit, tui}
   def handle_key(tui, <<4>>), do: {:quit, tui}
+  def handle_key(tui, <<17>>), do: {:quit, tui}
 
   # Tab switches active session in the deck
   def handle_key(tui, "\t") do
@@ -339,7 +404,7 @@ defmodule Athanor.TUI do
     trimmed = String.trim(tui.input)
 
     cond do
-      trimmed in ["/quit", "/exit"] ->
+      trimmed in ["/quit", "/exit", "/detach"] ->
         {:quit, %{tui | input: ""}}
 
       String.starts_with?(trimmed, "/conductor ") ->
@@ -614,14 +679,16 @@ defmodule Athanor.TUI do
   end
 
   defp format_entry_lines({:assistant, text}, max_w) do
-    style = Style.ansi256() |> Style.foreground(214) |> Style.bold()
+    label_style = Style.ansi256() |> Style.foreground(214) |> Style.bold()
+    prefix = " " <> Style.render_to_string(label_style, "Athanor: ")
+    indent = String.duplicate(" ", 10)
 
     text
-    |> wrap_text(max(5, max_w - 10))
+    |> Markdown.render(max(5, max_w - 10))
     |> Enum.with_index()
     |> Enum.map(fn
-      {line, 0} -> " " <> Style.render_to_string(style, "Athanor: ") <> line
-      {line, _} -> "          " <> line
+      {line, 0} -> prefix <> line
+      {line, _} -> indent <> line
     end)
     |> Kernel.++([""])
   end
