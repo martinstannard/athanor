@@ -22,3 +22,10 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 athanor-*.tar
 
+# Local agent tooling, not part of the project:
+#   /.claude/    — Claude Code hooks, settings and local MCP servers
+#   /.chainlink/ — Chainlink issue tracker state (issues.db is a local SQLite database)
+# Force-add with `git add -f <path>` if you specifically want them shared.
+/.claude/
+/.chainlink/
+
