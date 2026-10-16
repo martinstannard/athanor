@@ -70,24 +70,30 @@ defmodule Athanor.Store.Compactor do
   # -- trigger --------------------------------------------------------------------
 
   @doc """
-  Whether the working set is over budget and should be compacted (plan §5.4 steps 1–2).
+  Whether the working set is over budget and should be compacted (plan §5.4 steps 1–2, #37).
 
-  The trigger mirrors the plan literally:
+  Fires when **either**:
+  1. `length(messages) >= max_messages` (default `Athanor.Config.compaction_max_messages/0`, `400`),
+     **ignoring the token hysteresis latch (`:compacted?`)** because the OpenCode Go upstream
+     enforces a hard 512-message ceiling independent of token count (#37); or
+  2. The token estimate exceeds the context-window trigger:
 
-      estimate = Athanor.Store.Tokens.estimate_messages(messages)
-      estimate + reserve_tokens >= round(context_limit_tokens * compaction_threshold)
+         estimate = Athanor.Store.Tokens.estimate_messages(messages)
+         estimate + reserve_tokens >= round(context_limit_tokens * compaction_threshold)
 
-  with hysteresis on top: while the caller's `:compacted?` latch is set **and** the estimate is
-  still at or above `hysteresis_threshold/1` (`round(context_limit * hysteresis_ratio)`,
-  `64_000` by default), the trigger is suppressed. Once the estimate drops below that floor the
-  latch no longer suppresses anything; the caller clears it (see `latched?/2`) and the plain
-  threshold applies again.
+     with hysteresis on top: while the caller's `:compacted?` latch is set **and** the estimate is
+     still at or above `hysteresis_threshold/1` (`round(context_limit * hysteresis_ratio)`,
+     `64_000` by default), the token trigger is suppressed. Once the estimate drops below that
+     floor the latch no longer suppresses anything; the caller clears it (see `latched?/2`) and
+     the plain threshold applies again.
 
   The latch is not stored here — this module is pure — so it is handed in via `:compacted?` in
   `opts`.
 
   ## Options
 
+    * `:compaction_max_messages` — message-count trigger threshold (default
+      `Athanor.Config.compaction_max_messages/0`, `400`)
     * `:compaction_threshold` — fraction of the window that trips it (default
       `Athanor.Config.compaction_threshold/0`, `0.8`)
     * `:context_limit_tokens` — the window in tokens (default
@@ -109,6 +115,9 @@ defmodule Athanor.Store.Compactor do
     limit = context_limit(opts)
 
     cond do
+      length(messages) >= max_messages(opts) ->
+        true
+
       estimate == 0 ->
         false
 
@@ -149,7 +158,7 @@ defmodule Athanor.Store.Compactor do
   # -- cut point ------------------------------------------------------------------
 
   @doc """
-  The index into `messages` at which the kept suffix begins (plan §5.4 steps 3–5, correction C5).
+  The index into `messages` at which the kept suffix begins (plan §5.4 steps 3–5, correction C5, #37).
 
   `messages` is the **whole** history, including the leading `system` message; the returned index
   is a 0-based index into `messages` and is always `>= 1` when a system message is present (the
@@ -158,34 +167,44 @@ defmodule Athanor.Store.Compactor do
   The algorithm:
 
     1. Skip the leading `system` message and take the rest as the compactable `rest`.
-    2. Walk `rest` newest → oldest, accumulating `Athanor.Store.Tokens.cost/1`, and stop at the
-       first message that would push the running total over the keep budget
-       (`keep_budget/1`, default `round(context_limit_tokens * 0.4)`). If the whole of `rest`
-       fits, return `0` — nothing to do.
-    3. **Snap** that stop index back to the nearest `role: "user"` message at or before it. The
-       snap never moves the cut forward, so it may keep *more* than the budget (it keeps the
-       whole turn that straddles the boundary) but it can never split a pair.
-    4. If no user boundary exists at or before the stop index, return `0` (keep everything).
+    2. Walk `rest` newest → oldest, accumulating `Athanor.Store.Tokens.cost/1` and kept message
+       count, and stop at the first message where **either** `accumulated_tokens > keep_budget`
+       (`keep_budget/1`, default `round(context_limit_tokens * 0.4)`) **or**
+       `kept_count >= keep_messages` (default `Athanor.Config.compaction_keep_messages/0`, `200`).
+       If the whole of `rest` fits both budgets, return `0` — nothing to do.
+    3. **Snap** that stop index back to the nearest `role: "user"` message at or before it when
+       doing so leaves the kept suffix within `max_messages - 2` (leaving room for `system` +
+       `summary_message`).
+    4. If a single user turn contains hundreds of tool calls (#36 + #37) so snapping back to its
+       opening `user` message would keep more than `max_messages - 2` messages (or when no user
+       message precedes `local_stop` and `length(rest) > keep_messages`), snap instead to the
+       nearest clean turn-step boundary (`role: "user"` or `role: "assistant"`) at or before
+       `local_stop` that satisfies `pairing_ok?/1` on the kept suffix. Cutting immediately before
+       an `assistant` message never orphans a `tool` result because `tool` messages immediately
+       follow the `assistant(tool_calls)` that declared them.
+    5. If no valid boundary exists at or before the stop index, return `0` (keep everything).
 
   ## Guarantees when the result is non-zero
 
-    * `Enum.drop(messages, cut) |> hd()` is a `role: "user"` message.
+    * `Enum.drop(messages, cut) |> hd()` is a `role: "user"` message (or `role: "assistant"` when
+      falling back inside a single giant tool-call turn).
     * Every `tool_call.id` whose `assistant(tool_calls)` message is kept has its matching
-      `role: "tool"` message kept, and no kept `tool` message is orphaned — a pair cannot straddle
-      the cut because the cut is at a user boundary, which always precedes both halves.
+      `role: "tool"` message kept, and no kept `tool` message is orphaned (`pairing_ok?/1`).
   """
   @spec cut_index([message()], keyword()) :: non_neg_integer()
   def cut_index(messages, opts \\ [])
 
   def cut_index(messages, opts) when is_list(messages) do
     {_system, rest, offset} = split_system(messages)
+    keep_msgs = keep_messages(opts)
+    max_msgs = max_messages(opts)
 
-    case stop_index(rest, keep_budget(opts)) do
+    case stop_index(rest, keep_budget(opts), keep_msgs) do
       :all ->
         0
 
       {:cut, local_stop} ->
-        case last_user_index(rest, local_stop) do
+        case snap_cut_index(rest, local_stop, keep_msgs, max_msgs) do
           nil -> 0
           local -> local + offset
         end
@@ -209,24 +228,46 @@ defmodule Athanor.Store.Compactor do
     round(context_limit(opts) * fraction)
   end
 
-  # Newest → oldest. `{:cut, index}` is the index of the first message that does not fit, so the
-  # kept suffix would begin there; `:all` means the whole of `rest` fits the budget.
-  defp stop_index(rest, budget) do
+  # Newest → oldest. `{:cut, index}` is the index of the first message that does not fit either
+  # the token budget or the message-count keep budget, so the kept suffix would begin there; `:all`
+  # means the whole of `rest` fits both budgets.
+  defp stop_index(rest, budget, keep_msgs) do
     rest
     |> Enum.with_index()
     |> Enum.reverse()
-    |> Enum.reduce_while({:all, 0}, fn {message, index}, {_state, accumulated} ->
+    |> Enum.reduce_while({:all, 0, 0}, fn {message, index}, {_state, accumulated, kept_count} ->
       accumulated = accumulated + Tokens.cost(message)
+      kept_count = kept_count + 1
 
-      if accumulated > budget do
+      if accumulated > budget or kept_count >= keep_msgs do
         {:halt, {:cut, index}}
       else
-        {:cont, {:all, accumulated}}
+        {:cont, {:all, accumulated, kept_count}}
       end
     end)
     |> case do
       {:cut, index} -> {:cut, index}
-      {:all, _accumulated} -> :all
+      {:all, _accumulated, _kept_count} -> :all
+    end
+  end
+
+  defp snap_cut_index(rest, local_stop, keep_msgs, max_msgs) do
+    total = length(rest)
+    max_kept = max(max_msgs - 2, 1)
+    user_snap = last_user_index(rest, local_stop)
+
+    cond do
+      is_integer(user_snap) and user_snap > 0 and total - user_snap <= max_kept ->
+        user_snap
+
+      is_integer(user_snap) and total - user_snap > max_kept ->
+        last_step_boundary_index(rest, local_stop)
+
+      is_nil(user_snap) and total > keep_msgs ->
+        last_step_boundary_index(rest, local_stop)
+
+      true ->
+        user_snap
     end
   end
 
@@ -243,11 +284,28 @@ defmodule Athanor.Store.Compactor do
     end
   end
 
+  # Fallback when snapping back to the nearest `user` message would keep more than `max_messages - 2`
+  # messages (e.g. a single user turn with hundreds of tool rounds). Walks backwards from `stop`
+  # down to `1` looking for a non-`"tool"` boundary (`"user"` or `"assistant"`) where the kept
+  # suffix satisfies C5 (`pairing_ok?/1`).
+  defp last_step_boundary_index(rest, stop) do
+    rest
+    |> Enum.with_index()
+    |> Enum.filter(fn {message, index} ->
+      index >= 1 and index <= stop and step_boundary_message?(message)
+    end)
+    |> Enum.reverse()
+    |> Enum.find_value(fn {_message, index} ->
+      if pairing_ok?(Enum.drop(rest, index)), do: index, else: nil
+    end)
+  end
+
+  defp step_boundary_message?(message) do
+    role_of(message) in ["user", "assistant"]
+  end
+
   defp user_message?(message) do
-    case role(message) do
-      role when is_binary(role) -> String.downcase(role) == "user"
-      _other -> false
-    end
+    role_of(message) == "user"
   end
 
   # -- compaction -----------------------------------------------------------------
@@ -518,6 +576,20 @@ defmodule Athanor.Store.Compactor do
     case Keyword.get(opts, :context_limit_tokens, Config.context_limit_tokens()) do
       value when is_integer(value) and value > 0 -> value
       _other -> 128_000
+    end
+  end
+
+  defp max_messages(opts) do
+    case Keyword.get(opts, :compaction_max_messages, Config.compaction_max_messages()) do
+      value when is_integer(value) and value > 0 -> value
+      _other -> 400
+    end
+  end
+
+  defp keep_messages(opts) do
+    case Keyword.get(opts, :compaction_keep_messages, Config.compaction_keep_messages()) do
+      value when is_integer(value) and value > 0 -> value
+      _other -> 200
     end
   end
 

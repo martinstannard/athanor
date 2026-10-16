@@ -16,6 +16,9 @@ defmodule Athanor.Config do
   @default_compaction_threshold 0.8
   @default_context_limit_tokens 128_000
   @default_compaction_keep_fraction 0.4
+  @default_compaction_max_messages 400
+  @default_compaction_keep_messages 200
+  @default_max_turns :infinity
   @default_search_ignores [
     ".git",
     "_build",
@@ -289,6 +292,65 @@ defmodule Athanor.Config do
       :compaction_keep_fraction,
       @default_compaction_keep_fraction
     )
+  end
+
+  @doc """
+  Message-count trigger threshold for pre-flight compaction (default
+  `#{@default_compaction_max_messages}`).
+
+  The OpenCode Go upstream enforces a hard ceiling of 512 messages per `/chat/completions`
+  request, independent of token count (#37). Compacting at `#{@default_compaction_max_messages}`
+  leaves headroom for a multi-step tool loop before the next pre-flight check.
+
+  Overridable via `ATHANOR_COMPACTION_MAX_MESSAGES` or `:athanor, :compaction_max_messages`.
+  """
+  @spec compaction_max_messages() :: pos_integer()
+  def compaction_max_messages do
+    positive_int(
+      "ATHANOR_COMPACTION_MAX_MESSAGES",
+      :compaction_max_messages,
+      @default_compaction_max_messages
+    )
+  end
+
+  @doc """
+  Target maximum number of recent messages kept when compacting (default
+  `#{@default_compaction_keep_messages}`).
+
+  Overridable via `ATHANOR_COMPACTION_KEEP_MESSAGES` or `:athanor, :compaction_keep_messages`.
+  """
+  @spec compaction_keep_messages() :: pos_integer()
+  def compaction_keep_messages do
+    positive_int(
+      "ATHANOR_COMPACTION_KEEP_MESSAGES",
+      :compaction_keep_messages,
+      @default_compaction_keep_messages
+    )
+  end
+
+  @doc """
+  Maximum tool-call turns permitted in a single user prompt before `Athanor.Agent` stops with an
+  error (default `#{inspect(@default_max_turns)}` — unbounded, #36).
+
+  Overridable via `ATHANOR_MAX_TURNS` (positive integer, or `"infinity"`) or
+  `:athanor, :max_turns`, or per-agent via the `max_turns:` init option.
+  """
+  @spec max_turns() :: pos_integer() | :infinity
+  def max_turns do
+    "ATHANOR_MAX_TURNS"
+    |> System.get_env()
+    |> Kernel.||(Application.get_env(:athanor, :max_turns, @default_max_turns))
+    |> parse_max_turns()
+  end
+
+  defp parse_max_turns(n) when is_integer(n) and n > 0, do: n
+  defp parse_max_turns(raw) when raw in [nil, "", :infinity, "infinity"], do: :infinity
+
+  defp parse_max_turns(raw) do
+    case Integer.parse(to_string(raw)) do
+      {value, _rest} when value > 0 -> value
+      _ -> @default_max_turns
+    end
   end
 
   @doc """

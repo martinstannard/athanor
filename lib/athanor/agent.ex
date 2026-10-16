@@ -102,8 +102,6 @@ defmodule Athanor.Agent do
   alias Athanor.{Bus, Config, LLM, ProjectContext, SessionId, Tools}
   alias Athanor.Store.{Compactor, Tokens}
 
-  @default_max_turns 100
-
   @default_conductor_prompt """
   You are an Athanor Conductor — a persistent orchestrator on Elixir/OTP.
   You can handle tasks directly using file/bash tools, or delegate parallel/isolated
@@ -308,7 +306,7 @@ defmodule Athanor.Agent do
     model = Keyword.get(opts, :model, Config.model())
     cd = Keyword.get(opts, :cd, File.cwd!())
     system_prompt = compose_system_prompt(Keyword.get(opts, :system_prompt, default_prompt), cd, opts)
-    max_turns = Keyword.get(opts, :max_turns, @default_max_turns)
+    max_turns = Keyword.get(opts, :max_turns, Config.max_turns())
     notify_parent = Keyword.get(opts, :notify_parent_on_done, parent_id != nil)
 
     with :ok <- validate_id(id),
@@ -526,7 +524,7 @@ defmodule Athanor.Agent do
 
     state = %{state | turn_count: state.turn_count + 1}
 
-    if state.turn_count >= state.max_turns do
+    if max_turns_reached?(state) do
       state = set_status(state, :error)
       notify(state, {:error, "Reached maximum tool-call turns (#{state.max_turns})"})
       {:noreply, state}
@@ -589,6 +587,13 @@ defmodule Athanor.Agent do
   end
 
   # Internal Helpers
+
+  defp max_turns_reached?(%{max_turns: max_turns, turn_count: turn_count})
+       when is_integer(max_turns) and max_turns > 0 do
+    turn_count >= max_turns
+  end
+
+  defp max_turns_reached?(_state), do: false
 
   # Composes the effective system prompt for this session: the role prompt plus the nearest
   # project's `AGENTS.md`, wrapped in `ProjectContext.sentinel/0` so the injected text is

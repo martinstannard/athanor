@@ -1127,6 +1127,85 @@ defmodule Athanor.AgentTest do
     end
   end
 
+  # --- issue #36: unbounded tool-calling turns by default ---------------------------------
+
+  describe "max_turns (#36)" do
+    test "defaults to :infinity and completes >100 tool rounds without error", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "step.txt"), "ok")
+      rounds = 105
+
+      llm_fn = fn messages, _tools, _agent_pid ->
+        completed_rounds = Enum.count(messages, &(Map.get(&1, :role) == "tool"))
+
+        if completed_rounds < rounds do
+          {:ok,
+           %{
+             role: "assistant",
+             content: "",
+             tool_calls: [
+               %{
+                 id: "call_#{completed_rounds + 1}",
+                 type: "function",
+                 function: %{
+                   name: "read_file",
+                   arguments: JSON.encode!(%{"path" => "step.txt"})
+                 }
+               }
+             ]
+           }}
+        else
+          {:ok, %{role: "assistant", content: "finished #{rounds} rounds", tool_calls: []}}
+        end
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+      assert :sys.get_state(agent).max_turns == :infinity
+
+      assert :ok = Agent.prompt(agent, "run 105 tool rounds")
+      assert_receive {:agent_event, {:turn_complete, "finished 105 rounds"}}, 10_000
+
+      state = Agent.get_state(agent)
+      assert state.status == :idle
+      assert state.turn_count == rounds
+    end
+
+    test "honours an explicit integer max_turns: 2 and stops at 2", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "step.txt"), "ok")
+
+      llm_fn = fn messages, _tools, _agent_pid ->
+        completed_rounds = Enum.count(messages, &(Map.get(&1, :role) == "tool"))
+
+        {:ok,
+         %{
+           role: "assistant",
+           content: "",
+           tool_calls: [
+             %{
+               id: "call_#{completed_rounds + 1}",
+               type: "function",
+               function: %{
+                 name: "read_file",
+                 arguments: JSON.encode!(%{"path" => "step.txt"})
+               }
+             }
+           ]
+         }}
+      end
+
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, max_turns: 2)
+
+      assert :ok = Agent.prompt(agent, "loop forever")
+      assert_receive {:agent_event, {:error, "Reached maximum tool-call turns (2)"}}, 5_000
+
+      state = Agent.get_state(agent)
+      assert state.status == :error
+      assert state.turn_count == 2
+    end
+  end
+
   # --- project instructions env toggle (#33) lives in its own `async: false` module because it
   # mutates process-global environment (see `Athanor.ProjectContextEnvTest`).
 

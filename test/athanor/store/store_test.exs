@@ -777,6 +777,32 @@ defmodule Athanor.StoreTest do
       )
     end
 
+    test "compaction message-count accessors and max_turns default and honour env vars" do
+      with_clean_env(
+        [
+          "ATHANOR_COMPACTION_MAX_MESSAGES",
+          "ATHANOR_COMPACTION_KEEP_MESSAGES",
+          "ATHANOR_MAX_TURNS"
+        ],
+        fn ->
+          assert Athanor.Config.compaction_max_messages() == 400
+          assert Athanor.Config.compaction_keep_messages() == 200
+          assert Athanor.Config.max_turns() == :infinity
+
+          System.put_env("ATHANOR_COMPACTION_MAX_MESSAGES", "350")
+          System.put_env("ATHANOR_COMPACTION_KEEP_MESSAGES", "150")
+          System.put_env("ATHANOR_MAX_TURNS", "50")
+
+          assert Athanor.Config.compaction_max_messages() == 350
+          assert Athanor.Config.compaction_keep_messages() == 150
+          assert Athanor.Config.max_turns() == 50
+
+          System.put_env("ATHANOR_MAX_TURNS", "infinity")
+          assert Athanor.Config.max_turns() == :infinity
+        end
+      )
+    end
+
     test "transcript_sync/0 defaults to :per_record and only accepts :batched otherwise" do
       with_clean_env(["ATHANOR_TRANSCRIPT_SYNC"], fn ->
         assert Athanor.Config.transcript_sync() == :per_record

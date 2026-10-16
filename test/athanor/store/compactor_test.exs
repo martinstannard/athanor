@@ -578,4 +578,73 @@ defmodule Athanor.Store.CompactorTest do
       assert {nil, [], 0} = Compactor.split_system([])
     end
   end
+
+  # -- upstream 512-message limit (#37) -------------------------------------------
+
+  describe "message-count budget (#37)" do
+    test "450 tiny messages (well under the token threshold) trigger should_compact?/2 even when compacted?: true and compact down to <= 202 messages" do
+      # 113 turns * 4 messages = 452 messages (+1 system = 453 messages), each tiny (~2 tokens).
+      messages = [@system] ++ Enum.flat_map(1..113, &turn(&1, 1))
+      assert length(messages) == 453
+      assert Tokens.estimate_messages(messages) < 10_000
+
+      opts = [
+        context_limit_tokens: 128_000,
+        compaction_threshold: 0.8,
+        compaction_keep_fraction: 0.4,
+        compaction_max_messages: 400,
+        compaction_keep_messages: 200
+      ]
+
+      assert Compactor.should_compact?(messages, opts)
+      assert Compactor.should_compact?(messages, [{:compacted?, true} | opts])
+
+      {compacted, summary} = Compactor.compact(messages, opts)
+
+      assert summary != ""
+
+      # System + summary + 200 kept messages = 202.
+      assert length(compacted) <= 202
+      assert hd(compacted) == @system
+      assert Compactor.pairing_ok?(compacted)
+    end
+
+    test "a single user turn followed by 250 assistant(tool_calls) + tool pairs (502 messages total) compacts below the message limit and satisfies pairing_ok?/1" do
+      tool_pairs =
+        Enum.flat_map(1..250, fn i ->
+          [
+            %{
+              "role" => "assistant",
+              "content" => "",
+              "tool_calls" => [tool_call("c#{i}", "read_file", %{"path" => "f#{i}.ex"})]
+            },
+            %{
+              "role" => "tool",
+              "tool_call_id" => "c#{i}",
+              "content" => "ok"
+            }
+          ]
+        end)
+
+      messages = [@system, %{"role" => "user", "content" => "audit all 250 files"}] ++ tool_pairs
+      assert length(messages) == 502
+
+      opts = [
+        context_limit_tokens: 128_000,
+        compaction_max_messages: 400,
+        compaction_keep_messages: 200
+      ]
+
+      assert Compactor.should_compact?(messages, opts)
+      assert Compactor.should_compact?(messages, [{:compacted?, true} | opts])
+
+      {compacted, summary} = Compactor.compact(messages, opts)
+
+      assert summary != ""
+      assert length(compacted) <= 202
+      assert hd(compacted) == @system
+      assert Compactor.pairing_ok?(compacted)
+      assert Compactor.pairing_ok?(Enum.drop(compacted, 2))
+    end
+  end
 end
