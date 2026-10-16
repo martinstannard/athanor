@@ -417,6 +417,47 @@ defmodule Athanor.OrchestratorTest do
       cleanup([parent_id, worker_id])
     end
 
+    test "escalates to the conductor after max_nudges contradicted claims without ever sending [DONE]", %{
+      tmp_dir: dir
+    } do
+      parent_id = unique_id("e-parent")
+      worker_id = unique_id("e-worker")
+
+      goal_id =
+        start_goal!(worker_id, parent_id, dir,
+          max_nudges: 1,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: still broken"}}
+          end
+        )
+
+      spawn_conductor!(parent_id, dir)
+
+      stubborn_llm = fn _messages, _tools, _pid ->
+        {:ok,
+         %{
+           role: "assistant",
+           content: "Still claiming.\n===ATHANOR_DONE=== status=ok summary=trust me",
+           tool_calls: []
+         }}
+      end
+
+      {:ok, ^worker_id, _pid} =
+        Orchestrator.launch_subagent(parent_id, "stubborn", "fix it",
+          id: worker_id,
+          cd: dir,
+          goal_id: goal_id,
+          notify_parent_on_done: true,
+          llm_fn: stubborn_llm
+        )
+
+      assert await_message(parent_id, "[GOAL ESCALATED]", 2_000) =~ "exit 1: still broken"
+      refute conductor_said?(parent_id, "[DONE] Sub-agent")
+      assert :error = GoalManager.for_worker(worker_id)
+
+      cleanup([parent_id, worker_id])
+    end
+
     test "a verified goal wakes its conductor with the ordinary [DONE] line", %{tmp_dir: dir} do
       parent_id = unique_id("v-parent")
       worker_id = unique_id("v-worker")
@@ -534,7 +575,16 @@ defmodule Athanor.OrchestratorTest do
   defp unique_id(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
 
   defp sentinel_llm_fn(content) do
-    fn _messages, _tools, _pid -> {:ok, %{role: "assistant", content: content, tool_calls: []}} end
+    fn messages, _tools, _pid ->
+      reply = if nudged?(messages), do: "Continuing work.", else: content
+      {:ok, %{role: "assistant", content: reply, tool_calls: []}}
+    end
+  end
+
+  defp nudged?(messages) do
+    Enum.any?(messages, fn msg ->
+      Map.get(msg, :role) == "user" and Map.get(msg, :content, "") =~ "[GOAL NUDGE"
+    end)
   end
 
   defp spawn_conductor!(id, cd) do
@@ -567,6 +617,7 @@ defmodule Athanor.OrchestratorTest do
           parent_id: parent_id,
           cd: cd,
           verifier: {:shell, "true"},
+          max_nudges: Keyword.get(opts, :max_nudges, 3),
           verify_interval_ms: Keyword.get(opts, :verify_interval_ms, 10_000)
         ],
         verifier_fn: verifier_fn
@@ -619,8 +670,6 @@ defmodule Athanor.OrchestratorTest do
   defp conductor_said?(parent_id, needle) do
     Enum.any?(conductor_notifications(parent_id), &(&1 =~ needle))
   end
-
-  defp await_message(parent_id, needle), do: await_message(parent_id, needle, 200)
 
   defp await_message(parent_id, needle, attempts) do
     case Enum.find(conductor_notifications(parent_id), &(&1 =~ needle)) do

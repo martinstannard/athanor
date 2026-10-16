@@ -11,6 +11,7 @@ defmodule Athanor.Application do
     # leaves evidence behind if it wedges, and a detached daemon has no attached stdout
     # (`docs/handover.md` §5, `docs/wedge-findings.md`). Idempotent and fail-safe.
     Athanor.Log.install()
+    Athanor.GoalManager.init_resolved_table()
 
     children = [
       {Registry, keys: :unique, name: Athanor.AgentRegistry},

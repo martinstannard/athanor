@@ -226,7 +226,7 @@ defmodule Athanor.GoalManagerTest do
       Bus.publish_event(
         worker_id,
         nil,
-        {:turn_complete, "I did it\n===ATHANOR_DONE=== status=ok summary=all done"}
+        {:goal_candidate_done, %{status: "ok", summary: "all done"}}
       )
 
       # A worker's own claim can trigger a check and can never satisfy one: it is contradicted here,
@@ -418,6 +418,66 @@ defmodule Athanor.GoalManagerTest do
     end
   end
 
+  describe "stall detection, nudges, and escalation (§5.4–§5.5, M5)" do
+    test "nudges the worker inbox when stalled or contradicted, then escalates to conductor after max_nudges" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          stall_after_ms: 10,
+          max_nudges: 2,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: 2 failures"}}
+          end
+        )
+
+      Bus.subscribe("agent:#{worker_id}:inbox")
+      Bus.subscribe("agent:#{parent_id}:inbox")
+      Bus.subscribe("goal:#{goal_id}:events")
+      Bus.subscribe("conductor:#{parent_id}:goals")
+
+      # First contradicted claim -> Nudge 1/2
+      Bus.publish_event(worker_id, nil, {:goal_candidate_done, %{status: "ok", summary: "try 1"}})
+
+      assert_receive {:bus_command, {:enqueue_prompt, nudge_1}}, 1_000
+      assert nudge_1 =~ "[GOAL NUDGE 1/2]"
+      assert nudge_1 =~ "make it so"
+      assert nudge_1 =~ "exit 1: 2 failures"
+      assert_receive {:goal_event, ^goal_id, {:goal_nudged, %Goal{nudge_count: 1}, ^nudge_1}}, 1_000
+
+      # Second contradicted claim (or stall expiry) -> Nudge 2/2
+      Process.sleep(15)
+      send(pid, :verify_tick)
+
+      assert_receive {:bus_command, {:enqueue_prompt, nudge_2}}, 1_000
+      assert nudge_2 =~ "[GOAL NUDGE 2/2]"
+      assert_receive {:goal_event, ^goal_id, {:goal_nudged, %Goal{nudge_count: 2}, ^nudge_2}}, 1_000
+
+      # Third attempt exceeds max_nudges (2) -> Escalation to conductor!
+      Process.sleep(15)
+      send(pid, :verify_tick)
+
+      assert_receive {:bus_command, {:enqueue_prompt, escalation}}, 1_000
+      assert escalation =~ "[GOAL ESCALATED]"
+      assert escalation =~ "exceeded max_nudges (2)"
+      assert escalation =~ "exit 1: 2 failures"
+
+      assert_receive {:goal_event, ^goal_id,
+                      {:goal_escalated, %Goal{status: :escalated, nudge_count: 2}, %Result{verdict: :contradicted},
+                       :max_nudges_exceeded}},
+                     1_000
+
+      # Also mirrored onto conductor:<parent_id>:goals (C11).
+      assert_receive {:goal_event, ^goal_id, {:goal_escalated, _, _, :max_nudges_exceeded}}, 1_000
+
+      # Terminal: both registry keys released so a new goal can be attached (C5).
+      assert :error = GoalManager.for_worker(worker_id)
+      assert {:error, :not_found} = GoalManager.status(goal_id)
+      refute Process.alive?(pid)
+    end
+  end
+
   # -- helpers --------------------------------------------------------------------------------
 
   # Starts a goal with test-friendly timings and an injected verifier. The 20 ms figures are real
@@ -433,8 +493,8 @@ defmodule Athanor.GoalManagerTest do
       cd: File.cwd!(),
       verifier: {:shell, "true"},
       verify_interval_ms: 10_000,
-      stall_after_ms: Keyword.get(opts, :stall_after_ms, 20),
-      max_nudges: 2,
+      stall_after_ms: Keyword.get(opts, :stall_after_ms, 10_000),
+      max_nudges: Keyword.get(opts, :max_nudges, 2),
       parent_id: Keyword.get(opts, :parent_id)
     ]
 

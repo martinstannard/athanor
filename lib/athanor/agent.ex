@@ -1024,6 +1024,7 @@ defmodule Athanor.Agent do
       report ->
         cond do
           GoalManager.registered?(goal_id) -> notify(state, {:goal_candidate_done, report})
+          GoalManager.resolved?(goal_id) -> :ok
           state.notify_parent_on_done and is_binary(state.parent_id) -> notify(state, {:child_done, report})
           true -> :ok
         end

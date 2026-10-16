@@ -36,10 +36,21 @@ defmodule Athanor.GoalManager do
 
   @registry Athanor.GoalRegistry
   @supervisor Athanor.GoalSupervisor
+  @resolved_table :athanor_resolved_goals
 
   # How many recent events the audit trail keeps: enough to explain a decision, bounded so a chatty
   # worker cannot grow it without limit.
   @history_limit 50
+
+  @doc false
+  @spec init_resolved_table() :: :ok
+  def init_resolved_table do
+    if :ets.whereis(@resolved_table) == :undefined do
+      :ets.new(@resolved_table, [:named_table, :public, :set])
+    end
+
+    :ok
+  end
 
   # -- Client API ----------------------------------------------------------------------------
 
@@ -121,6 +132,20 @@ defmodule Athanor.GoalManager do
   @spec registered?(String.t()) :: boolean()
   def registered?(goal_id) when is_binary(goal_id) do
     Registry.lookup(@registry, {:goal, goal_id}) != []
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc """
+  Whether `goal_id` already reached a normal terminal transition (`:closed`, `:escalated`, or
+  `:cancelled`).
+
+  Prevents a late worker turn after a goal has already escalated or closed from triggering the C8
+  crash-fallback `{:child_done, _}` notification.
+  """
+  @spec resolved?(String.t()) :: boolean()
+  def resolved?(goal_id) when is_binary(goal_id) do
+    :ets.lookup(@resolved_table, goal_id) != []
   rescue
     ArgumentError -> false
   end
@@ -219,6 +244,8 @@ defmodule Athanor.GoalManager do
           goal: %{goal | status: :active, last_progress_at: Goal.now_ms()},
           interval_ms: Keyword.get(opts, :verify_interval_ms, goal.verify_interval_ms),
           verifier_fn: Keyword.get(opts, :verifier_fn, &Verifier.verify/2),
+          worker_pid: lookup_worker_pid(goal.worker_id),
+          candidate_done?: false,
           timer_ref: nil,
           verifier_task: nil,
           last_verify_at: nil,
@@ -283,31 +310,26 @@ defmodule Athanor.GoalManager do
     if Result.verified?(state.last_verifier_result) do
       close(state, state.last_verifier_result)
     else
-      {:noreply, state}
+      after_unverified(state)
     end
   end
 
   # A verifier that died without answering is `:inconclusive`, not evidence against the worker
   # (§5.3 step 3).
   def handle_info({:DOWN, ref, :process, pid, reason}, %{verifier_task: {pid, ref}} = state) do
-    {:noreply, record_result(state, {:error, "the verifier crashed: #{inspect(reason)}"})}
+    state = record_result(state, {:error, "the verifier crashed: #{inspect(reason)}"})
+    after_unverified(state)
   end
 
   def handle_info({:agent_event, worker_id, {:goal_candidate_done, _report}}, %{goal: %{worker_id: worker_id}} = state) do
     # A claim, not a verdict: verify now, but never close on it (C1's realisation on the agent side).
-    {:noreply, state |> refresh_progress() |> verify_unless_busy()}
+    {:noreply, state |> Map.put(:candidate_done?, true) |> refresh_progress() |> verify_unless_busy()}
   end
 
-  # §4.6's table says the same for a sentinel-bearing `:turn_complete`: the agent normally reports
-  # that as `{:goal_candidate_done, _}`, and handling the raw sentinel too means a worker's claim
-  # cannot be lost if that path is bypassed. A sentinel-*less* turn is conversation, not a claim.
-  def handle_info({:agent_event, worker_id, {:turn_complete, content}}, %{goal: %{worker_id: worker_id}} = state) do
-    state = refresh_progress(state)
-
-    case Athanor.Agent.parse_done_sentinel(content) do
-      :none -> {:noreply, state}
-      _claim -> {:noreply, state |> note(:claimed_done) |> verify_unless_busy()}
-    end
+  # A conversational turn refreshes the stall clock; sentinel-bearing turns arrive via
+  # `{:goal_candidate_done, report}` above (§5.2 step 4), so we do not double-trigger verification.
+  def handle_info({:agent_event, worker_id, {:turn_complete, _content}}, %{goal: %{worker_id: worker_id}} = state) do
+    {:noreply, refresh_progress(state)}
   end
 
   def handle_info({:agent_event, worker_id, event}, %{goal: %{worker_id: worker_id}} = state) do
@@ -402,12 +424,121 @@ defmodule Athanor.GoalManager do
 
     goal.status in [:active, :verifying] and
       Goal.now_ms() - progress_at >= goal.stall_after_ms and
-      (state.worker_status in [:idle, :error] or contradicted?)
+      (state.worker_status in [nil, :idle, :error] or contradicted?)
   end
 
   defp refresh_progress(state) do
     %{state | goal: %{state.goal | last_progress_at: Goal.now_ms()}}
   end
+
+  # -- nudges & escalation (§5.4–§5.5) -------------------------------------------------------
+
+  defp after_unverified(state) do
+    claimed_and_contradicted? =
+      state.candidate_done? and match?(%Result{verdict: :contradicted}, state.last_verifier_result)
+
+    cond do
+      worker_died?(state) ->
+        escalate(%{state | candidate_done?: false}, :worker_unreachable)
+
+      claimed_and_contradicted? or stalled?(state) ->
+        nudge_or_escalate(%{state | candidate_done?: false})
+
+      true ->
+        {:noreply, %{state | candidate_done?: false}}
+    end
+  end
+
+  defp nudge_or_escalate(state) do
+    if state.goal.nudge_count >= state.goal.max_nudges do
+      escalate(state, :max_nudges_exceeded)
+    else
+      nudge(state)
+    end
+  end
+
+  defp nudge(state) do
+    goal = state.goal
+    nudge_count = goal.nudge_count + 1
+    elapsed_s = max(div(Goal.now_ms() - (goal.last_progress_at || Goal.now_ms()), 1000), 0)
+    text = nudge_text(goal, nudge_count, elapsed_s, state.last_verifier_result)
+
+    updated_goal = %{goal | nudge_count: nudge_count, last_progress_at: Goal.now_ms()}
+    state = state |> Map.put(:goal, updated_goal) |> note({:nudged, nudge_count})
+
+    Bus.send_command(goal.worker_id, {:enqueue_prompt, text})
+    publish(state, {:goal_nudged, updated_goal, text})
+    {:noreply, state}
+  end
+
+  defp escalate(state, reason) do
+    state = state |> cancel_timer() |> terminate_goal(:escalated) |> note({:escalated, reason})
+    goal = state.goal
+    text = escalation_text(goal, state.last_verifier_result, state.worker_status, reason)
+
+    if is_binary(goal.parent_id) do
+      Bus.send_command(goal.parent_id, {:enqueue_prompt, text})
+    end
+
+    publish(state, {:goal_escalated, goal, state.last_verifier_result, reason})
+    {:stop, :normal, state}
+  end
+
+  defp nudge_text(goal, nudge_count, elapsed_s, result) do
+    title_part = if is_binary(goal.title), do: " ('#{goal.title}')", else: ""
+
+    receipt_summary =
+      case last_receipt(goal) do
+        nil -> "none"
+        %Receipt{summary: summary} -> summary
+      end
+
+    verifier_line =
+      case result do
+        %Result{verdict: verdict, evidence: evidence} when is_binary(evidence) and evidence != "" ->
+          "\nVerifier (#{verdict}): #{String.slice(evidence, 0, 200)}"
+
+        %Result{verdict: verdict} ->
+          "\nVerifier: #{verdict}."
+
+        _ ->
+          ""
+      end
+
+    "[GOAL NUDGE #{nudge_count}/#{goal.max_nudges}] Goal #{goal.id}#{title_part} has not reported progress for #{elapsed_s}s.\n" <>
+      "Objective: #{goal.objective}\n" <>
+      "Last receipt: #{receipt_summary}. Take the next bounded step and call report_progress." <>
+      verifier_line <>
+      "\nYou cannot close this goal — the Verifier must confirm it."
+  end
+
+  defp escalation_text(goal, result, worker_status, reason) do
+    title_part = if is_binary(goal.title), do: " ('#{goal.title}')", else: ""
+
+    verifier_desc =
+      case result do
+        %Result{mode: mode, verdict: verdict, evidence: evidence} ->
+          ev = if is_binary(evidence), do: String.slice(evidence, 0, 400), else: "none"
+          "#{mode} → #{verdict}. Evidence: #{ev}"
+
+        nil ->
+          "not yet run"
+      end
+
+    "[GOAL ESCALATED] Goal #{goal.id}#{title_part} exceeded max_nudges (#{goal.max_nudges}) without verification (#{reason}).\n" <>
+      "Verifier: #{verifier_desc}.\n" <>
+      "Nudges sent: #{goal.nudge_count}. Last worker status: #{worker_status || :unknown}. Requires Conductor/user intervention."
+  end
+
+  defp lookup_worker_pid(worker_id) do
+    case Athanor.Orchestrator.lookup(worker_id) do
+      {:ok, pid} -> pid
+      :error -> nil
+    end
+  end
+
+  defp worker_died?(%{worker_pid: pid}) when is_pid(pid), do: not Process.alive?(pid)
+  defp worker_died?(_state), do: false
 
   # -- closure (§5.6) ------------------------------------------------------------------------
 
@@ -426,7 +557,7 @@ defmodule Athanor.GoalManager do
         close_evidence: result.evidence
     }
 
-    state = state |> cancel_timer() |> Map.put(:goal, goal) |> release_keys()
+    state = state |> cancel_timer() |> Map.put(:goal, goal) |> mark_resolved(:closed) |> release_keys()
     publish(state, {:goal_verified, goal, result})
     publish_child_done(state, "ok", result.evidence)
 
@@ -469,7 +600,16 @@ defmodule Athanor.GoalManager do
     state
     |> cancel_timer()
     |> Map.put(:goal, %{state.goal | status: status})
+    |> mark_resolved(status)
     |> then(fn state -> release_keys(state) end)
+  end
+
+  defp mark_resolved(state, status) do
+    init_resolved_table()
+    :ets.insert(@resolved_table, {state.goal.id, status})
+    state
+  rescue
+    ArgumentError -> state
   end
 
   defp register_keys(goal) do
