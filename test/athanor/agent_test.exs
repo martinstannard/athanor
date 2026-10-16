@@ -126,6 +126,40 @@ defmodule Athanor.AgentTest do
       assert field(placeholder, "content") =~ "cancelled"
     end
 
+    test "a turn killed by the watchdog also answers its outstanding tool call", %{
+      tmp_dir: tmp_dir
+    } do
+      llm_fn = fn _messages, _tools, _agent_pid ->
+        {:ok,
+         %{
+           role: "assistant",
+           content: "",
+           tool_calls: [
+             %{
+               id: "call_wedged",
+               type: "function",
+               function: %{name: "bash", arguments: ~s({"command":"sleep 5"})}
+             }
+           ]
+         }}
+      end
+
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, turn_timeout_ms: 400)
+
+      assert :ok = Agent.prompt(agent, "run something wedged")
+      assert_receive {:agent_event, {:tool_start, "bash", _}}, 2_000
+      assert_receive {:agent_event, {:error, msg}}, 3_000
+      assert msg =~ "timed out"
+
+      messages = Agent.get_state(agent).messages
+      assert_paired!(messages)
+
+      placeholder = Enum.find(messages, &(field(&1, "tool_call_id") == "call_wedged"))
+      assert placeholder, "expected a placeholder result for the timed-out tool call"
+      assert field(placeholder, "content") =~ "timed out"
+    end
+
     test "a completed turn records the real result and no placeholder", %{tmp_dir: tmp_dir} do
       File.write!(Path.join(tmp_dir, "marker.txt"), "here")
 
