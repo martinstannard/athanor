@@ -111,6 +111,21 @@ defmodule Athanor.GoalManager do
   end
 
   @doc """
+  Whether a live manager is registered for `goal_id`.
+
+  This is the check `Athanor.Agent` makes before treating a goal-attached worker's sentinel as a
+  *claim* for its manager rather than an ordinary completion for its conductor (C8). A manager is
+  `:temporary`, so it can be gone while its worker is still running — and a crashed manager must not
+  be allowed to swallow the worker's completion along with it.
+  """
+  @spec registered?(String.t()) :: boolean()
+  def registered?(goal_id) when is_binary(goal_id) do
+    Registry.lookup(@registry, {:goal, goal_id}) != []
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc """
   Asks for verification *now*, rather than waiting for the next tick.
 
   The only route to closure a caller can reach, and it still goes through the Verifier: a caller can

@@ -11,7 +11,7 @@ defmodule Athanor.ToolsTest do
         Tools.schemas()
         |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
 
-      assert names == ["read_file", "write_file", "edit_file", "bash", "glob", "grep"]
+      assert names == ["read_file", "write_file", "edit_file", "bash", "glob", "grep", "report_progress"]
     end
 
     test "includes conductor orchestration tools when role: :conductor" do
@@ -29,6 +29,21 @@ defmodule Athanor.ToolsTest do
       # workspace tools are still present for conductors
       assert "glob" in names
       assert "grep" in names
+    end
+
+    test "report_progress is advertised to a worker and not to a conductor" do
+      worker_names =
+        Tools.schemas(role: :worker)
+        |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
+
+      assert "report_progress" in worker_names
+
+      # A conductor owns goals; it has no goal of its own to report progress against.
+      conductor_names =
+        Tools.schemas(role: :conductor)
+        |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
+
+      refute "report_progress" in conductor_names
     end
 
     test "worktree management is not advertised to a worker" do

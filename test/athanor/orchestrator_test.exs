@@ -1,7 +1,8 @@
 defmodule Athanor.OrchestratorTest do
   use ExUnit.Case, async: false
 
-  alias Athanor.{Agent, Bus, Orchestrator, SessionId, Store}
+  alias Athanor.{Agent, Bus, GoalManager, Orchestrator, SessionId, Store}
+  alias Athanor.Verifier.Result
 
   @moduletag :tmp_dir
 
@@ -360,6 +361,278 @@ defmodule Athanor.OrchestratorTest do
     else
       Process.sleep(10)
       await_status(id, status, attempts - 1)
+    end
+  end
+
+  # --- §7.2 M4: trust but verify, end to end ----------------------------------------------
+
+  describe "a goal-attached worker (plan §9.3)" do
+    setup do
+      Bus.subscribe("deck:events")
+      :ok
+    end
+
+    test "its claim never wakes the conductor, and a contradicting verifier keeps the goal open", %{
+      tmp_dir: dir
+    } do
+      parent_id = unique_id("g-parent")
+      worker_id = unique_id("g-worker")
+
+      # The verifier disagrees with the worker. That is the entire point of the feature: the worker
+      # saying "done" and the goal being done are different claims.
+      goal_id =
+        start_goal!(worker_id, parent_id, dir,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: audit incomplete"}}
+          end
+        )
+
+      spawn_conductor!(parent_id, dir)
+
+      {:ok, ^worker_id, _pid} =
+        Orchestrator.launch_subagent(parent_id, "auditor", "audit the files",
+          id: worker_id,
+          cd: dir,
+          goal_id: goal_id,
+          goal_objective: "audit the files",
+          notify_parent_on_done: true,
+          llm_fn: sentinel_llm_fn("Audited.\n===ATHANOR_DONE=== status=ok summary=all audited")
+        )
+
+      # The claim reaches the goal's manager, which is its only audience...
+      assert_receive {:agent_event, ^worker_id, {:goal_candidate_done, report}}, 5_000
+      assert report.status == "ok"
+      assert report.summary == "all audited"
+
+      # ...the verification contradicts it...
+      assert %{last_verifier_result: %Result{verdict: :contradicted}} =
+               await_goal(goal_id, &(&1.last_verifier_result != nil))
+
+      # ...so the goal stays open and the conductor is never told the worker finished. The claim is
+      # not a completion: only the verdict is, and there is no verdict here that says "done".
+      assert {:ok, ^goal_id} = GoalManager.for_worker(worker_id)
+      refute_receive {:agent_event, ^worker_id, {:child_done, _report}}, 300
+      refute conductor_said?(parent_id, "[DONE] Sub-agent")
+
+      cleanup([parent_id, worker_id])
+    end
+
+    test "a verified goal wakes its conductor with the ordinary [DONE] line", %{tmp_dir: dir} do
+      parent_id = unique_id("v-parent")
+      worker_id = unique_id("v-worker")
+
+      goal_id =
+        start_goal!(worker_id, parent_id, dir,
+          title: "verifier target",
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :verified, evidence: "marker.txt exists"}}
+          end
+        )
+
+      spawn_conductor!(parent_id, dir)
+
+      {:ok, ^worker_id, _pid} =
+        Orchestrator.launch_subagent(parent_id, "verifier target", "do the thing",
+          id: worker_id,
+          cd: dir,
+          goal_id: goal_id,
+          notify_parent_on_done: true,
+          llm_fn: sentinel_llm_fn("Done.\n===ATHANOR_DONE=== status=ok summary=goal met")
+        )
+
+      # Closure publishes the *identical* `{:child_done, report}` an ordinary worker produces, so the
+      # conductor's existing handler does the work and no conductor code changed (§4.3).
+      assert_receive {:agent_event, ^worker_id, {:child_done, report}}, 5_000
+      assert report.status == "ok"
+      assert report.summary == "marker.txt exists"
+
+      assert await_message(parent_id, "[DONE] Sub-agent 'verifier target'", 2_000) =~ "status=ok"
+
+      cleanup([parent_id, worker_id])
+    end
+
+    test "a sentinel-less turn says nothing at all (C1)", %{tmp_dir: dir} do
+      parent_id = unique_id("s-parent")
+      worker_id = unique_id("s-worker")
+
+      goal_id = start_goal!(worker_id, parent_id, dir, verify_interval_ms: 10_000)
+
+      spawn_conductor!(parent_id, dir)
+
+      {:ok, ^worker_id, _pid} =
+        Orchestrator.launch_subagent(parent_id, "chatty", "have a look",
+          id: worker_id,
+          cd: dir,
+          goal_id: goal_id,
+          notify_parent_on_done: true,
+          llm_fn: sentinel_llm_fn("I had a look but did not finish anything.")
+        )
+
+      # A conversational turn is not a claim, and must not be treated as one: otherwise every turn
+      # of a goal-driven worker would trigger a verification (C1).
+      refute_receive {:agent_event, ^worker_id, {:goal_candidate_done, _report}}, 300
+      refute_receive {:agent_event, ^worker_id, {:child_done, _report}}, 50
+      refute conductor_said?(parent_id, "[DONE] Sub-agent")
+
+      assert %{verify_attempts: 0} = await_goal(goal_id, &is_map/1)
+
+      cleanup([parent_id, worker_id])
+    end
+
+    test "with no manager registered, the completion is not swallowed (C8)", %{tmp_dir: dir} do
+      parent_id = unique_id("n-parent")
+      worker_id = unique_id("n-worker")
+
+      # A goal id whose manager is not running — a `:temporary` manager that died, or one whose
+      # process never started. The worker finishing anyway must not vanish with it.
+      spawn_conductor!(parent_id, dir)
+
+      {:ok, ^worker_id, _pid} =
+        Orchestrator.launch_subagent(parent_id, "orphan goal", "do the thing",
+          id: worker_id,
+          cd: dir,
+          goal_id: "goal-never-started",
+          notify_parent_on_done: true,
+          llm_fn: sentinel_llm_fn("Done.\n===ATHANOR_DONE=== status=ok summary=finished anyway")
+        )
+
+      assert_receive {:agent_event, ^worker_id, {:child_done, report}}, 5_000
+      assert report.summary == "finished anyway"
+      assert await_message(parent_id, "[DONE] Sub-agent 'orphan goal'", 2_000) =~ "finished anyway"
+
+      cleanup([parent_id, worker_id])
+    end
+
+    test "a worker whose turn produces no sentinel is unaffected when it has no goal", %{
+      tmp_dir: dir
+    } do
+      # The other half of C1's guard: with no goal attached, a sentinel-less turn still says nothing,
+      # and a sentinel-bearing one still wakes the conductor exactly as it always did.
+      parent_id = unique_id("p-parent")
+      worker_id = unique_id("p-worker")
+
+      spawn_conductor!(parent_id, dir)
+
+      {:ok, ^worker_id, _pid} =
+        Orchestrator.launch_subagent(parent_id, "plain worker", "chat",
+          id: worker_id,
+          cd: dir,
+          notify_parent_on_done: true,
+          llm_fn: sentinel_llm_fn("Just chatting.")
+        )
+
+      refute_receive {:agent_event, ^worker_id, {:child_done, _report}}, 300
+      refute_receive {:agent_event, ^worker_id, {:goal_candidate_done, _report}}, 50
+      refute conductor_said?(parent_id, "[DONE] Sub-agent")
+
+      cleanup([parent_id, worker_id])
+    end
+  end
+
+  # --- helpers for the goal tests ---------------------------------------------------------
+
+  defp unique_id(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
+
+  defp sentinel_llm_fn(content) do
+    fn _messages, _tools, _pid -> {:ok, %{role: "assistant", content: content, tool_calls: []}} end
+  end
+
+  defp spawn_conductor!(id, cd) do
+    {:ok, ^id, _pid} =
+      Orchestrator.spawn_session(id: id, role: :conductor, title: id, cd: cd, llm_fn: running_llm())
+
+    id
+  end
+
+  # A registered manager with an injected verifier; the default verifies (so a test that cares about
+  # *not* closing overrides it).
+  defp start_goal!(worker_id, parent_id, cd, opts) do
+    verifier_fn =
+      Keyword.get(opts, :verifier_fn, fn _goal, _opts ->
+        {:ok, %Result{mode: :shell, verdict: :verified, evidence: "ok"}}
+      end)
+
+    goal_id = unique_id("goal")
+
+    {:ok, ^goal_id, manager_pid} =
+      GoalManager.start_goal(
+        [
+          id: goal_id,
+          # The closure's `[DONE] Sub-agent '<title>' …` line is titled by the *goal* (the manager
+          # knows the goal, not the worker's own title), so a caller that wants the usual wording
+          # passes the worker's title here.
+          title: Keyword.get(opts, :title),
+          objective: "the objective",
+          worker_id: worker_id,
+          parent_id: parent_id,
+          cd: cd,
+          verifier: {:shell, "true"},
+          verify_interval_ms: Keyword.get(opts, :verify_interval_ms, 10_000)
+        ],
+        verifier_fn: verifier_fn
+      )
+
+    on_exit(fn -> stop_goal(goal_id, manager_pid) end)
+
+    goal_id
+  end
+
+  defp stop_goal(goal_id, pid) do
+    GoalManager.cancel(goal_id)
+    if Process.alive?(pid), do: DynamicSupervisor.terminate_child(Athanor.GoalSupervisor, pid)
+  rescue
+    _error -> :ok
+  end
+
+  defp await_goal(goal_id, predicate), do: await_goal(goal_id, predicate, 150)
+
+  defp await_goal(goal_id, predicate, attempts)
+
+  defp await_goal(goal_id, _predicate, 0), do: flunk("goal #{goal_id} never settled")
+
+  defp await_goal(goal_id, predicate, attempts) do
+    case GoalManager.status(goal_id) do
+      {:ok, snapshot} ->
+        if predicate.(snapshot), do: snapshot, else: Process.sleep(10) && await_goal(goal_id, predicate, attempts - 1)
+
+      {:error, reason} ->
+        flunk("goal #{goal_id} disappeared while waiting (#{inspect(reason)})")
+    end
+  end
+
+  # Only the conductor's *user* messages: its own system prompt explains the notification by quoting
+  # "[DONE] Sub-agent …", so searching every message would match the prompt itself.
+  defp conductor_notifications(parent_id) do
+    case Orchestrator.lookup(parent_id) do
+      {:ok, pid} ->
+        pid
+        |> Agent.get_state()
+        |> Map.fetch!(:messages)
+        |> Enum.filter(&(Map.get(&1, :role) == "user"))
+        |> Enum.map(&(Map.get(&1, :content) || ""))
+
+      :error ->
+        []
+    end
+  end
+
+  defp conductor_said?(parent_id, needle) do
+    Enum.any?(conductor_notifications(parent_id), &(&1 =~ needle))
+  end
+
+  defp await_message(parent_id, needle), do: await_message(parent_id, needle, 200)
+
+  defp await_message(parent_id, needle, attempts) do
+    case Enum.find(conductor_notifications(parent_id), &(&1 =~ needle)) do
+      nil when attempts > 0 ->
+        Process.sleep(10)
+        await_message(parent_id, needle, attempts - 1)
+
+      nil ->
+        flunk("the conductor never received #{inspect(needle)}")
+
+      content ->
+        content
     end
   end
 

@@ -99,7 +99,7 @@ defmodule Athanor.Agent do
 
   require Logger
 
-  alias Athanor.{Bus, Config, LLM, ProjectContext, SessionId, Tools}
+  alias Athanor.{Bus, Config, GoalManager, LLM, ProjectContext, SessionId, Tools}
   alias Athanor.Store.{Compactor, Tokens}
 
   @default_conductor_prompt """
@@ -137,6 +137,8 @@ defmodule Athanor.Agent do
     :max_turns,
     :notify_parent_on_done,
     :compaction_opts,
+    :goal_id,
+    :goal_objective,
     :turn_timeout_ms,
     status: :idle,
     turn_count: 0,
@@ -305,7 +307,14 @@ defmodule Athanor.Agent do
 
     model = Keyword.get(opts, :model, Config.model())
     cd = Keyword.get(opts, :cd, File.cwd!())
-    system_prompt = compose_system_prompt(Keyword.get(opts, :system_prompt, default_prompt), cd, opts)
+
+    system_prompt =
+      compose_system_prompt(
+        Keyword.get(opts, :system_prompt, default_prompt) |> goal_preamble(opts),
+        cd,
+        opts
+      )
+
     max_turns = Keyword.get(opts, :max_turns, Config.max_turns())
     notify_parent = Keyword.get(opts, :notify_parent_on_done, parent_id != nil)
 
@@ -341,6 +350,8 @@ defmodule Athanor.Agent do
         max_turns: max_turns,
         notify_parent_on_done: notify_parent,
         turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, Config.turn_timeout_ms()),
+        goal_id: Keyword.get(opts, :goal_id),
+        goal_objective: Keyword.get(opts, :goal_objective),
         compaction_opts: normalize_compaction_opts(opts),
         llm_fn: Keyword.get(opts, :llm_fn, default_llm_fn),
         messages: initial_messages(system_prompt, Keyword.get(opts, :messages))
@@ -420,6 +431,7 @@ defmodule Athanor.Agent do
       cd: state.cd,
       session_id: state.session_id,
       turn_count: state.turn_count,
+      goal_id: state.goal_id,
       prompt_queue_len: prompt_queue_len(state)
     }
 
@@ -995,30 +1007,84 @@ defmodule Athanor.Agent do
   # asserts completion, so a warning per suppressed wakeup would be routine noise — and
   # `Athanor.Log.event/2` is reserved for "a hang was avoided". The sentinel obligation lives in
   # the worker's system prompt.
+  # A goal-attached worker's sentinel is a **claim**, not a completion (§5.2, C1): the GoalManager
+  # decides, on evidence the worker does not control, so the conductor is woken by the verdict rather
+  # than by the claim. Two reasons the claim can still be the last word:
+  #
+  #   * a `:temporary` manager can have died, and its worker finishing anyway must not be swallowed
+  #     with it — the ordinary `{:child_done, …}` is emitted instead, so the conductor still learns
+  #     (C8);
+  #   * a conductor that asked not to be notified (`notify_parent_on_done: false`, e.g. a `wait: true`
+  #     caller) is not notified by the fallback either.
+  defp maybe_publish_child_done(%{goal_id: goal_id} = state, content) when is_binary(goal_id) do
+    case done_report(state, content) do
+      nil ->
+        :ok
+
+      report ->
+        cond do
+          GoalManager.registered?(goal_id) -> notify(state, {:goal_candidate_done, report})
+          state.notify_parent_on_done and is_binary(state.parent_id) -> notify(state, {:child_done, report})
+          true -> :ok
+        end
+    end
+  end
+
   defp maybe_publish_child_done(
          %{parent_id: parent_id, notify_parent_on_done: true} = state,
          content
        )
        when is_binary(parent_id) do
-    case parse_done_sentinel(content || "") do
-      {:ok, %{status: status, summary: summary}} ->
-        notify(state, {
-          :child_done,
-          %{
-            child_id: state.id,
-            title: state.title,
-            status: status,
-            summary: summary,
-            output: content
-          }
-        })
-
-      :none ->
-        :ok
+    case done_report(state, content) do
+      nil -> :ok
+      report -> notify(state, {:child_done, report})
     end
   end
 
   defp maybe_publish_child_done(_state, _content), do: :ok
+
+  # The one shape both paths publish, derived from the *same* sentinel the conductor's handler has
+  # always understood — no new grammar (plan §4.4).
+  defp done_report(state, content) do
+    case parse_done_sentinel(content || "") do
+      {:ok, %{status: status, summary: summary}} ->
+        %{
+          child_id: state.id,
+          title: state.title,
+          status: status,
+          summary: summary,
+          output: content
+        }
+
+      :none ->
+        nil
+    end
+  end
+
+  # A goal-driven worker is told what its goal is and that it cannot close it. The instruction is
+  # half the invariant; the other half is that neither this worker's sentinel nor its own summary
+  # decides anything (§7.2 #1).
+  defp goal_preamble(prompt, opts) do
+    case Keyword.get(opts, :goal_id) do
+      nil ->
+        prompt
+
+      goal_id ->
+        [
+          prompt,
+          "\nYou are working to a verified goal (id: #{goal_id}).",
+          case Keyword.get(opts, :goal_objective) do
+            nil -> nil
+            objective -> "Objective: #{objective}"
+          end,
+          "Record progress with the report_progress tool as you go, and end your final message with " <>
+            "the ===ATHANOR_DONE=== sentinel when you believe the goal is met.",
+          "You cannot close this goal yourself: an independent verification decides whether it is met."
+        ]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join("\n")
+    end
+  end
 
   defp kill_current_task(%{current_task: nil} = state), do: state
 

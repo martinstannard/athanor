@@ -9,7 +9,7 @@ defmodule Athanor.Tools do
     available to `:conductor` sessions.
   """
 
-  alias Athanor.{Bus, Orchestrator, SessionId}
+  alias Athanor.{Bus, GoalManager, Orchestrator, SessionId}
   alias Athanor.Tools.{Glob, Grep}
   alias Athanor.Tools.Worktree, as: WorktreeTools
 
@@ -28,7 +28,9 @@ defmodule Athanor.Tools do
 
     case role do
       :conductor -> workspace_schemas() ++ conductor_schemas()
-      _ -> workspace_schemas()
+      # `report_progress` is worker-only: a conductor has no goal of its own to report against, so
+      # offering it there is pure token cost (§7.2, plan §7).
+      _worker -> workspace_schemas() ++ worker_schemas()
     end
   end
 
@@ -177,6 +179,39 @@ defmodule Athanor.Tools do
               }
             },
             "required" => ["pattern"]
+          }
+        }
+      }
+    ]
+  end
+
+  # Tools only a `role: :worker` session is told about. The goal tools (`set_goal`, `verify_goal`,
+  # `goal_status`, `list_goals`) are conductor-only and live in their own group.
+  defp worker_schemas do
+    [
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "report_progress",
+          "description" =>
+            "Record progress on the verified goal this session is working to. Call it as you complete each bounded step so the goal's stall clock is reset; it does not close the goal — only independent verification can do that.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "summary" => %{
+                "type" => "string",
+                "description" => "One line describing what you just completed."
+              },
+              "step" => %{
+                "type" => "string",
+                "description" => "Optional short label for the step (e.g. \"3/7 tests\")."
+              },
+              "evidence" => %{
+                "type" => "string",
+                "description" => "Optional raw evidence: command output, a file path, a diff summary."
+              }
+            },
+            "required" => ["summary"]
           }
         }
       }
@@ -467,6 +502,19 @@ defmodule Athanor.Tools do
     end
   end
 
+  def execute("report_progress", %{"summary" => summary} = args, opts)
+      when is_binary(summary) and summary != "" do
+    # The goal is found from the *calling session*, not from an argument: a worker cannot file
+    # progress against somebody else's goal, and the session id is what the tool opts already carry.
+    case Keyword.get(opts, :session_id) do
+      worker_id when is_binary(worker_id) ->
+        report_progress(worker_id, summary, args)
+
+      _no_session ->
+        {:error, "report_progress needs the calling session id"}
+    end
+  end
+
   def execute("create_worktree", args, opts) when is_map(args) do
     with :ok <- conductor_only(opts, "create_worktree"), do: WorktreeTools.create(args, opts)
   end
@@ -538,7 +586,8 @@ defmodule Athanor.Tools do
              "send_session",
              "create_worktree",
              "list_worktrees",
-             "remove_worktree"
+             "remove_worktree",
+             "report_progress"
            ] do
     {:error, "Missing or invalid required arguments for tool #{tool_name}"}
   end
@@ -600,6 +649,21 @@ defmodule Athanor.Tools do
 
       {:exit, reason} ->
         {:error, {:bash_crashed, reason}}
+    end
+  end
+
+  defp report_progress(worker_id, summary, args) do
+    case GoalManager.report_progress(
+           worker_id,
+           summary: summary,
+           step: args["step"],
+           evidence: args["evidence"]
+         ) do
+      :ok ->
+        {:ok, "Progress recorded. It does not close the goal — independent verification decides that."}
+
+      {:error, :not_found} ->
+        {:error, "this session has no goal attached, so there is no progress to report"}
     end
   end
 
