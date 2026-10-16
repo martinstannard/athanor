@@ -188,4 +188,117 @@ defmodule Athanor.DaemonTest do
              {:assistant, "It uses Elixir 1.19."}
            ]
   end
+
+  test "converts rehydrated (JSON string-keyed) messages into the same TUI entries" do
+    # A resumed session's working set comes back through `transcript.jsonl`, so its keys are
+    # strings — the shape `Orchestrator.resume_*` restores (plan §5.3). If this path did not
+    # render, a `/resume` would hydrate an empty viewport (plan §9.8).
+    messages = [
+      %{"role" => "system", "content" => "sys"},
+      %{"role" => "user", "content" => "Check mix.exs"},
+      %{
+        "role" => "assistant",
+        "content" => "",
+        "tool_calls" => [
+          %{
+            "id" => "1",
+            "type" => "function",
+            "function" => %{"name" => "read_file", "arguments" => "{}"}
+          }
+        ]
+      },
+      %{"role" => "tool", "tool_call_id" => "1", "content" => "elixir: 1.19"},
+      %{"role" => "assistant", "content" => "It uses Elixir 1.19.", "tool_calls" => []}
+    ]
+
+    assert Daemon.messages_to_tui_entries(messages) == [
+             {:user, "Check mix.exs"},
+             {:tool, "✓ read_file"},
+             {:assistant, "It uses Elixir 1.19."}
+           ]
+  end
+
+  # design §7.4 / plan §6.3 + M4: the resume surface is a thin `:erpc` wrapper pair. Exercised
+  # locally (the wrapper short-circuits to a direct call on this node), so these stay cheap
+  # assertions about *dispatch* rather than a new distributed daemon harness.
+  describe "resume wrappers" do
+    @tag :tmp_dir
+    test "resume_all/2 forwards to Orchestrator.resume_all/1 and reports an empty sweep", %{
+      tmp_dir: dir
+    } do
+      # `root:` reaches the Orchestrator's sweep (a wrapper that never dispatched — or an `:erpc`
+      # to a node without the module — would raise `:undef`/`:noproc` here instead). The scratch
+      # root is empty, so nothing is resumed and nothing is written to a real `~/.athanor`.
+      assert {:ok, [], []} = Daemon.resume_all(Node.self(), root: dir)
+    end
+
+    test "resume_session/2 forwards to Orchestrator.resume_session/2" do
+      missing = "daemon-test-missing-#{System.unique_integer([:positive])}"
+
+      assert {:error, :not_found} = Daemon.resume_session(Node.self(), missing)
+    end
+
+    @tag :tmp_dir
+    test "ensure_main_conductor_and_hydrate/2 rehydrates instead of creating a fresh conductor",
+         %{
+           tmp_dir: dir
+         } do
+      id = "daemon-resume-abc"
+
+      :ok =
+        Athanor.Store.ensure_session(
+          [id: id, role: :conductor, title: "Persisted", cd: dir],
+          root: dir
+        )
+
+      # `main_id` is "conductor-main", which does not exist on disk: the resumed Conductor is
+      # what the client is handed, proving the call routed through resume (plan M4).
+      assert {:ok, ^id, sessions} =
+               Daemon.ensure_main_conductor_and_hydrate(Node.self(),
+                 main_id: "conductor-main",
+                 resume: true,
+                 root: dir
+               )
+
+      assert Enum.any?(sessions, &(&1.id == id))
+      refute Enum.any?(sessions, &(&1.id == "conductor-main"))
+
+      stop_session(id)
+    end
+
+    @tag :tmp_dir
+    test "ensure_main_conductor_and_hydrate/2 falls back to a fresh conductor when nothing is stored",
+         %{tmp_dir: dir} do
+      id = "daemon-resume-fallback"
+
+      assert {:ok, ^id, sessions} =
+               Daemon.ensure_main_conductor_and_hydrate(Node.self(),
+                 main_id: id,
+                 resume: true,
+                 root: dir
+               )
+
+      assert Enum.any?(sessions, &(&1.id == id))
+
+      stop_session(id)
+    end
+
+    @tag :tmp_dir
+    test "ensure_main_conductor_and_hydrate/2 reports an unresumable --session id", %{
+      tmp_dir: dir
+    } do
+      assert {:error, {:resume_failed, "daemon-resume-nope", :not_found}} =
+               Daemon.ensure_main_conductor_and_hydrate(Node.self(),
+                 session: "daemon-resume-nope",
+                 root: dir
+               )
+    end
+  end
+
+  defp stop_session(id) do
+    case Athanor.Orchestrator.lookup(id) do
+      {:ok, pid} -> DynamicSupervisor.terminate_child(Athanor.AgentSupervisor, pid)
+      :error -> :ok
+    end
+  end
 end

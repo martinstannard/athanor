@@ -61,9 +61,10 @@ defmodule Athanor.Tools.Grep do
     [root, String.trim_leading(glob, "/")]
     |> Path.join()
     |> Path.wildcard(match_dot: false)
-    |> Enum.filter(&Ignore.within?(ctx, &1))
-    |> Enum.filter(&Ignore.regular_file?/1)
-    |> Enum.filter(&(not Ignore.symlink_ancestor?(ctx, &1)))
+    |> Enum.filter(fn path ->
+      Ignore.within?(ctx, path) and Ignore.regular_file?(path) and
+        not Ignore.symlink_ancestor?(ctx, path)
+    end)
     |> Enum.reject(&Ignore.ignored?(ctx, &1))
     |> Enum.sort()
   rescue
@@ -76,72 +77,84 @@ defmodule Athanor.Tools.Grep do
   defp walk(dir, ctx, acc) do
     case File.ls(dir) do
       {:ok, entries} ->
-        Enum.reduce(entries, acc, fn name, acc ->
-          path = Path.join(dir, name)
-
-          cond do
-            Ignore.ignored?(ctx, path) ->
-              acc
-
-            true ->
-              case File.lstat(path) do
-                {:ok, %File.Stat{type: :directory}} -> walk(path, ctx, acc)
-                {:ok, %File.Stat{type: :regular}} -> [path | acc]
-                _ -> acc
-              end
-          end
-        end)
+        Enum.reduce(entries, acc, &walk_child(&1, dir, ctx, &2))
 
       _ ->
         acc
     end
   end
 
-  defp search_files(files, root, regex, max) do
-    case Enum.reduce_while(files, {[], 0}, fn file, acc ->
-           if elem(acc, 1) >= max do
-             {:halt, acc}
-           else
-             {:cont, scan_file(file, root, regex, max, acc)}
-           end
-         end) do
-      {[], 0} ->
-        {:ok, "(no matches)"}
+  defp walk_child(name, dir, ctx, acc) do
+    path = Path.join(dir, name)
 
-      {lines, count} ->
-        body = lines |> Enum.reverse() |> Enum.join("\n")
-
-        if count >= max do
-          {:ok,
-           body <> "\n… (truncated at #{max} matches; narrow the pattern or raise max_results)"}
-        else
-          {:ok, body}
-        end
+    if Ignore.ignored?(ctx, path) do
+      acc
+    else
+      lstat_entry(path, ctx, acc)
     end
   end
 
-  defp scan_file(file, root, regex, max, {acc, count}) do
-    if Ignore.too_large?(file, Config.search_max_file_bytes()) or Ignore.binary?(file) do
-      {acc, count}
-    else
-      rel = Path.relative_to(Path.expand(file), root)
+  defp lstat_entry(path, ctx, acc) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} -> walk(path, ctx, acc)
+      {:ok, %File.Stat{type: :regular}} -> [path | acc]
+      _ -> acc
+    end
+  end
 
-      file
-      |> File.stream!([], :line)
-      |> Stream.with_index(1)
-      |> Enum.reduce_while({acc, count}, fn {raw_line, line_no}, {acc, count} ->
-        if count >= max do
-          {:halt, {acc, count}}
+  defp search_files(files, root, regex, max) do
+    result =
+      Enum.reduce_while(files, {[], 0}, fn file, acc ->
+        if elem(acc, 1) >= max do
+          {:halt, acc}
         else
-          line = String.trim_trailing(raw_line, "\n")
-
-          if Regex.match?(regex, line) do
-            {:cont, {["#{rel}:#{line_no}:#{line}" | acc], count + 1}}
-          else
-            {:cont, {acc, count}}
-          end
+          {:cont, scan_file(file, root, regex, max, acc)}
         end
       end)
+
+    format_matches(result, max)
+  end
+
+  defp format_matches({[], 0}, _max), do: {:ok, "(no matches)"}
+
+  defp format_matches({lines, count}, max) do
+    body = lines |> Enum.reverse() |> Enum.join("\n")
+
+    if count >= max do
+      {:ok, body <> "\n… (truncated at #{max} matches; narrow the pattern or raise max_results)"}
+    else
+      {:ok, body}
+    end
+  end
+
+  defp scan_file(file, root, regex, max, acc) do
+    if Ignore.too_large?(file, Config.search_max_file_bytes()) or Ignore.binary?(file) do
+      acc
+    else
+      scan_lines(file, Path.relative_to(Path.expand(file), root), regex, max, acc)
+    end
+  end
+
+  defp scan_lines(file, rel, regex, max, state) do
+    file
+    |> File.stream!([], :line)
+    |> Stream.with_index(1)
+    |> Enum.reduce_while(state, fn {raw_line, line_no}, state ->
+      if elem(state, 1) >= max do
+        {:halt, state}
+      else
+        {:cont, scan_line(raw_line, line_no, rel, regex, state)}
+      end
+    end)
+  end
+
+  defp scan_line(raw_line, line_no, rel, regex, {acc, count}) do
+    line = String.trim_trailing(raw_line, "\n")
+
+    if Regex.match?(regex, line) do
+      {["#{rel}:#{line_no}:#{line}" | acc], count + 1}
+    else
+      {acc, count}
     end
   end
 

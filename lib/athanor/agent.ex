@@ -7,11 +7,59 @@ defmodule Athanor.Agent do
   - Subscribes to `"agent:<id>:inbox"` for commands (`{:prompt, text}`, `:cancel`, etc.)
   - Conductors subscribe to `"conductor:<id>:children"` to receive sub-agent completion events
   - Publishes all streaming deltas, tool events, and lifecycle transitions via `Athanor.Bus.publish_event/3`
+  - Publishes every message it appends to `state.messages` via `Athanor.Bus.publish_message/3`
+    as `{:message, id, msg}` on `"deck:events"`, so §7.4's `Athanor.Store.Recorder` can persist
+    the exact, replayable conversation (correction C1). The `system` message is **never**
+    published — it is re-derived on resume (correction C13).
+
+  ## Compaction (design §7.4, plan §5.4)
+
+  The Agent owns `state.messages`, so it also owns the compaction *trigger*: at the end of every
+  turn — and **only** at that boundary, in the terminal `tool_calls: []` branch of
+  `{:llm_result, _}` — it asks `Athanor.Store.Compactor.should_compact?/2` whether the working set
+  is over budget. If it is, `Athanor.Store.Compactor.compact/2` folds the older turns into a
+  single deterministic summary message, the working set shrinks, and a
+  `{:compaction, %{summary: _, kept: _, dropped: _}}` event is published so
+  `Athanor.Store.Recorder` can rewrite `HANDOFF.md` and log the marker. The transcript on disk is
+  never truncated — only the in-memory working set shrinks.
+
+  Never mid-stream and never mid-tool-loop: an `assistant(tool_calls)` message and its `tool`
+  results are still arriving there, and the C5 pairing invariant is exactly what must not be
+  split. The compaction latch (`:compacted?`, supplied to the Compactor by this process) provides
+  the hysteresis the policy documents, so a session near the boundary does not thrash.
+
+  `:compaction_opts` (an init option) is the injection seam for tests and per-session overrides:
+  any `Athanor.Store.Compactor` option (`:context_limit_tokens`, `:compaction_threshold`,
+  `:compaction_keep_fraction`, `:reserve_tokens`, `:hysteresis_ratio`, `:summarizer_fn`).
+
+  ## Prompt stacking
+
+  A prompt that arrives while a turn is in flight is **never dropped**: `enqueue_prompt/2` — and
+  the `{:enqueue_prompt, text}` bus command that `Athanor.Orchestrator.send_session/2` and the TUI
+  use — appends it to `state.prompt_queue`, and `drain_prompt_queue/1` starts exactly **one**
+  queued prompt (FIFO) each time a turn reaches its terminal boundary. `prompt/2` is the
+  synchronous counterpart and answers `{:error, :busy}` instead of queueing.
+
+  Every queue mutation publishes `{:prompt_queue, %{len: n, next: prompt | nil}}`, so a client can
+  render the pending depth without polling; the depth is also carried by `get_state/1` and
+  `snapshot_meta/1` as `:prompt_queue_len`. A queued prompt is persisted only once it *begins* a
+  turn (`begin_user_turn/2` -> `record_messages/1`), which keeps §7.4's transcript exactly equal to
+  the conversation that actually happened.
+
+  **Cancel clears the queue.** `cancel/1` (Esc in the TUI) is a stop-the-line gesture: it kills the
+  in-flight turn *and* discards every queued prompt, publishing `{:prompt_queue, %{len: 0}}`.
+  Retaining the queue would start the very next stacked prompt the moment the killed turn unwound —
+  indistinguishable from not cancelling at all — and, because `drain_prompt_queue/1` runs only at a
+  turn boundary, a retained queue would otherwise sit stranded until some later turn finished.
+  `clear_prompt_queue/1` drops the pending queue on its own, leaving the in-flight turn alone.
   """
 
   use GenServer
 
+  require Logger
+
   alias Athanor.{Bus, Config, LLM, SessionId, Tools}
+  alias Athanor.Store.{Compactor, Tokens}
 
   @default_max_turns 100
 
@@ -48,8 +96,10 @@ defmodule Athanor.Agent do
     :current_task,
     :max_turns,
     :notify_parent_on_done,
+    :compaction_opts,
     status: :idle,
     turn_count: 0,
+    compacted?: false,
     messages: [],
     prompt_queue: :queue.new()
   ]
@@ -96,7 +146,26 @@ defmodule Athanor.Agent do
   end
 
   @doc """
+  Discards every prompt still waiting in `state.prompt_queue` without touching the in-flight turn.
+
+  The counterpart to `cancel/1`'s "stop everything": this is "forget what I stacked". Returns `:ok`
+  unconditionally (clearing an already-empty queue is a no-op) and publishes
+  `{:prompt_queue, %{len: 0, next: nil}}` so clients can drop their indicator.
+  """
+  @spec clear_prompt_queue(GenServer.server() | String.t()) :: :ok
+  def clear_prompt_queue(agent_id) when is_binary(agent_id) do
+    Bus.send_command(agent_id, :clear_prompt_queue)
+  end
+
+  def clear_prompt_queue(agent) do
+    GenServer.call(agent, :clear_prompt_queue)
+  end
+
+  @doc """
   Cancels any in-flight LLM stream or tool execution and returns the agent to `:idle`.
+
+  Also clears the pending prompt queue (see the moduledoc): a cancel means *stop*, not "start the
+  next stacked prompt as soon as this one dies".
   """
   @spec cancel(GenServer.server() | String.t()) :: :ok
   def cancel(agent_id) when is_binary(agent_id) do
@@ -143,7 +212,7 @@ defmodule Athanor.Agent do
 
   # GenServer Callbacks
 
-  @impl true
+  @impl GenServer
   def init(opts) do
     id = Keyword.get(opts, :id, "conductor-main")
     parent_id = Keyword.get(opts, :parent_id)
@@ -192,8 +261,9 @@ defmodule Athanor.Agent do
         cd: cd,
         max_turns: max_turns,
         notify_parent_on_done: notify_parent,
+        compaction_opts: normalize_compaction_opts(opts),
         llm_fn: Keyword.get(opts, :llm_fn, default_llm_fn),
-        messages: [%{role: "system", content: String.trim(system_prompt)}]
+        messages: initial_messages(system_prompt, Keyword.get(opts, :messages))
       }
 
       notify(state, {:session_started, snapshot_meta(state)})
@@ -227,18 +297,22 @@ defmodule Athanor.Agent do
     end
   end
 
-  @impl true
+  @impl GenServer
   def handle_call({:prompt, _text}, _from, %{status: status} = state)
       when status in [:streaming, :executing_tools] do
     {:reply, {:error, :busy}, state}
   end
 
   def handle_call({:prompt, text}, _from, state) do
-    {:reply, :ok, begin_user_turn(state, text)}
+    {:reply, :ok, do_enqueue_prompt(state, text)}
   end
 
   def handle_call(:cancel, _from, state) do
     {:reply, :ok, do_cancel(state)}
+  end
+
+  def handle_call(:clear_prompt_queue, _from, state) do
+    {:reply, :ok, do_clear_prompt_queue(state)}
   end
 
   def handle_call({:subscribe, pid}, _from, state) do
@@ -255,30 +329,37 @@ defmodule Athanor.Agent do
       status: state.status,
       messages: state.messages,
       model: state.model,
-      cd: state.cd
+      cd: state.cd,
+      session_id: state.session_id,
+      turn_count: state.turn_count,
+      prompt_queue_len: prompt_queue_len(state)
     }
 
     {:reply, snapshot, state}
   end
 
-  @impl true
+  @impl GenServer
   def handle_cast({:enqueue_prompt, text}, state) do
     {:noreply, do_enqueue_prompt(state, text)}
   end
 
-  @impl true
-  # PubSub commands arriving on "agent:<id>:inbox"
-  def handle_info({:bus_command, {:prompt, text}}, %{status: status} = state)
-      when status in [:idle, :error] do
-    {:noreply, begin_user_turn(state, text)}
+  @impl GenServer
+  def handle_cast(:clear_prompt_queue, state) do
+    {:noreply, do_clear_prompt_queue(state)}
   end
 
+  @impl GenServer
+  # PubSub commands arriving on "agent:<id>:inbox"
   def handle_info({:bus_command, {:prompt, text}}, state) do
     {:noreply, do_enqueue_prompt(state, text)}
   end
 
   def handle_info({:bus_command, {:enqueue_prompt, text}}, state) do
     {:noreply, do_enqueue_prompt(state, text)}
+  end
+
+  def handle_info({:bus_command, :clear_prompt_queue}, state) do
+    {:noreply, do_clear_prompt_queue(state)}
   end
 
   def handle_info({:bus_command, :cancel}, state) do
@@ -304,14 +385,14 @@ defmodule Athanor.Agent do
 
   def handle_info({:llm_result, {:ok, assistant_msg}}, %{current_task: {_pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
-    state = %{state | current_task: nil, messages: state.messages ++ [assistant_msg]}
+    state = state |> Map.put(:current_task, nil) |> record_messages(assistant_msg)
 
     case Map.get(assistant_msg, :tool_calls, []) do
       [] ->
         state = set_status(state, :idle)
         notify(state, {:turn_complete, assistant_msg.content})
         maybe_publish_child_done(state, assistant_msg.content)
-        {:noreply, drain_prompt_queue(state)}
+        {:noreply, drain_prompt_queue(maybe_compact(state))}
 
       tool_calls when is_list(tool_calls) ->
         {:noreply, start_tool_execution(state, tool_calls)}
@@ -327,13 +408,8 @@ defmodule Athanor.Agent do
 
   def handle_info({:tools_result, tool_messages}, %{current_task: {_pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
-
-    state = %{
-      state
-      | current_task: nil,
-        messages: state.messages ++ tool_messages,
-        turn_count: state.turn_count + 1
-    }
+    state = state |> Map.put(:current_task, nil) |> record_messages(tool_messages)
+    state = %{state | turn_count: state.turn_count + 1}
 
     if state.turn_count >= state.max_turns do
       state = set_status(state, :error)
@@ -367,37 +443,193 @@ defmodule Athanor.Agent do
 
   # Internal Helpers
 
+  # Builds the initial working set: a freshly derived `system` message followed by any
+  # pre-seeded history (C3). The system message is never persisted (C13), so a resumed session
+  # carries its history *without* its old prompt — if the default prompt changed, the new one
+  # wins. Any `system` message inside the pre-seed is dropped so exactly one always leads the
+  # list.
+  defp initial_messages(system_prompt, pre_seed) do
+    system_msg = %{role: "system", content: String.trim(system_prompt)}
+
+    case pre_seed do
+      messages when is_list(messages) ->
+        [system_msg | Enum.reject(messages, &(Map.get(&1, :role) == "system"))]
+
+      nil ->
+        [system_msg]
+    end
+  end
+
+  # The single choke point through which every append to `state.messages` flows (C1):
+  # it appends AND publishes the exact message map, so no append site can silently skip the
+  # write path. Exactly one `{:message, _}` is broadcast per appended message — the system
+  # message set in `init/1` never passes through here.
+  defp record_messages(state, messages) do
+    messages = List.wrap(messages)
+
+    Enum.each(messages, fn msg ->
+      Bus.publish_message(state.id, state.parent_id, msg)
+    end)
+
+    %{state | messages: state.messages ++ messages}
+  end
+
+  # -- compaction (design §7.4, plan §5.4) -----------------------------------------
+
+  # The post-turn compaction check. Called from exactly ONE place: the terminal
+  # `tool_calls == []` branch of `{:llm_result, _}`, after the status has gone `:idle` and
+  # `{:turn_complete, _}` has been published — i.e. only at a turn boundary, never mid-stream
+  # and never mid-tool-loop (where an `assistant(tool_calls)` message is still awaiting its
+  # `tool` results and cutting would break the C5 pairing invariant).
+  #
+  # A no-op unless the working set is genuinely over budget: `should_compact?/2` owns the
+  # threshold + hysteresis policy, and `compact/2` owns the C5-safe cut. `compact/2` signalling
+  # "nothing happened" with an empty summary (no user boundary to cut at) leaves the state
+  # untouched, so a session that cannot be safely compacted simply tries again next turn.
+  defp maybe_compact(state) do
+    opts = compaction_opts(state)
+
+    if Compactor.should_compact?(state.messages, opts) do
+      do_compact(state, opts)
+    else
+      release_compaction_latch(state, opts)
+    end
+  end
+
+  defp do_compact(state, opts) do
+    {new_messages, summary} = Compactor.compact(state.messages, opts)
+
+    if summary == "" or new_messages == state.messages do
+      # No safe cut point (or nothing to drop): leave the working set exactly as it is.
+      state
+    else
+      kept = length(new_messages)
+      dropped = length(state.messages) - kept
+
+      Logger.debug(
+        "Athanor.Agent #{state.id}: compacted #{dropped} messages, kept #{kept} " <>
+          "(estimate #{Tokens.estimate_messages(new_messages)} tokens)"
+      )
+
+      # PINNED SHAPE — Athanor.Store.Recorder consumes exactly this event to rewrite
+      # HANDOFF.md, append the `kind: "compaction"` transcript marker, and bump
+      # `meta.json#compaction`.
+      notify(state, {:compaction, %{summary: summary, kept: kept, dropped: dropped}})
+
+      %{state | messages: new_messages, compacted?: true}
+    end
+  end
+
+  # Hysteresis: after a compaction the latch stays set until the estimate drops back below
+  # `Compactor.hysteresis_threshold/1`, which is what stops a session parked near the boundary
+  # from compacting on every single turn. `Compactor` is pure, so the latch lives here.
+  defp release_compaction_latch(%{compacted?: false} = state, _opts), do: state
+
+  defp release_compaction_latch(state, opts) do
+    if Compactor.latched?(Tokens.estimate_messages(state.messages), opts) do
+      state
+    else
+      %{state | compacted?: false}
+    end
+  end
+
+  # The Compactor options for this agent: the caller's `:compaction_opts` (per-session overrides
+  # and the test/LLM-summariser seam) plus the current latch. Everything else — thresholds, the
+  # context window, the summariser — falls back to `Athanor.Config`/`Compactor` defaults.
+  defp compaction_opts(state) do
+    state.compaction_opts ++ [compacted?: state.compacted?, session: session_meta(state)]
+  end
+
+  # The session description handed to the summary builder (`Handoff`'s metadata block).
+  defp session_meta(state) do
+    %{
+      id: state.id,
+      title: state.title,
+      role: state.role,
+      parent_id: state.parent_id,
+      model: state.model,
+      cd: state.cd,
+      opencode_session_id: state.session_id
+    }
+  end
+
+  defp normalize_compaction_opts(opts) do
+    case Keyword.get(opts, :compaction_opts, []) do
+      list when is_list(list) -> list
+      nil -> []
+      _other -> []
+    end
+  end
+
+  # A prompt arriving on a non-busy agent starts a turn at once — through the queue, so a prompt
+  # that was left stacked by an errored turn cannot be overtaken by a later arrival (FIFO holds
+  # regardless of how the previous turn ended).
   defp do_enqueue_prompt(%{status: status} = state, text) when status in [:idle, :error] do
-    begin_user_turn(state, text)
+    state = %{state | prompt_queue: :queue.in(text, state.prompt_queue)}
+    drain_prompt_queue(state)
   end
 
   defp do_enqueue_prompt(state, text) do
-    %{state | prompt_queue: :queue.in(text, state.prompt_queue)}
+    state = %{state | prompt_queue: :queue.in(text, state.prompt_queue)}
+    notify_prompt_queue(state)
   end
 
+  # Cancel clears the queue (moduledoc): a stacked prompt must not start a fresh turn the moment
+  # the killed one unwinds, because that would undo the cancel.
   defp do_cancel(state) do
-    state = kill_current_task(state)
-    state = set_status(state, :idle)
+    state = state |> kill_current_task() |> set_status(:idle)
     notify(state, :cancelled)
-    state
+    do_clear_prompt_queue(state)
+  end
+
+  # Empties the pending queue without touching `current_task`/`status`: the in-flight turn keeps
+  # streaming, only the stack behind it is forgotten.
+  defp do_clear_prompt_queue(%{prompt_queue: queue} = state) do
+    if :queue.is_empty(queue) do
+      state
+    else
+      notify_prompt_queue(%{state | prompt_queue: :queue.new()})
+    end
   end
 
   defp begin_user_turn(state, text) do
-    user_msg = %{role: "user", content: text}
-    state = %{state | messages: state.messages ++ [user_msg], turn_count: 0}
+    state = state |> record_messages(%{role: "user", content: text}) |> Map.put(:turn_count, 0)
     notify(state, {:user_message, text})
     start_llm_turn(state)
   end
 
+  # Pops exactly one prompt per completed turn (FIFO): each stacked prompt becomes its own turn —
+  # with its own user message and its own §7.4 record — rather than being merged into the prompt
+  # that just finished. The `{:prompt_queue, _}` notification fires before the new turn starts
+  # so a client sees the depth drop at the same moment the queued prompt appears as a `user`
+  # entry.
   defp drain_prompt_queue(state) do
     case :queue.out(state.prompt_queue) do
       {{:value, next_prompt}, rest} ->
-        begin_user_turn(%{state | prompt_queue: rest}, next_prompt)
+        state = %{state | prompt_queue: rest}
+        notify_prompt_queue(state)
+        begin_user_turn(state, next_prompt)
 
       {:empty, _} ->
         state
     end
   end
+
+  # The single notification point for every queue mutation: the depth (what the TUI renders) plus
+  # a preview of the next prompt. `snapshot_meta/1` carries the depth across the wire as well,
+  # so a client that missed an event can still recover the count from `{:session_started, meta}`.
+  defp notify_prompt_queue(state) do
+    notify(state, {:prompt_queue, %{len: prompt_queue_len(state), next: next_queued(state)}})
+  end
+
+  defp next_queued(state) do
+    case :queue.peek(state.prompt_queue) do
+      {:value, prompt} -> prompt
+      :empty -> nil
+    end
+  end
+
+  defp prompt_queue_len(state), do: :queue.len(state.prompt_queue)
 
   defp start_llm_turn(state) do
     state = set_status(state, :streaming)
@@ -422,35 +654,31 @@ defmodule Athanor.Agent do
 
     {pid, ref} =
       spawn_monitor(fn ->
-        tool_messages =
-          Enum.map(tool_calls, fn tc ->
-            name = tc.function.name
-            raw_args = tc.function.arguments
-
-            send(agent_pid, {:tool_event, {:tool_start, name, raw_args}})
-
-            output =
-              case Tools.execute(name, raw_args, cd: cd, session_id: session_id) do
-                {:ok, res} ->
-                  send(agent_pid, {:tool_event, {:tool_end, name, {:ok, res}}})
-                  res
-
-                {:error, err} ->
-                  send(agent_pid, {:tool_event, {:tool_end, name, {:error, err}}})
-                  "Error: #{err}"
-              end
-
-            %{
-              role: "tool",
-              tool_call_id: tc.id,
-              content: output
-            }
-          end)
-
+        tool_messages = Enum.map(tool_calls, &run_tool(&1, agent_pid, cd, session_id))
         send(agent_pid, {:tools_result, tool_messages})
       end)
 
     %{state | current_task: {pid, ref}}
+  end
+
+  defp run_tool(tc, agent_pid, cd, session_id) do
+    name = tc.function.name
+    raw_args = tc.function.arguments
+
+    send(agent_pid, {:tool_event, {:tool_start, name, raw_args}})
+
+    output =
+      case Tools.execute(name, raw_args, cd: cd, session_id: session_id) do
+        {:ok, res} ->
+          send(agent_pid, {:tool_event, {:tool_end, name, {:ok, res}}})
+          res
+
+        {:error, err} ->
+          send(agent_pid, {:tool_event, {:tool_end, name, {:error, err}}})
+          "Error: #{err}"
+      end
+
+    %{role: "tool", tool_call_id: tc.id, content: output}
   end
 
   defp maybe_publish_child_done(
@@ -508,7 +736,9 @@ defmodule Athanor.Agent do
       role: state.role,
       parent_id: state.parent_id,
       model: state.model,
-      status: state.status
+      status: state.status,
+      session_id: state.session_id,
+      prompt_queue_len: prompt_queue_len(state)
     }
   end
 

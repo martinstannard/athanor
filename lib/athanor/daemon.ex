@@ -22,7 +22,7 @@ defmodule Athanor.Daemon do
     case System.get_env("ATHANOR_DAEMON_NODE") do
       nil -> Application.get_env(:athanor, :daemon_node, @default_daemon_node)
       "" -> Application.get_env(:athanor, :daemon_node, @default_daemon_node)
-      val -> String.to_atom(val)
+      val -> dynamic_atom(val)
     end
   end
 
@@ -34,7 +34,7 @@ defmodule Athanor.Daemon do
     case System.get_env("ATHANOR_COOKIE") do
       nil -> Application.get_env(:athanor, :cookie, @default_cookie)
       "" -> Application.get_env(:athanor, :cookie, @default_cookie)
-      val -> String.to_atom(val)
+      val -> dynamic_atom(val)
     end
   end
 
@@ -148,8 +148,21 @@ defmodule Athanor.Daemon do
   end
 
   defp client_node_name do
-    :"athanor_tui_#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}@127.0.0.1"
+    dynamic_atom(
+      "athanor_tui_#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}@127.0.0.1"
+    )
   end
+
+  # The single conversion point for the daemon node name, the distribution cookie and this
+  # client's random node name. All three are **operator-controlled**, not untrusted input: the
+  # node name/cookie come from `ATHANOR_DAEMON_NODE`/`ATHANOR_COOKIE` (or application env) and
+  # the client name is generated here from `:crypto.strong_rand_bytes/1`. None of them is
+  # guaranteed to be an already-existing atom, so the `*_existing_atom` variant would raise on a
+  # valid custom name; creating the atom is intended. Kept in one place so the escape hatch is
+  # narrow and auditable (these atoms are created at most once per configured name — the client
+  # name once per call — so there is no unbounded atom table growth).
+  # credo:disable-for-next-line Credo.Check.Warning.UnsafeToAtom
+  defp dynamic_atom(value) when is_binary(value), do: String.to_atom(value)
 
   @doc """
   Starts Distributed Erlang as a lightweight TUI client node and connects to `target_node`.
@@ -271,63 +284,150 @@ defmodule Athanor.Daemon do
   end
 
   @doc """
-  Ensures a default root Conductor (`"conductor-main"`) is running on `target_node`,
+  Ensures a root Conductor (`"conductor-main"` by default) is running on `target_node`,
   then returns `{:ok, main_id, full_sessions}`.
+
+  When the caller asked to resume — `resume: true` (every persisted session) or
+  `session: "<id>"` (exactly one, taking precedence over `resume: true`) — the Conductor is
+  **rehydrated from the daemon's `~/.athanor/sessions`** instead of being created fresh
+  (design §7.4, plan §6.3/M4). Resume restores history and leaves every session `:idle`: an
+  interrupted turn is never re-run (plan C12). `main_id` then names a resumed Conductor
+  (`"conductor-main"` when it was among them, otherwise the first resumed id, which
+  `Orchestrator.resume_all/1` emits conductors-first).
+
+  Returns `{:error, {:resume_failed, id, reason}}` when `session:` names something that cannot
+  be rehydrated (unknown id, unsupported `meta.json` version, unreadable transcript) so a client
+  can report it instead of silently opening an empty Conductor. A resume request that matches
+  **nothing** on disk (a first-ever `--resume`) falls back to a fresh Conductor, so the daemon is
+  always usable.
   """
   @spec ensure_main_conductor_and_hydrate(node(), keyword()) ::
-          {:ok, String.t(), [map()]}
+          {:ok, String.t(), [map()]} | {:error, term()}
   def ensure_main_conductor_and_hydrate(target_node \\ Node.self(), opts \\ []) do
     main_id = Keyword.get(opts, :main_id, "conductor-main")
-    model = Keyword.get(opts, :model)
 
+    with {:ok, main_id} <- resolve_main_conductor(target_node, main_id, opts) do
+      {:ok, main_id, fetch_full_sessions(target_node)}
+    end
+  end
+
+  # Precedence: an explicit `session:` beats a blanket `resume:` (it is the narrower request).
+  # OptionParser cannot express `--resume [id]`, hence the two-flag grammar (plan OQ3).
+  defp resume_request(opts) do
+    case Keyword.get(opts, :session) do
+      id when is_binary(id) and id != "" -> {:session, String.trim(id)}
+      _ -> if(Keyword.get(opts, :resume) == true, do: :all, else: nil)
+    end
+  end
+
+  defp resolve_main_conductor(target_node, main_id, opts) do
+    case resume_request(opts) do
+      nil -> {:ok, ensure_fresh_conductor(target_node, main_id, opts)}
+      :all -> resume_all_requested(target_node, main_id, opts)
+      {:session, id} -> resume_session_requested(target_node, id)
+    end
+  end
+
+  defp ensure_fresh_conductor(target_node, main_id, opts) do
     case rpc(target_node, Orchestrator, :lookup, [main_id]) do
       {:ok, _pid} ->
-        :ok
+        main_id
 
       :error ->
-        start_opts =
-          [id: main_id, title: main_id]
-          |> then(fn base -> if model, do: Keyword.put(base, :model, model), else: base end)
+        start_opts = [id: main_id, title: main_id] |> put_model(Keyword.get(opts, :model))
 
         {:ok, _, _} = rpc(target_node, Orchestrator, :start_conductor, [start_opts])
+        main_id
     end
+  end
 
-    {:ok, main_id, fetch_full_sessions(target_node)}
+  defp put_model(opts, nil), do: opts
+  defp put_model(opts, model), do: Keyword.put(opts, :model, model)
+
+  defp resume_all_requested(target_node, main_id, opts) do
+    {:ok, ids, _skipped} = resume_all(target_node, store_opts(opts))
+
+    case resumed_main_id(ids, main_id) do
+      nil -> {:ok, ensure_fresh_conductor(target_node, main_id, opts)}
+      id -> {:ok, id}
+    end
+  end
+
+  # A session that is already live is *already* resumed — attaching to it is the whole point of
+  # §7.7, and re-spawning it would fail with `{:duplicate_session_id, id}`.
+  defp resume_session_requested(target_node, id) do
+    case rpc(target_node, Orchestrator, :lookup, [id]) do
+      {:ok, _pid} ->
+        {:ok, id}
+
+      :error ->
+        case resume_session(target_node, id) do
+          {:ok, ^id, _pid} -> {:ok, id}
+          {:error, reason} -> {:error, {:resume_failed, id, reason}}
+        end
+    end
+  end
+
+  defp resumed_main_id([], _main_id), do: nil
+  defp resumed_main_id(ids, main_id), do: if(main_id in ids, do: main_id, else: List.first(ids))
+
+  # An explicit `:root` is forwarded so a caller (or a test) can point the daemon's sweep at a
+  # scratch directory. A `nil` is dropped rather than forwarded: `Store.root/1` treats a present
+  # but nil `:root` as the answer and would then `Path.expand(nil)`.
+  defp store_opts(opts) do
+    case Keyword.get(opts, :root) do
+      root when is_binary(root) -> [root: root]
+      _ -> []
+    end
   end
 
   @doc """
   Converts hydrated session maps from `fetch_full_sessions/1` into `Athanor.TUI`
   session view maps (rebuilding `entries` from historical `user`/`assistant` messages).
+
+  Handles both message shapes the daemon can hand a client: **atom**-keyed (a live
+  `Athanor.Agent`'s working set, built by `Athanor.LLM.finalize_message/1`) and **string**-keyed
+  (anything rehydrated from `transcript.jsonl`, where JSON object keys are always strings —
+  plan §3.1/§5.3). Without the second shape a resumed session would hydrate with an empty
+  viewport, which is exactly what plan §9.8 pins down.
   """
   @spec messages_to_tui_entries([map()]) :: [Athanor.TUI.entry()]
   def messages_to_tui_entries(messages) when is_list(messages) do
-    Enum.flat_map(messages, fn
-      %{role: "user", content: text} when is_binary(text) and text != "" ->
+    Enum.flat_map(messages, &message_to_tui_entries/1)
+  end
+
+  defp message_to_tui_entries(message) do
+    case {field(message, :role), field(message, :content)} do
+      {"user", text} when is_binary(text) and text != "" ->
         [{:user, text}]
 
-      %{role: "assistant", content: text, tool_calls: tool_calls} ->
-        tool_entries =
-          (tool_calls || [])
-          |> Enum.map(fn tc ->
-            {:tool, "✓ #{tc.function.name}"}
-          end)
-
-        assistant_entries =
-          if is_binary(text) and String.trim(text) != "" do
-            [{:assistant, text}]
-          else
-            []
-          end
-
-        tool_entries ++ assistant_entries
-
-      %{role: "assistant", content: text} when is_binary(text) and text != "" ->
-        [{:assistant, text}]
+      {"assistant", text} ->
+        tool_entries(message) ++ assistant_entry(text)
 
       _ ->
         []
-    end)
+    end
   end
+
+  defp tool_entries(message) do
+    message
+    |> field(:tool_calls)
+    |> List.wrap()
+    |> Enum.map(fn tool_call -> {:tool, "✓ #{field(field(tool_call, :function), :name)}"} end)
+  end
+
+  defp assistant_entry(text) do
+    if is_binary(text) and String.trim(text) != "" do
+      [{:assistant, text}]
+    else
+      []
+    end
+  end
+
+  # Reads a field from a message map regardless of whether it was decoded from JSON (string
+  # keys) or built in memory (atom keys).
+  defp field(%{} = map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  defp field(_other, _key), do: nil
 
   # Remote-aware Orchestrator RPC wrappers.
   #
@@ -356,6 +456,54 @@ defmodule Athanor.Daemon do
   @spec start_conductor(node(), keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def start_conductor(target_node, opts \\ []) do
     rpc(target_node, Orchestrator, :start_conductor, [opts])
+  end
+
+  @doc """
+  Rehydrates one persisted session on `target_node` and returns its live pid (design §7.4).
+
+  Thin `:erpc` wrapper over `Athanor.Orchestrator.resume_session/2`. The daemon node owns the
+  `Athanor.Store.Recorder` and therefore `~/.athanor/sessions`; a TUI client never reads or
+  writes the Store itself (plan §6.3). The restored session carries its full message history,
+  comes back `:idle`, and is never prompted — resume restores history, it does not re-run work.
+  """
+  @spec resume_session(node(), String.t()) :: {:ok, String.t(), pid()} | {:error, term()}
+  def resume_session(target_node, session_id) when is_binary(session_id) do
+    rpc(target_node, Orchestrator, :resume_session, [session_id])
+  end
+
+  @doc """
+  Rehydrates **every** persisted session on `target_node`, parents strictly before children,
+  and returns `{:ok, ids, skipped}` (design §7.4, plan §5.3).
+
+  Thin `:erpc` wrapper over `Athanor.Orchestrator.resume_all/1`; `opts` are forwarded verbatim
+  (only `:root` is meaningful — it overrides the Store root for tests). `skipped` reports the
+  directories that were rejected rather than crashing the sweep: malformed/torn `meta.json`,
+  an unsupported version, or a session that is already live on the daemon.
+  """
+  @spec resume_all(node(), keyword()) :: {:ok, [String.t()], [map()]}
+  def resume_all(target_node, opts \\ []) do
+    rpc(target_node, Orchestrator, :resume_all, [opts])
+  end
+
+  @doc """
+  Removes (kills) one running session on `target_node` (design §10.3 verb table, §10.9 T5).
+
+  Thin `:erpc` wrapper over `Athanor.Orchestrator.remove_session/2`. Like the Store, the *process*
+  lives on the daemon node, so a TUI client or a `mix athanor kill` CLI invocation asks the daemon
+  to do the terminating instead of reaching into another node's supervision tree.
+
+  `opts` are forwarded verbatim:
+
+    * `:force` — allow removing a session that is mid-turn (`:streaming`/`:executing_tools`);
+      without it such a session is left running and `{:error, :busy}` comes back.
+    * `:delete_transcript` — also delete `<root>/sessions/<id>`. **Off by default**: T5 keeps the
+      transcript so `resume_session/2` / `resume_all/2` can offer the session again.
+    * `:root` — the Store root (tests point this at a scratch directory).
+  """
+  @spec remove_session(node(), String.t(), keyword()) ::
+          {:ok, :removed} | {:ok, %{transcript: :deleted}} | {:error, :not_found | :busy | term()}
+  def remove_session(target_node, session_id, opts \\ []) when is_binary(session_id) do
+    rpc(target_node, Orchestrator, :remove_session, [session_id, opts])
   end
 
   # Internal Node / Daemon Helpers

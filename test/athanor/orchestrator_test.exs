@@ -1,7 +1,7 @@
 defmodule Athanor.OrchestratorTest do
   use ExUnit.Case, async: false
 
-  alias Athanor.{Agent, Bus, Orchestrator, SessionId}
+  alias Athanor.{Agent, Bus, Orchestrator, SessionId, Store}
 
   @moduletag :tmp_dir
 
@@ -146,6 +146,128 @@ defmodule Athanor.OrchestratorTest do
 
       assert {:ok, _} = Orchestrator.lookup("my-own-id")
       cleanup(["my-own-id"])
+    end
+  end
+
+  describe "remove_session/2 (kill — design §10.3, §10.9 T5)" do
+    test "removes an idle session: gone from lookup/1 and list_sessions/0", %{tmp_dir: tmp_dir} do
+      {:ok, id, pid} =
+        Orchestrator.spawn_session(id: "kill-idle", cd: tmp_dir, llm_fn: running_llm())
+
+      assert Process.alive?(pid)
+      assert {:ok, ^pid} = Orchestrator.lookup(id)
+      assert id in session_ids()
+
+      assert {:ok, :removed} = Orchestrator.remove_session(id)
+
+      assert :error = Orchestrator.lookup(id)
+      refute Process.alive?(pid)
+      refute id in session_ids()
+    end
+
+    test "removing an unknown (or already removed) id reports not_found" do
+      assert {:error, :not_found} = Orchestrator.remove_session("kill-no-such-session")
+      assert {:error, :not_found} = Orchestrator.kill_session("kill-no-such-session")
+
+      {:ok, id, _pid} =
+        Orchestrator.spawn_session(id: "kill-twice", llm_fn: running_llm())
+
+      assert {:ok, :removed} = Orchestrator.remove_session(id)
+      assert {:error, :not_found} = Orchestrator.remove_session(id)
+    end
+  end
+
+  describe "remove_session/2 safety (§10.3) and transcript retention (§10.9 T5)" do
+    test "a mid-turn session is refused without force and removed with it", %{tmp_dir: tmp_dir} do
+      test_pid = self()
+
+      # Holds the turn open: the agent sits in `:streaming` until the test releases the LLM
+      # function, which is exactly the "unfinished turn" §10.3 says must not be killed silently.
+      holding_llm = fn _messages, _tools, _agent_pid ->
+        send(test_pid, {:holding_turn, self()})
+
+        receive do
+          :release -> {:ok, %{role: "assistant", content: "released", tool_calls: []}}
+        after
+          2_000 -> {:ok, %{role: "assistant", content: "released", tool_calls: []}}
+        end
+      end
+
+      {:ok, id, pid} =
+        Orchestrator.spawn_session(
+          id: "kill-busy",
+          prompt: "a long job",
+          cd: tmp_dir,
+          llm_fn: holding_llm
+        )
+
+      assert_receive {:holding_turn, llm_pid}
+      assert :streaming = await_status(id, :streaming)
+
+      assert {:error, :busy} = Orchestrator.remove_session(id)
+      # Refused means refused: the session is still running and still registered.
+      assert Process.alive?(pid)
+      assert {:ok, ^pid} = Orchestrator.lookup(id)
+
+      assert {:ok, :removed} = Orchestrator.remove_session(id, force: true)
+      assert :error = Orchestrator.lookup(id)
+      refute id in session_ids()
+
+      # Let the orphaned LLM task finish promptly instead of idling until its timeout.
+      send(llm_pid, :release)
+    end
+
+    test "the transcript is kept by default and deleted only with delete_transcript: true", %{
+      tmp_dir: tmp_dir
+    } do
+      kept = "kill-keep-transcript"
+      purged = "kill-purge-transcript"
+
+      for id <- [kept, purged] do
+        {:ok, ^id, _pid} =
+          Orchestrator.spawn_session(id: id, cd: tmp_dir, llm_fn: running_llm())
+
+        :ok = Store.ensure_session([id: id, role: :worker], root: tmp_dir)
+        assert File.dir?(Store.session_dir(id, root: tmp_dir))
+      end
+
+      # T5 default: the process dies, the transcript stays, so /resume can still offer it.
+      assert {:ok, :removed} = Orchestrator.remove_session(kept, root: tmp_dir)
+      assert File.dir?(Store.session_dir(kept, root: tmp_dir))
+
+      # Explicit opt-in destroys it.
+      assert {:ok, %{transcript: :deleted}} =
+               Orchestrator.remove_session(purged, root: tmp_dir, delete_transcript: true)
+
+      refute File.exists?(Store.session_dir(purged, root: tmp_dir))
+    end
+
+    test "Athanor.Daemon.remove_session/3 forwards to the Orchestrator" do
+      {:ok, id, _pid} = Orchestrator.spawn_session(id: "kill-daemon", llm_fn: running_llm())
+
+      assert {:ok, :removed} = Athanor.Daemon.remove_session(Node.self(), id)
+      assert :error = Orchestrator.lookup(id)
+    end
+  end
+
+  defp session_ids, do: Enum.map(Orchestrator.list_sessions(), & &1.id)
+
+  defp await_status(id, status), do: await_status(id, status, 100)
+
+  defp await_status(_id, _status, 0), do: :timeout
+
+  defp await_status(id, status, attempts) do
+    current =
+      case Orchestrator.lookup(id) do
+        {:ok, pid} -> Agent.get_state(pid).status
+        :error -> nil
+      end
+
+    if current == status do
+      status
+    else
+      Process.sleep(10)
+      await_status(id, status, attempts - 1)
     end
   end
 

@@ -9,6 +9,15 @@ defmodule Mix.Tasks.Athanor.Daemon do
       mix athanor.daemon
       mix athanor.daemon --status
       mix athanor.daemon --stop
+      mix athanor.daemon --resume
+      mix athanor.daemon --session work-1a2b3c4d
+
+  `--resume` / `--session <id>` rehydrate persisted sessions (design §7.4) instead of creating a
+  fresh `conductor-main` when this task initialises the daemon: `--resume` rehydrates every
+  session under `~/.athanor/sessions` (`Athanor.Orchestrator.resume_all/1`), `--session <id>`
+  exactly one (`Orchestrator.resume_session/2`). Passed to the daemon by the client, both are
+  thin `:erpc` wrappers (`Athanor.Daemon.resume_all/2`, `resume_session/2`); the daemon node is
+  the only writer, so a client never touches the Store itself (plan §6.3).
   """
 
   use Mix.Task
@@ -19,8 +28,15 @@ defmodule Mix.Tasks.Athanor.Daemon do
   def run(args) do
     {opts, _rest, _invalid} =
       OptionParser.parse(args,
-        strict: [status: :boolean, stop: :boolean, restart: :boolean, model: :string],
-        aliases: [m: :model, r: :restart]
+        strict: [
+          status: :boolean,
+          stop: :boolean,
+          restart: :boolean,
+          model: :string,
+          resume: :boolean,
+          session: :string
+        ],
+        aliases: [m: :model, r: :restart, s: :session]
       )
 
     cond do

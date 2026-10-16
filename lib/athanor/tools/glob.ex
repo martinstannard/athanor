@@ -22,18 +22,20 @@ defmodule Athanor.Tools.Glob do
     pattern = args["pattern"]
     max = max_results(args["max_results"])
 
-    cond do
-      not is_binary(pattern) or String.trim(pattern) == "" ->
-        {:error, "glob requires a non-empty `pattern`"}
+    if is_binary(pattern) and String.trim(pattern) != "" do
+      search_root(pattern, args, opts, max)
+    else
+      {:error, "glob requires a non-empty `pattern`"}
+    end
+  end
 
-      true ->
-        root = Tools.resolve_path(args["path"] || ".", opts)
+  defp search_root(pattern, args, opts, max) do
+    root = Tools.resolve_path(args["path"] || ".", opts)
 
-        if File.dir?(root) do
-          search(pattern, root, max)
-        else
-          {:error, "No such directory: #{args["path"] || "."}"}
-        end
+    if File.dir?(root) do
+      search(pattern, root, max)
+    else
+      {:error, "No such directory: #{args["path"] || "."}"}
     end
   end
 
@@ -44,9 +46,10 @@ defmodule Athanor.Tools.Glob do
       [root, String.trim_leading(pattern, "/")]
       |> Path.join()
       |> wildcard()
-      |> Enum.filter(&Ignore.within?(ctx, &1))
-      |> Enum.filter(&Ignore.regular_file?/1)
-      |> Enum.filter(&(not Ignore.symlink_ancestor?(ctx, &1)))
+      |> Enum.filter(fn path ->
+        Ignore.within?(ctx, path) and Ignore.regular_file?(path) and
+          not Ignore.symlink_ancestor?(ctx, path)
+      end)
       |> Enum.reject(&Ignore.ignored?(ctx, &1))
       |> Enum.map(&Path.relative_to(&1, root))
       |> Enum.sort()

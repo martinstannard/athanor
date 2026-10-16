@@ -41,14 +41,14 @@ defmodule Athanor.Bus do
   @spec broadcast(String.t(), term()) :: :ok
   def broadcast(topic, message) when is_binary(topic) do
     if Process.whereis(@pubsub) do
-      Registry.dispatch(@pubsub, topic, fn entries ->
-        for {pid, _} <- entries do
-          send(pid, message)
-        end
-      end)
+      Registry.dispatch(@pubsub, topic, fn entries -> send_all(entries, message) end)
     end
 
     :ok
+  end
+
+  defp send_all(entries, message) do
+    Enum.each(entries, fn {pid, _value} -> send(pid, message) end)
   end
 
   @doc """
@@ -65,6 +65,28 @@ defmodule Athanor.Bus do
       broadcast("conductor:#{parent_id}:children", msg)
     end
 
+    :ok
+  end
+
+  @doc """
+  Publishes an exact appended conversation message to `"deck:events"` as
+  `{:message, agent_id, msg}`.
+
+  Used by `Athanor.Store.Recorder` (design §7.4, correction C1) to persist the *true*
+  conversation history: `{:agent_event, id, {:tool_start, name, args}}` carries no
+  `tool_call.id` and intermediate assistant messages (those carrying `tool_calls`) are never
+  emitted as events, so the transcript cannot be reconstructed from the existing firehose.
+
+  Mirrors `publish_event/3`'s tuple shape `{:<event>, id, payload}` on the **same**
+  `"deck:events"` topic, so it introduces no new topic and no new subscription. `parent_id` is
+  accepted for signature symmetry but is deliberately not routed to `"conductor:<id>:children"`.
+
+  The `system` message is never passed here (it is re-derived on resume — correction C13).
+  """
+  @spec publish_message(String.t(), String.t() | nil, map()) :: :ok
+  def publish_message(agent_id, parent_id, msg) when is_binary(agent_id) do
+    broadcast("deck:events", {:message, agent_id, msg})
+    _ = parent_id
     :ok
   end
 

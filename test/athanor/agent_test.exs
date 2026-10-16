@@ -1,7 +1,8 @@
 defmodule Athanor.AgentTest do
   use ExUnit.Case, async: true
 
-  alias Athanor.Agent
+  alias Athanor.{Agent, Bus}
+  alias Athanor.Store.{Compactor, Tokens}
 
   @moduletag :tmp_dir
 
@@ -81,5 +82,428 @@ defmodule Athanor.AgentTest do
     assert_receive {:agent_event, :cancelled}
 
     assert Agent.get_state(agent).status == :idle
+  end
+
+  # --- §7.4 write path (C1/C3/C4) ----------------------------------------------------------
+
+  describe "Bus.publish_message/3 write path (C1)" do
+    setup do
+      # "deck:events" is a :duplicate Registry key, so subscribing is not idempotent — each
+      # test subscribes exactly once and drains anything left by a sibling async test.
+      Bus.subscribe("deck:events")
+      :ok
+    end
+
+    test "publishes the exact user message map when a turn begins", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: tool_loop_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+
+      assert_receive {:message, "conductor-main",
+                      %{role: "user", content: "What is inside secret.txt?"}}
+
+      assert :ok = Agent.cancel(agent)
+    end
+
+    test "publishes the assistant message including its tool_calls", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: tool_loop_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+
+      assert_receive {:message, "conductor-main",
+                      %{role: "assistant", tool_calls: [%{id: "call_1"} = tool_call]}}
+
+      assert tool_call.function.name == "read_file"
+    end
+
+    test "publishes each tool result message with its tool_call_id", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: tool_loop_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+
+      assert_receive {:message, "conductor-main",
+                      %{role: "tool", tool_call_id: "call_1", content: "alchemical_gold"}}
+    end
+
+    test "the system message is NEVER published on the wire", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: tool_loop_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+
+      # Drive the whole multi-turn loop to completion before checking for absence.
+      assert_receive {:message, _id, %{role: "user"}}
+      assert_receive {:message, _id, %{role: "assistant", tool_calls: [_]}}
+      assert_receive {:message, _id, %{role: "tool"}}
+      assert_receive {:message, _id, %{role: "assistant", tool_calls: []}}
+      assert_receive {:agent_event, {:turn_complete, _}}
+
+      refute_received {:message, _id, %{role: "system"}}
+      refute_received {:message, _id, %{role: "system", content: _}}
+    end
+
+    test "publishes exactly one {:message, _} per appended message", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = fn messages, _tools, _agent_pid ->
+        case List.last(messages).role do
+          "user" ->
+            {:ok,
+             %{
+               role: "assistant",
+               content: "",
+               tool_calls: [
+                 %{
+                   id: "call_1",
+                   type: "function",
+                   function: %{
+                     name: "read_file",
+                     arguments: JSON.encode!(%{"path" => "secret.txt"})
+                   }
+                 }
+               ]
+             }}
+
+          "tool" ->
+            {:ok, %{role: "assistant", content: "done", tool_calls: []}}
+        end
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+      assert_receive {:message, _id, %{role: "user"}}
+      assert_receive {:message, _id, %{role: "assistant", tool_calls: [_]}}
+      assert_receive {:message, _id, %{role: "tool"}}
+      assert_receive {:message, _id, %{role: "assistant", tool_calls: []}}
+      assert_receive {:agent_event, {:turn_complete, "done"}}
+
+      # 5 entries in state.messages, but the system message never rides the wire (C13), so
+      # exactly 4 `{:message, _}` broadcasts — and no duplicates (C-dup).
+      assert length(Agent.get_state(agent).messages) == 5
+      refute_received {:message, _id, _msg}
+    end
+  end
+
+  describe "messages pre-seed (C3)" do
+    test "yields exactly one system message followed by the provided history", %{tmp_dir: tmp_dir} do
+      history = [
+        %{role: "user", content: "first prompt"},
+        %{
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            %{
+              id: "call_1",
+              type: "function",
+              function: %{name: "bash", arguments: ~s({"command":"ls"})}
+            }
+          ]
+        },
+        %{role: "tool", tool_call_id: "call_1", content: "mix.exs"}
+      ]
+
+      {:ok, agent} = Agent.start_link(cd: tmp_dir, messages: history)
+
+      messages = Agent.get_state(agent).messages
+
+      assert [%{role: "system", content: system_content} | rest] = messages
+      assert is_binary(system_content) and system_content != ""
+      assert rest == history
+      assert Enum.count(messages, &(&1.role == "system")) == 1
+    end
+
+    test "drops any system message found inside the pre-seed", %{tmp_dir: tmp_dir} do
+      history = [
+        %{role: "system", content: "STALE PROMPT"},
+        %{role: "user", content: "hello"}
+      ]
+
+      {:ok, agent} = Agent.start_link(cd: tmp_dir, messages: history)
+      messages = Agent.get_state(agent).messages
+
+      assert Enum.count(messages, &(&1.role == "system")) == 1
+      refute Enum.any?(messages, &(&1[:content] == "STALE PROMPT"))
+      assert List.last(messages) == %{role: "user", content: "hello"}
+    end
+
+    test "without :messages the working set is still [system] only", %{tmp_dir: tmp_dir} do
+      {:ok, agent} = Agent.start_link(cd: tmp_dir)
+      assert [%{role: "system"}] = Agent.get_state(agent).messages
+    end
+  end
+
+  describe "get_state/1 and snapshot_meta/1 (C4)" do
+    test "exposes session_id and turn_count", %{tmp_dir: tmp_dir} do
+      {:ok, agent} =
+        Agent.start_link(cd: tmp_dir, session_id: "ses_athanor_deadbeef")
+
+      state = Agent.get_state(agent)
+
+      assert state.session_id == "ses_athanor_deadbeef"
+      assert state.turn_count == 0
+      # existing keys are untouched
+      assert state.id == "conductor-main"
+      assert state.status == :idle
+      assert %{role: "system"} = hd(state.messages)
+    end
+
+    test "session_id is included in the {:session_started, meta} event", %{tmp_dir: tmp_dir} do
+      Bus.subscribe("deck:events")
+
+      {:ok, _agent} =
+        Agent.start_link(cd: tmp_dir, id: "meta-session-id", session_id: "ses_athanor_c4")
+
+      assert_receive {:agent_event, {:session_started, meta}}
+      assert meta.session_id == "ses_athanor_c4"
+      assert meta.id == "meta-session-id"
+    end
+
+    test "turn_count increments as tool rounds complete", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: tool_loop_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+      assert_receive {:agent_event, {:turn_complete, _}}
+
+      assert Agent.get_state(agent).turn_count == 1
+    end
+  end
+
+  # --- §5.4 compaction trigger (M5) -------------------------------------------------------
+
+  describe "post-turn compaction trigger (§5.4)" do
+    setup do
+      # "deck:events" is a :duplicate Registry key: subscribe exactly once per test and drain
+      # anything a sibling async test left behind before asserting.
+      Bus.subscribe("deck:events")
+      :ok
+    end
+
+    test "compacts a large history at the turn boundary and publishes the pinned event",
+         %{tmp_dir: tmp_dir} do
+      # A deliberately small window so the seeded history is unambiguously over budget.
+      limit = Tokens.estimate_messages(big_turns(4))
+      opts = compaction_opts(limit)
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          cd: tmp_dir,
+          messages: big_turns(4),
+          llm_fn: final_answer_llm_fn(),
+          compaction_opts: opts
+        )
+
+      before = Agent.get_state(agent).messages
+      assert length(before) == 17
+      assert Compactor.should_compact?(before, opts)
+
+      assert :ok = Agent.prompt(agent, "follow-up question")
+      assert_receive {:agent_event, {:turn_complete, "final answer"}}
+
+      state = Agent.get_state(agent)
+
+      # (a) the working set shrank and now carries the Compactor's summary message
+      assert length(state.messages) < length(before)
+      assert [%{role: "system"} | [summary_msg | _recent]] = state.messages
+      assert summary_msg.role == "assistant"
+      assert summary_msg.content =~ "[CONTEXT COMPACTED]"
+      assert summary_msg.content =~ "Completed steps"
+
+      # (b) the pinned {:compaction, %{summary:, kept:, dropped:}} event rides "deck:events"
+      assert_receive {:agent_event,
+                      {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
+
+      assert is_binary(summary) and summary =~ "Handoff for"
+      assert kept == length(state.messages)
+      assert dropped == length(before) + 2 - kept
+      assert dropped > 0
+
+      # (c) the C5 pairing invariant still holds on the new list (Compactor guarantees it)
+      assert Compactor.pairing_ok?(state.messages)
+
+      # the system message is still first and unique
+      assert hd(state.messages) == hd(before)
+      assert Enum.count(state.messages, &(&1.role == "system")) == 1
+
+      assert state.status == :idle
+    end
+
+    test "the summary message is the Compactor's own output for the dropped prefix",
+         %{tmp_dir: tmp_dir} do
+      limit = Tokens.estimate_messages(big_turns(4))
+      opts = compaction_opts(limit)
+      history = big_turns(4)
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          cd: tmp_dir,
+          messages: history,
+          llm_fn: final_answer_llm_fn(),
+          compaction_opts: opts
+        )
+
+      assert :ok = Agent.prompt(agent, "follow-up question")
+
+      assert_receive {:agent_event,
+                      {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
+
+      assert_receive {:agent_event, {:turn_complete, _}}
+
+      # Everything in the working set at the turn boundary: the system message, the seed and
+      # the user prompt — the turn boundary is the *only* place compaction can fire.
+      state = Agent.get_state(agent)
+      assert kept + dropped == length(history) + 3
+      assert Enum.at(state.messages, 1).content == "[CONTEXT COMPACTED] " <> summary
+    end
+
+    test "does NOT compact below the threshold", %{tmp_dir: tmp_dir} do
+      # A huge window: the same history is nowhere near the trigger.
+      opts = compaction_opts(100_000_000)
+      history = big_turns(2)
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          cd: tmp_dir,
+          messages: history,
+          llm_fn: final_answer_llm_fn(),
+          compaction_opts: opts
+        )
+
+      assert :ok = Agent.prompt(agent, "follow-up question")
+      assert_receive {:agent_event, {:turn_complete, "final answer"}}
+
+      state = Agent.get_state(agent)
+      # system + history + user prompt + terminal assistant message, unchanged
+      assert length(state.messages) == length(history) + 3
+      assert Enum.at(state.messages, 1) == Enum.at(history, 0)
+
+      # (d) below-threshold histories produce NO compaction event at all
+      refute_received {:agent_event, {:compaction, _}}
+    end
+
+    test "never compacts mid-tool-loop (only at the terminal turn boundary)", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      # Same tiny window: if the trigger ran mid-loop the tool-call/result pair would be at risk.
+      history = big_turns(4)
+      limit = Tokens.estimate_messages(history)
+      opts = compaction_opts(limit)
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          cd: tmp_dir,
+          messages: history,
+          llm_fn: tool_loop_llm_fn(),
+          compaction_opts: opts
+        )
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+
+      # The intermediate assistant(tool_calls) + tool result are observed *before* any
+      # compaction — i.e. the tool loop ran to completion uncompacted.
+      assert_receive {:message, _id, %{role: "assistant", tool_calls: [_]}}
+      assert_receive {:message, _id, %{role: "tool"}}
+      assert_receive {:agent_event, {:tool_end, "read_file", {:ok, "alchemical_gold"}}}
+      assert_receive {:agent_event, {:turn_complete, "done"}}
+
+      state = Agent.get_state(agent)
+
+      # The full tool pair survived the loop...
+      kept_pairs =
+        state.messages
+        |> Enum.filter(&match?(%{role: "assistant", tool_calls: [_]}, &1))
+        |> Enum.map(&hd(&1.tool_calls).id)
+
+      assert "call_1" in kept_pairs
+      assert Compactor.pairing_ok?(state.messages)
+
+      # ...and the compaction event (if any) fired only after the terminal turn.
+      assert_receive {:agent_event, {:compaction, %{kept: kept, dropped: dropped}}}
+      assert kept == length(state.messages)
+      assert dropped > 0
+      assert hd(state.messages).role == "system"
+    end
+  end
+
+  # -- compaction test fixtures ------------------------------------------------------------
+
+  # One user turn: prompt, assistant (tool call), tool result, assistant answer — with a fat
+  # body on each so the seeded history is comfortably over a small window.
+  defp big_turn(n) do
+    body = String.duplicate("x", 400)
+
+    [
+      %{role: "user", content: "task#{n} " <> body},
+      %{
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          %{
+            id: "call_#{n}",
+            type: "function",
+            function: %{
+              name: "read_file",
+              arguments: JSON.encode!(%{"path" => "f#{n}.ex"})
+            }
+          }
+        ]
+      },
+      %{role: "tool", tool_call_id: "call_#{n}", content: "result#{n} " <> body},
+      %{role: "assistant", content: "answer#{n} " <> body}
+    ]
+  end
+
+  defp big_turns(n), do: Enum.flat_map(1..n, &big_turn/1)
+
+  # A window of `limit` with the threshold at 0.5 and no reserve, so `should_compact?/2` is
+  # decided purely by the seeded history being at/above `limit`.
+  defp compaction_opts(limit) do
+    [
+      context_limit_tokens: limit,
+      compaction_threshold: 0.5,
+      reserve_tokens: 0,
+      compaction_keep_fraction: 0.2
+    ]
+  end
+
+  defp final_answer_llm_fn do
+    fn _messages, _tools, _agent_pid ->
+      {:ok, %{role: "assistant", content: "final answer", tool_calls: []}}
+    end
+  end
+
+  # A fake provider: emit one read_file tool call, then a final answer once the tool ran.
+  defp tool_loop_llm_fn do
+    fn messages, _tools, _agent_pid ->
+      case List.last(messages).role do
+        "user" ->
+          {:ok,
+           %{
+             role: "assistant",
+             content: "",
+             tool_calls: [
+               %{
+                 id: "call_1",
+                 type: "function",
+                 function: %{
+                   name: "read_file",
+                   arguments: JSON.encode!(%{"path" => "secret.txt"})
+                 }
+               }
+             ]
+           }}
+
+        "tool" ->
+          {:ok, %{role: "assistant", content: "done", tool_calls: []}}
+      end
+    end
   end
 end

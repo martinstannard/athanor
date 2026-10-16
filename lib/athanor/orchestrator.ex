@@ -4,11 +4,21 @@ defmodule Athanor.Orchestrator do
   using `Athanor.Bus` PubSub for control and event routing.
   """
 
-  alias Athanor.{Agent, Bus, SessionId}
+  require Logger
+
+  alias Athanor.{Agent, Bus, SessionId, Store}
+  alias Athanor.Store.Session
 
   # Generated-id collisions are already vanishingly unlikely; this bounds a retry loop
   # rather than silently starting an unreachable, unregistered agent.
   @id_attempts 3
+
+  # A Registry entry is deleted by the `Athanor.AgentRegistry` process when it observes the
+  # registered process's `:DOWN`, which can trail `DynamicSupervisor.terminate_child/2` by one
+  # message pass. `remove_session/2` therefore confirms the entry is gone with a short bounded
+  # retry (50 x 10 ms) rather than reporting success on a process that is still reachable.
+  @remove_confirm_attempts 50
+  @remove_confirm_pause_ms 10
 
   @doc """
   Subscribes the calling process to `"deck:events"`, receiving
@@ -69,6 +79,72 @@ defmodule Athanor.Orchestrator do
   @spec spawn_agent(keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def spawn_agent(opts \\ []), do: spawn_session(opts)
 
+  @doc """
+  Rehydrates every persisted session under the Store root, parents before children
+  (design §7.4; plan §5.3; corrections C8/C12).
+
+  Discovery goes through `Athanor.Store.list/1`, which is deliberately tolerant: a directory
+  with a malformed, corrupt or too-new `meta.json` is logged and skipped rather than raising.
+  The ids `Store.list/1` discards are additionally collected, so callers can report them
+  without a second sweep — one bad directory never aborts the resume.
+
+  Sessions are re-created with `spawn_session/1` in a topologically sorted order:
+
+    * **Conductors first**, then a depth-first walk of the `parent_id` forest, so a session is
+      spawned only **after** the parent it names. When a child comes up its parent is therefore
+      already live and registered, and both its `notify_parent_on_done` topic and
+      `Orchestrator.lookup(parent_id)` resolve (C8).
+    * The working set is restored from `transcript.jsonl`: the `user`/`assistant`/`tool`
+      records in `seq` order, mapped back to their exact message maps. `system` is **never**
+      restored — `Athanor.Agent.init/1` re-derives exactly one from the role (C13).
+    * In-flight state is neutralised (C12): `spawn_session/1` always starts a session `:idle`
+      with no `current_task`, so a turn that was `:streaming` when it was persisted is not
+      resumed. A `{:resume, %{from: version}}` marker is published for the Recorder to persist.
+
+  **No initial prompt is ever dispatched** — resume restores history, it never re-runs work.
+
+  Returns `{:ok, ids, skipped}`, where `ids` are the resumed session ids **in spawn order**
+  (parents before children) and `skipped` is a list of `%{id: id, reason: reason}` maps for the
+  sessions that could not be resumed (rejected at discovery, unreadable transcript, or a failed
+  spawn).
+  """
+  @spec resume_all(keyword()) :: {:ok, [String.t()], [map()]} | {:error, term()}
+  def resume_all(opts \\ []) do
+    root = Store.root(opts)
+    {sessions, skipped} = discover_sessions(root)
+
+    {ids, skipped} =
+      sessions
+      |> order_for_resume()
+      |> Enum.reduce({[], skipped}, fn session, {ids, skipped} ->
+        case safe_resume(session, root) do
+          {:ok, _id, _pid} -> {[session.id | ids], skipped}
+          {:error, reason} -> {ids, [%{id: session.id, reason: reason} | skipped]}
+        end
+      end)
+
+    {:ok, Enum.reverse(ids), Enum.reverse(skipped)}
+  end
+
+  @doc """
+  Rehydrates a single persisted session by id and returns its live pid.
+
+  The single-node form of `resume_all/1`: the same history restore, the same `:idle`
+  neutralisation (C12), the same `{:resume, _}` marker. Returns `{:error, :not_found}` for an
+  unknown id or `{:error, {:unsupported_version, n}}` for a too-new `meta.json` (both from
+  `Athanor.Store.load/2`), or `{:error, reason}` when the transcript is unreadable or the spawn
+  fails.
+  """
+  @spec resume_session(String.t(), keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
+  def resume_session(id, opts \\ []) when is_binary(id) do
+    root = Store.root(opts)
+
+    with {:ok, session} <- Store.load(id, root: root),
+         {:ok, _id, pid} <- rehydrate_and_spawn(session, root) do
+      {:ok, id, pid}
+    end
+  end
+
   defp spawn_generated(_opts, prefix, 0), do: {:error, {:session_id_exhausted, prefix}}
 
   defp spawn_generated(opts, prefix, attempts) do
@@ -87,7 +163,7 @@ defmodule Athanor.Orchestrator do
         opts
         |> Keyword.put(:id, id)
         |> Keyword.put(:title, title)
-        |> Keyword.put(:register, true)
+        |> Keyword.put_new(:register, true)
         |> Keyword.put_new(:subscriber, nil)
 
       spec = %{
@@ -98,10 +174,7 @@ defmodule Athanor.Orchestrator do
 
       case DynamicSupervisor.start_child(Athanor.AgentSupervisor, spec) do
         {:ok, pid} ->
-          if is_binary(initial_prompt) and String.trim(initial_prompt) != "" do
-            Bus.send_command(id, {:prompt, initial_prompt})
-          end
-
+          prompt_if_present(id, initial_prompt)
           {:ok, id, pid}
 
         {:error, reason} ->
@@ -109,6 +182,12 @@ defmodule Athanor.Orchestrator do
       end
     else
       {:error, {:invalid_session_id, id}}
+    end
+  end
+
+  defp prompt_if_present(id, prompt) do
+    if is_binary(prompt) and String.trim(prompt) != "" do
+      Bus.send_command(id, {:prompt, prompt})
     end
   end
 
@@ -139,6 +218,128 @@ defmodule Athanor.Orchestrator do
 
       :error ->
         {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Removes (kills) a running session: `terminate_child/2` on the process, **keeping** the
+  on-disk transcript by default (design §10.3 verb table, §10.9 T5).
+
+  Where `cancel_session/1` merely cancels one in-flight *turn* and leaves the session running,
+  this removes the session itself, so the deck/registry stops accumulating finished Sub-Agents.
+  Because §7.4 persists every session, a removed session **lingers as a resumable transcript**:
+  `Athanor.Orchestrator.resume_session/2` / `resume_all/1` can bring it back. Destroying state
+  is therefore never the default — matching the §9 principle and T5's recommendation.
+
+  ## Options
+
+    * `:force` — allow removing a session that is **mid-turn** (`:streaming` or
+      `:executing_tools`). Without it such a session is left alone and `{:error, :busy}` is
+      returned, so killing unfinished work always takes an explicit decision (§10.3, §7.2's rule
+      that only a managed, verified path may terminate work).
+    * `:delete_transcript` — also hard-delete `<root>/sessions/<id>` via `Athanor.Store.delete/2`.
+      Off by default.
+    * `:root` — the Store root the transcript lives under (defaults to
+      `Athanor.Config.home/0`); forwarded to `Store.delete/2`, so tests can point at a scratch
+      directory.
+
+  ## Return value
+
+  `{:ok, :removed}` when the transcript is kept (the default) and `{:ok, %{transcript: :deleted}}`
+  when `:delete_transcript` was honoured. `{:error, :not_found}` for an id that is not currently
+  registered (including one already removed), and `{:error, :busy}` for a live session in a
+  `:streaming`/`:executing_tools` state without `:force`.
+  """
+  @spec remove_session(String.t(), keyword()) ::
+          {:ok, :removed} | {:ok, %{transcript: :deleted}} | {:error, :not_found | :busy | term()}
+  def remove_session(id, opts \\ []) when is_binary(id) do
+    with {:ok, pid} <- lookup_or_not_found(id),
+         :ok <- ensure_removable(id, pid, opts),
+         :ok <- terminate_and_confirm(id, pid) do
+      delete_transcript(id, opts)
+    end
+  end
+
+  @doc """
+  Alias for `remove_session/2`.
+  """
+  @spec kill_session(String.t(), keyword()) ::
+          {:ok, :removed} | {:ok, %{transcript: :deleted}} | {:error, :not_found | :busy | term()}
+  def kill_session(id, opts \\ []) when is_binary(id), do: remove_session(id, opts)
+
+  # `lookup/1` returns `:error` (a bare atom) for an unknown id; `remove_session/2` speaks in
+  # tagged tuples, so the two are bridged here.
+  defp lookup_or_not_found(id) do
+    case lookup(id) do
+      {:ok, pid} -> {:ok, pid}
+      :error -> {:error, :not_found}
+    end
+  end
+
+  # §10.3: a session with unfinished work is only removed when the caller says so explicitly.
+  defp ensure_removable(id, pid, opts) do
+    case Agent.get_state(pid).status do
+      status when status in [:streaming, :executing_tools] ->
+        if truthy?(Keyword.get(opts, :force)) do
+          :ok
+        else
+          Logger.warning(
+            "Athanor.Orchestrator: refusing to remove session #{id} (status=#{status}); " <>
+              "pass force: true to terminate a session mid-turn"
+          )
+
+          {:error, :busy}
+        end
+
+      _status ->
+        :ok
+    end
+  end
+
+  defp truthy?(value), do: value not in [nil, false]
+
+  # `terminate_child/2` is synchronous on the supervisor, but the Registry entry disappears only
+  # when the registry observes the `:DOWN` — a separate message pass. Confirming `lookup/1` is
+  # `:error` before returning is what makes `{:ok, :removed}` meaningful (and keeps a caller's
+  # immediately-following spawn of the same id from hitting `{:duplicate_session_id, id}`).
+  defp terminate_and_confirm(id, pid) do
+    case DynamicSupervisor.terminate_child(Athanor.AgentSupervisor, pid) do
+      :ok -> confirm_removed(id, @remove_confirm_attempts)
+      # The child was already gone (crashed, or removed concurrently): the goal state holds.
+      {:error, :not_found} -> confirm_removed(id, @remove_confirm_attempts)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp confirm_removed(_id, 0), do: {:error, :not_removed}
+
+  defp confirm_removed(id, attempts) do
+    case lookup(id) do
+      :error ->
+        :ok
+
+      {:ok, _pid} ->
+        Process.sleep(@remove_confirm_pause_ms)
+        confirm_removed(id, attempts - 1)
+    end
+  end
+
+  # T5: the transcript is retained unless the caller explicitly asks for its removal. `Store.delete/2`
+  # is idempotent (`:ok` for a missing directory) and `opts` is forwarded verbatim so an explicit
+  # `:root` reaches it.
+  defp delete_transcript(id, opts) do
+    if truthy?(Keyword.get(opts, :delete_transcript)) do
+      case Store.delete(id, opts) do
+        :ok ->
+          {:ok, %{transcript: :deleted}}
+
+        {:error, reason} ->
+          # The process is already gone; only the on-disk cleanup failed. Report it rather than
+          # pretending the session was fully removed.
+          {:error, {:transcript_delete_failed, reason}}
+      end
+    else
+      {:ok, :removed}
     end
   end
 
@@ -228,5 +429,143 @@ defmodule Athanor.Orchestrator do
       %{role: "assistant", content: text} when is_binary(text) and text != "" -> text
       _ -> nil
     end)
+  end
+
+  # -- resume / rehydration (plan §5.3, C8/C12) ---------------------------------
+
+  # `Store.list/1` already skips (and logs) malformed/corrupt/too-new directories; the scan
+  # below recovers exactly those ids so `resume_all/1` can report them. A session that loads
+  # here is filtered out of `skipped`, so the two views can never disagree.
+  defp discover_sessions(root) do
+    sessions = Store.list(root: root)
+    loaded = MapSet.new(sessions, & &1.id)
+
+    skipped =
+      Store.sessions_root(root: root)
+      |> Path.join("*/meta.json")
+      |> Path.wildcard()
+      |> Enum.map(&(&1 |> Path.dirname() |> Path.basename()))
+      |> Enum.reject(&MapSet.member?(loaded, &1))
+      |> Enum.sort()
+      |> Enum.flat_map(fn id ->
+        case Store.load(id, root: root) do
+          {:ok, _session} -> []
+          {:error, reason} -> [%{id: id, reason: reason}]
+        end
+      end)
+
+    {sessions, skipped}
+  end
+
+  # C8: conductors first (by `created_at`), then a depth-first walk of the `parent_id` forest so
+  # a session is emitted only after the parent it names. Sessions whose parent is absent (an
+  # orphan) are appended last rather than dropped.
+  defp order_for_resume(sessions) do
+    by_parent = Enum.group_by(sessions, & &1.parent_id)
+    roots = sessions |> Enum.filter(&is_nil(&1.parent_id)) |> ordered()
+
+    emitted = Enum.flat_map(roots, &emit_tree(&1, by_parent))
+    emitted_ids = MapSet.new(emitted, & &1.id)
+
+    emitted ++ (sessions |> Enum.reject(&MapSet.member?(emitted_ids, &1.id)) |> ordered())
+  end
+
+  defp emit_tree(session, by_parent) do
+    children = by_parent |> Map.get(session.id, []) |> ordered()
+    [session | Enum.flat_map(children, &emit_tree(&1, by_parent))]
+  end
+
+  defp ordered(sessions) do
+    Enum.sort_by(sessions, fn session ->
+      {role_rank(session), created_at_key(session), session.id}
+    end)
+  end
+
+  defp role_rank(%Session{role: :conductor}), do: 0
+  defp role_rank(_session), do: 1
+
+  defp created_at_key(%Session{created_at: %DateTime{} = dt}) do
+    DateTime.to_unix(dt, :microsecond)
+  end
+
+  defp created_at_key(%Session{created_at: value}) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> DateTime.to_unix(dt, :microsecond)
+      {:error, _reason} -> 0
+    end
+  end
+
+  defp created_at_key(_session), do: 0
+
+  defp safe_resume(session, root) do
+    rehydrate_and_spawn(session, root)
+  rescue
+    error -> {:error, {:resume_failed, Exception.message(error)}}
+  end
+
+  defp rehydrate_and_spawn(%Session{} = session, root) do
+    with {:ok, messages} <- rehydrate_messages(session.id, root) do
+      spawn_resumed(session, messages)
+    end
+  end
+
+  # §5.3 step 3: the restored working set is exactly the persisted `user`/`assistant`/`tool`
+  # records in `seq` order, mapped back to their message maps. `system` records are dropped —
+  # `Athanor.Agent.init/1` re-derives one (C13), so a resume never grafts a stale prompt onto
+  # the history and never ends up with two.
+  defp rehydrate_messages(id, root) do
+    case Store.load_records(id, root: root) do
+      {:ok, records, _meta} ->
+        messages =
+          records
+          |> Enum.sort_by(&record_seq/1)
+          |> Enum.flat_map(&persisted_message/1)
+
+        {:ok, messages}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp persisted_message(%{"kind" => kind, "payload" => %{} = payload})
+       when kind in ["user", "assistant", "tool"],
+       do: [payload]
+
+  defp persisted_message(_record), do: []
+
+  defp record_seq(%{"seq" => seq}) when is_integer(seq), do: seq
+  defp record_seq(_record), do: 0
+
+  # Parents-before-children is guaranteed by the caller's ordering; here we simply re-create the
+  # session with its persisted identity restored and its history pre-seeded. `register: true`
+  # keeps it reachable through `lookup/1`, `list_sessions/0` and the TUI. No `:prompt` is passed,
+  # so `spawn_session/1` dispatches nothing — resume never re-runs work.
+  defp spawn_resumed(%Session{} = session, messages) do
+    opts =
+      [
+        id: session.id,
+        title: session.title,
+        role: session.role,
+        parent_id: session.parent_id,
+        model: session.model,
+        cd: session.cd,
+        session_id: session.opencode_session_id,
+        messages: messages,
+        register: true
+      ]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+    case spawn_session(opts) do
+      {:ok, id, pid} ->
+        # C12: `spawn_session/1` always starts a session `:idle` with `current_task: nil`, so an
+        # interrupted turn is neutralised, never resumed. The marker is published (the Recorder
+        # persists it as a `kind: "resume"` record) so the interruption stays visible.
+        Bus.publish_event(id, session.parent_id, {:resume, %{from: session.version}})
+        {:ok, id, pid}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 end

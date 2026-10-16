@@ -319,27 +319,7 @@ defmodule Athanor.Tools do
 
     case File.read(full_path) do
       {:ok, content} ->
-        parts = String.split(content, old_str)
-
-        case length(parts) - 1 do
-          0 ->
-            {:error, "old_string not found in #{path}"}
-
-          1 ->
-            updated = Enum.join(parts, new_str)
-
-            case File.write(full_path, updated) do
-              :ok ->
-                {:ok, "Edited #{path} successfully"}
-
-              {:error, reason} ->
-                {:error, "Failed to write #{path}: #{:file.format_error(reason)}"}
-            end
-
-          count ->
-            {:error,
-             "old_string matched #{count} locations in #{path}; include more context to make it unique"}
-        end
+        edit_content(content, path, full_path, old_str, new_str)
 
       {:error, reason} ->
         {:error, "Failed to read #{path}: #{:file.format_error(reason)}"}
@@ -472,6 +452,29 @@ defmodule Athanor.Tools do
 
   def execute(unknown_tool, _args, _opts) do
     {:error, "Unknown tool: #{unknown_tool}"}
+  end
+
+  defp edit_content(content, path, full_path, old_str, new_str) do
+    parts = String.split(content, old_str)
+
+    case length(parts) - 1 do
+      0 ->
+        {:error, "old_string not found in #{path}"}
+
+      1 ->
+        write_edit(full_path, Enum.join(parts, new_str), path)
+
+      count ->
+        {:error,
+         "old_string matched #{count} locations in #{path}; include more context to make it unique"}
+    end
+  end
+
+  defp write_edit(full_path, updated, path) do
+    case File.write(full_path, updated) do
+      :ok -> {:ok, "Edited #{path} successfully"}
+      {:error, reason} -> {:error, "Failed to write #{path}: #{:file.format_error(reason)}"}
+    end
   end
 
   defp await_subagent(child_id, timeout) do

@@ -9,6 +9,9 @@ defmodule Athanor.LLM do
 
   alias Athanor.Config
 
+  # Placeholder for a tool call slot seen for the first time in a streaming delta.
+  @empty_tool_call %{id: "", type: "function", function: %{name: "", arguments: ""}}
+
   @type tool_call :: %{
           id: String.t(),
           type: String.t(),
@@ -194,48 +197,35 @@ defmodule Athanor.LLM do
   defp apply_content_delta(state, _delta, _caller_pid), do: state
 
   defp apply_tool_calls_delta(state, %{"tool_calls" => calls}) when is_list(calls) do
-    updated_calls =
-      Enum.reduce(calls, state.tool_calls, fn tc_delta, acc ->
-        idx = Map.get(tc_delta, "index", 0)
-
-        existing =
-          Map.get(acc, idx, %{
-            id: "",
-            type: "function",
-            function: %{name: "", arguments: ""}
-          })
-
-        id =
-          case Map.get(tc_delta, "id") do
-            val when is_binary(val) and val != "" -> val
-            _ -> existing.id
-          end
-
-        fn_delta = Map.get(tc_delta, "function", %{}) || %{}
-
-        name =
-          case Map.get(fn_delta, "name") do
-            val when is_binary(val) and val != "" -> existing.function.name <> val
-            _ -> existing.function.name
-          end
-
-        args =
-          case Map.get(fn_delta, "arguments") do
-            val when is_binary(val) -> existing.function.arguments <> val
-            _ -> existing.function.arguments
-          end
-
-        Map.put(acc, idx, %{
-          id: id,
-          type: "function",
-          function: %{name: name, arguments: args}
-        })
-      end)
-
+    updated_calls = Enum.reduce(calls, state.tool_calls, &merge_tool_call_delta/2)
     %{state | tool_calls: updated_calls}
   end
 
   defp apply_tool_calls_delta(state, _delta), do: state
+
+  defp merge_tool_call_delta(tc_delta, acc) do
+    idx = Map.get(tc_delta, "index", 0)
+    existing = Map.get(acc, idx, @empty_tool_call)
+    fn_delta = Map.get(tc_delta, "function", %{}) || %{}
+
+    Map.put(acc, idx, %{
+      id: merge_id(Map.get(tc_delta, "id"), existing.id),
+      type: "function",
+      function: %{
+        name: merge_name(Map.get(fn_delta, "name"), existing.function.name),
+        arguments: merge_args(Map.get(fn_delta, "arguments"), existing.function.arguments)
+      }
+    })
+  end
+
+  defp merge_id(val, _existing) when is_binary(val) and val != "", do: val
+  defp merge_id(_val, existing), do: existing
+
+  defp merge_name(val, existing) when is_binary(val) and val != "", do: existing <> val
+  defp merge_name(_val, existing), do: existing
+
+  defp merge_args(val, existing) when is_binary(val), do: existing <> val
+  defp merge_args(_val, existing), do: existing
 
   defp resolve_api_key(opts) do
     case Keyword.get(opts, :api_key) do
