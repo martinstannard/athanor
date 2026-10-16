@@ -38,6 +38,11 @@ defmodule Athanor.Config do
   @default_worktree_allow_dirty false
   @default_worktree_git_timeout_ms 30_000
   @default_worktree_branch_prefix "athanor/"
+  @default_goal_verify_interval_ms 30_000
+  @default_goal_max_nudges 3
+  @default_goal_stall_after_ms 60_000
+  @default_goal_verify_timeout_ms 60_000
+  @default_goal_peer_timeout_ms 120_000
 
   @doc """
   Returns the OpenCode Go base URL.
@@ -573,6 +578,105 @@ defmodule Athanor.Config do
       :project_context_max_bytes,
       @default_project_context_max_bytes
     )
+  end
+
+  # -- goals (§7.2, #3) ---------------------------------------------------------------------
+
+  @doc """
+  How often a goal's verifier runs (default `#{@default_goal_verify_interval_ms}` ms).
+
+  Overridable via `ATHANOR_GOAL_VERIFY_INTERVAL_MS` or `:athanor, :goal_verify_interval_ms`; a
+  per-goal `verify_interval_ms` wins over both.
+  """
+  @spec goal_verify_interval_ms() :: pos_integer()
+  def goal_verify_interval_ms do
+    positive_int(
+      "ATHANOR_GOAL_VERIFY_INTERVAL_MS",
+      :goal_verify_interval_ms,
+      @default_goal_verify_interval_ms
+    )
+  end
+
+  @doc """
+  How many nudges a stalled goal gets before it escalates (default
+  `#{@default_goal_max_nudges}`).
+
+  Zero is allowed — escalate without nudging, for a goal nobody should be prodded about — which is
+  why this is not parsed with the positive-only helper. Overridable via
+  `ATHANOR_GOAL_MAX_NUDGES` or `:athanor, :goal_max_nudges`.
+  """
+  @spec goal_max_nudges() :: non_neg_integer()
+  def goal_max_nudges do
+    non_neg_int("ATHANOR_GOAL_MAX_NUDGES", :goal_max_nudges, @default_goal_max_nudges)
+  end
+
+  @doc """
+  How long a goal may go without a receipt before it counts as stalled (default
+  `#{@default_goal_stall_after_ms}` ms).
+
+  Overridable via `ATHANOR_GOAL_STALL_AFTER_MS` or `:athanor, :goal_stall_after_ms`.
+  """
+  @spec goal_stall_after_ms() :: pos_integer()
+  def goal_stall_after_ms do
+    positive_int("ATHANOR_GOAL_STALL_AFTER_MS", :goal_stall_after_ms, @default_goal_stall_after_ms)
+  end
+
+  @doc """
+  How long one `:shell` verification may run (default `#{@default_goal_verify_timeout_ms}` ms).
+
+  Overridable via `ATHANOR_GOAL_VERIFY_TIMEOUT_MS` or `:athanor, :goal_verify_timeout_ms`.
+  """
+  @spec goal_verify_timeout_ms() :: pos_integer()
+  def goal_verify_timeout_ms do
+    positive_int(
+      "ATHANOR_GOAL_VERIFY_TIMEOUT_MS",
+      :goal_verify_timeout_ms,
+      @default_goal_verify_timeout_ms
+    )
+  end
+
+  @doc """
+  How long a `:peer` verification may take (default `#{@default_goal_peer_timeout_ms}` ms).
+
+  Longer than the shell timeout on purpose: a peer is a whole agent turn, not a command.
+  Overridable via `ATHANOR_GOAL_PEER_TIMEOUT_MS` or `:athanor, :goal_peer_timeout_ms`.
+  """
+  @spec goal_peer_timeout_ms() :: pos_integer()
+  def goal_peer_timeout_ms do
+    positive_int("ATHANOR_GOAL_PEER_TIMEOUT_MS", :goal_peer_timeout_ms, @default_goal_peer_timeout_ms)
+  end
+
+  @doc """
+  An opt-in default verification command for goals, or `nil` (the default).
+
+  Deliberately `nil` unless somebody sets it: a goal with no verifier must be a usage error, not a
+  goal that quietly verifies itself against whatever happens to be in the working directory. Read
+  from `ATHANOR_GOAL_VERIFY_COMMAND` or `:athanor, :goal_verify_command`; an empty string counts as
+  unset. `Athanor.Goal.new/1` is the only reader.
+  """
+  @spec goal_verify_command() :: String.t() | nil
+  def goal_verify_command do
+    case System.get_env("ATHANOR_GOAL_VERIFY_COMMAND") || Application.get_env(:athanor, :goal_verify_command) do
+      command when is_binary(command) -> if String.trim(command) == "", do: nil, else: command
+      _other -> nil
+    end
+  end
+
+  # Like `positive_int/3`, but zero is a legitimate value for the few knobs where "never" is a
+  # meaningful setting (see `goal_max_nudges/0`).
+  defp non_neg_int(env, key, default) do
+    case System.get_env(env) || Application.get_env(:athanor, key, default) do
+      value when is_integer(value) and value >= 0 -> value
+      value when is_binary(value) -> parse_non_neg(value, default)
+      _other -> default
+    end
+  end
+
+  defp parse_non_neg(value, default) do
+    case Integer.parse(value) do
+      {int, ""} when int >= 0 -> int
+      _other -> default
+    end
   end
 
   defp boolean_env(env, key, default) do

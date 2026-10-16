@@ -409,37 +409,21 @@ defmodule Athanor.Tools do
   end
 
   def execute("bash", %{"command" => command}, opts) when is_binary(command) do
-    cd = Keyword.get(opts, :cd, File.cwd!())
-    timeout = Keyword.get(opts, :timeout, @default_bash_timeout_ms)
-    caller = self()
-
-    task = Task.async(fn -> run_bash(command, cd, caller) end)
-
-    # The task reports its port's `os_pid` as soon as the process is up, so a timeout can reap
-    # the child's whole process group rather than just closing the port. `setsid --wait` makes
-    # the port's `os_pid` the group leader, so `kill -TERM -<os_pid>` reaches grandchildren too.
-    os_pid =
-      receive do
-        {:athanor_bash_os_pid, task_pid, pid} when task_pid == task.pid -> pid
-      after
-        2_000 -> nil
-      end
-
-    case Task.yield(task, timeout) do
-      {:ok, {output, 0}} ->
+    # A thin adapter over `run_command/2` (plan C9). The two error strings below are part of the
+    # model-facing contract — a model reads them to decide what to do next — so they stay exactly as
+    # they were; the structured runner exists for callers that must tell a timeout from a non-zero
+    # exit, which sniffing these strings could not do safely.
+    case run_command(command, opts) do
+      {:ok, %{output: output, exit_code: 0}} ->
         {:ok, output}
 
-      {:ok, {output, exit_code}} ->
+      {:ok, %{output: output, exit_code: exit_code}} ->
         {:error, "Command exited with status #{exit_code}:\n#{output}"}
 
-      nil ->
-        # Timed out: kill the subtree, then the task, so nothing outlives the call. Ordering
-        # matters — reap the tree first (while `os_pid` is still valid), then shut the task.
-        kill_tree(os_pid)
-        _ = Task.shutdown(task, :brutal_kill)
-        {:error, "Command timed out after #{timeout}ms"}
+      {:timeout, message} ->
+        {:error, message}
 
-      {:exit, _reason} ->
+      {:error, _reason} ->
         {:error, "Command execution crashed"}
     end
   end
@@ -566,6 +550,59 @@ defmodule Athanor.Tools do
   # Worktree management is a conductor's job: a worker has no business making more worktrees. It is
   # not told these tools exist (the schemas are role-gated), and it is refused by name if it asks
   # anyway — the wording matches the catch-all below, so schema gating and dispatch agree.
+  @doc """
+  Runs a shell command and reports **what happened**, structurally.
+
+  Returns `{:ok, %{output: output, exit_code: code}}` when the command ran to completion — *including*
+  a non-zero exit, which is a fact about the work rather than a failure of this function — plus
+  `{:timeout, message}` when it did not finish within `opts[:timeout]`, and `{:error, reason}` when
+  the runner itself failed.
+
+  That distinction is the point: `Athanor.Verifier` must be able to separate "the check ran and said
+  no" (`:contradicted`) from "we could not tell" (`:inconclusive`), and the model-facing `bash`
+  tool's error strings cannot carry it (plan C9, OQ9).
+
+  Bounding and reaping are the `bash` tool's, unchanged: `opts[:timeout]` (default
+  `#{@default_bash_timeout_ms}` ms) covers the whole call, and a timeout kills the child's whole
+  process group, not just its port.
+  """
+  @spec run_command(String.t(), keyword()) ::
+          {:ok, %{output: String.t(), exit_code: integer()}}
+          | {:timeout, String.t()}
+          | {:error, term()}
+  def run_command(command, opts \\ []) when is_binary(command) do
+    cd = Keyword.get(opts, :cd, File.cwd!())
+    timeout = Keyword.get(opts, :timeout, @default_bash_timeout_ms)
+    caller = self()
+
+    task = Task.async(fn -> run_bash(command, cd, caller) end)
+
+    # The task reports its port's `os_pid` as soon as the process is up, so a timeout can reap
+    # the child's whole process group rather than just closing the port. `setsid --wait` makes
+    # the port's `os_pid` the group leader, so `kill -TERM -<os_pid>` reaches grandchildren too.
+    os_pid =
+      receive do
+        {:athanor_bash_os_pid, task_pid, pid} when task_pid == task.pid -> pid
+      after
+        2_000 -> nil
+      end
+
+    case Task.yield(task, timeout) do
+      {:ok, {output, exit_code}} ->
+        {:ok, %{output: output, exit_code: exit_code}}
+
+      nil ->
+        # Timed out: kill the subtree, then the task, so nothing outlives the call. Ordering
+        # matters — reap the tree first (while `os_pid` is still valid), then shut the task.
+        kill_tree(os_pid)
+        _ = Task.shutdown(task, :brutal_kill)
+        {:timeout, "Command timed out after #{timeout}ms"}
+
+      {:exit, reason} ->
+        {:error, {:bash_crashed, reason}}
+    end
+  end
+
   defp conductor_only(opts, tool_name) do
     case Keyword.get(opts, :role, :conductor) do
       :conductor -> :ok
