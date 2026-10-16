@@ -813,8 +813,10 @@ defmodule Athanor.Store.RecorderTest do
       assert is_pid(pid)
 
       assert Enum.map(rest, &elem(&1, 0)) == [
+               Athanor.GoalSupervisor,
                Athanor.AgentSupervisor,
                Athanor.Worktree.Server,
+               Athanor.GoalRegistry,
                Athanor.PubSub,
                Athanor.AgentRegistry
              ]

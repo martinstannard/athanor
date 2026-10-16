@@ -11,12 +11,17 @@ defmodule Athanor.Verifier.Result do
     * `:inconclusive` — we could not tell: a timeout, a missing tool, an unparsable peer answer. It
       must never close a goal, and must never be reported as the worker's failure either, because
       "the check did not run" and "the work is wrong" call for opposite responses.
+
+  `mode` says how the check was *attempted*; `:unknown` is a check that never ran at all — a
+  verifier process that crashed, say — which is exactly when the mode is not knowable.
   """
 
   @enforce_keys [:mode, :verdict]
   defstruct [:mode, :verdict, :evidence, :command, :peer_id, duration_ms: 0, checked_at: nil]
 
-  @type mode :: :shell | :peer
+  @typedoc "How the check was attempted. `:unknown` is a check that never ran (a crashed verifier)."
+  @type mode :: :shell | :peer | :unknown
+
   @type verdict :: :verified | :contradicted | :inconclusive
 
   @type t :: %__MODULE__{

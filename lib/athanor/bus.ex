@@ -69,6 +69,29 @@ defmodule Athanor.Bus do
   end
 
   @doc """
+  Publishes a goal lifecycle event (design §7.2, plan §4.2).
+
+  Fans out to `"deck:events"` (so the TUI and loggers see goals without any new wiring),
+  `"goal:<goal_id>:events"` (goal-scoped watchers and tests), and — when the goal has a conductor —
+  `"conductor:<parent_id>:goals"`, which is the topic a conductor watches to mirror its goals.
+
+  Deliberately a separate shape from `publish_event/3`: a goal is not an agent, and naming a goal id
+  in an `{:agent_event, …}` would make the TUI try to render it as a session.
+  """
+  @spec publish_goal_event(String.t(), String.t() | nil, term()) :: :ok
+  def publish_goal_event(goal_id, parent_id, event) when is_binary(goal_id) do
+    msg = {:goal_event, goal_id, event}
+    broadcast("deck:events", msg)
+    broadcast("goal:#{goal_id}:events", msg)
+
+    if is_binary(parent_id) do
+      broadcast("conductor:#{parent_id}:goals", msg)
+    end
+
+    :ok
+  end
+
+  @doc """
   Publishes an exact appended conversation message to `"deck:events"` as
   `{:message, agent_id, msg}`.
 

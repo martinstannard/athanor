@@ -15,10 +15,16 @@ defmodule Athanor.Application do
     children = [
       {Registry, keys: :unique, name: Athanor.AgentRegistry},
       {Registry, keys: :duplicate, name: Athanor.PubSub},
+      # Before `GoalSupervisor`: a manager claims its `{:goal, id}` and `{:worker, id}` keys while it
+      # starts, so the registry has to be listening (§7.2, plan §2.3).
+      {Registry, keys: :unique, name: Athanor.GoalRegistry},
       # Before `AgentSupervisor`, like `AgentRegistry`: a Sub-Agent resolves its worktree while it
       # is starting, and the Server is the only writer of `session_id → worktree` (§7.1, plan §2.2).
       {Athanor.Worktree.Server, []},
       {DynamicSupervisor, strategy: :one_for_one, name: Athanor.AgentSupervisor},
+      # One `GoalManager` per goal, `:temporary` (§7.2): a goal manager must never be restarted into
+      # re-nudging a dead worker — see `Athanor.GoalManager`'s moduledoc.
+      {DynamicSupervisor, strategy: :one_for_one, name: Athanor.GoalSupervisor},
       {Athanor.Store.Recorder, recorder_opts()}
     ]
 
