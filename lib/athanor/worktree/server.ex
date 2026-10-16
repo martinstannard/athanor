@@ -151,7 +151,14 @@ defmodule Athanor.Worktree.Server do
   def init(opts) do
     repo = opts |> Keyword.get(:repo, File.cwd!()) |> Path.expand()
 
-    state = %{sessions: %{}, repo: repo, sidecar: sidecar_path(repo)}
+    state = %{
+      sessions: %{},
+      repo: repo,
+      sidecar: sidecar_path(repo),
+      # Every repository this process has tracked a worktree in: the sidecar set to keep rewritten,
+      # so removing the last worktree of a repo leaves an empty file rather than a stale entry.
+      repos: MapSet.new([repo])
+    }
 
     # `prune` at boot is the §4.4 carve-out: metadata only, never a directory.
     {:ok, state |> rebuild() |> prune_metadata()}
@@ -228,7 +235,12 @@ defmodule Athanor.Worktree.Server do
   end
 
   defp track(state, worktree) do
-    state = %{state | sessions: Map.put(state.sessions, worktree.session_id, worktree)}
+    state = %{
+      state
+      | sessions: Map.put(state.sessions, worktree.session_id, worktree),
+        repos: MapSet.put(state.repos, repo_of(worktree, state.repo))
+    }
+
     write_sidecar(state)
   end
 
@@ -377,18 +389,36 @@ defmodule Athanor.Worktree.Server do
   # the caller that was doing something useful. Returns `state` — deliberately, and not `:ok` — so
   # its callers can end on it; `:ok` reaching the state slot is a bug this codebase has already had
   # twice (docs/wedge-findings.md #7).
+  #
+  # One sidecar *per repository*: a worker's worktree can belong to a repository other than this
+  # process's own (its parent's `cd` decides, §M4), and writing all of them into one file would
+  # attribute worktrees to the wrong repo. Every repository this process has touched gets rewritten,
+  # including as an empty file when its last worktree is gone.
   defp write_sidecar(state) do
-    body = JSON.encode!(Map.new(state.sessions, fn {id, wt} -> {id, encode_worktree(wt)} end))
-    tmp = state.sidecar <> ".tmp"
+    by_repo = state.sessions |> Map.values() |> Enum.group_by(&repo_of(&1, state.repo))
 
-    with :ok <- File.mkdir_p(Path.dirname(state.sidecar)),
+    state.repos
+    |> Enum.concat(Map.keys(by_repo))
+    |> Enum.uniq()
+    |> Enum.each(fn repo -> write_repo_sidecar(sidecar_path(repo), Map.get(by_repo, repo, [])) end)
+
+    state
+  end
+
+  defp repo_of(worktree, fallback), do: worktree.repo || fallback
+
+  defp write_repo_sidecar(path, worktrees) do
+    body = JSON.encode!(Map.new(worktrees, fn wt -> {wt.session_id, encode_worktree(wt)} end))
+    tmp = path <> ".tmp"
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
          :ok <- File.write(tmp, body),
-         :ok <- File.rename(tmp, state.sidecar) do
-      state
+         :ok <- File.rename(tmp, path) do
+      :ok
     else
       {:error, reason} ->
-        Logger.warning("Athanor.Worktree.Server: could not write #{state.sidecar}: #{inspect(reason)}")
-        state
+        Logger.warning("Athanor.Worktree.Server: could not write #{path}: #{inspect(reason)}")
+        :ok
     end
   end
 

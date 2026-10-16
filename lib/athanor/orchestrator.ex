@@ -6,7 +6,7 @@ defmodule Athanor.Orchestrator do
 
   require Logger
 
-  alias Athanor.{Agent, Bus, SessionId, Store}
+  alias Athanor.{Agent, Bus, SessionId, Store, Worktree}
   alias Athanor.Store.{Compactor, Session}
 
   # Generated-id collisions are already vanishingly unlikely; this bounds a retry loop
@@ -43,17 +43,87 @@ defmodule Athanor.Orchestrator do
 
   @doc """
   Spawns a child Sub-Agent worker (`role: :worker`) linked to `parent_id`.
+
+  The worker starts in the repository its parent is working in, so a relative path in its
+  `edit`/`write`/`search`/`bash` tools means what the conductor meant by it.
+
+  Pass `worktree: true` (or a keyword list of `Athanor.Worktree.add/2` options) to give the worker a
+  checkout of its own instead: the worktree is created (or reused) and becomes the worker's `cd`, so
+  parallel workers cannot fight over one working tree (design §7.1). It branches from the **parent's**
+  `cd`, not from whatever directory this process happens to be in.
+
+  A refusal from the create path — most importantly a dirty source repo, which would silently hide
+  the user's uncommitted work from the worker — comes back as `{:error, reason}` and no worker is
+  spawned.
   """
   @spec launch_subagent(String.t(), String.t(), String.t(), keyword()) ::
           {:ok, String.t(), pid()} | {:error, term()}
   def launch_subagent(parent_id, title, prompt, opts \\ [])
       when is_binary(parent_id) and is_binary(title) and is_binary(prompt) do
-    opts
-    |> Keyword.put(:title, title)
-    |> Keyword.put(:role, :worker)
-    |> Keyword.put(:parent_id, parent_id)
-    |> Keyword.put(:prompt, prompt)
-    |> spawn_session()
+    base =
+      opts
+      |> Keyword.put(:title, title)
+      |> Keyword.put(:role, :worker)
+      |> Keyword.put(:parent_id, parent_id)
+      |> Keyword.put(:prompt, prompt)
+
+    with {:ok, opts} <- with_cd(base) do
+      spawn_session(opts)
+    end
+  end
+
+  # Where the worker works. An explicit `:cd` always wins; otherwise `worktree: true` gives it a
+  # checkout of its own, and the plain case inherits the parent's directory.
+  #
+  # The inheritance is the point: `Athanor.Agent` defaults `cd` to this process's directory, and for
+  # a sub-agent that is the *daemon's* — so a worker's relative paths would resolve against a tree the
+  # conductor never mentioned (the trap a live session fell into, `docs/handover.md`).
+  defp with_cd(opts) do
+    case {Keyword.fetch(opts, :cd), Keyword.get(opts, :worktree, false)} do
+      {{:ok, _cd}, _worktree} ->
+        {:ok, Keyword.delete(opts, :worktree)}
+
+      {:error, setting} when setting in [false, nil] ->
+        {:ok, Keyword.put(opts, :cd, parent_cd(opts))}
+
+      {:error, setting} ->
+        with_worktree_cd(opts, setting)
+    end
+  end
+
+  # The worktree is keyed by session id, so the id has to exist *before* the spawn — one is generated
+  # here when the caller did not supply it. `:worktree` never reaches `Athanor.Agent`, which knows
+  # only about `:cd`.
+  defp with_worktree_cd(opts, setting) do
+    opts = Keyword.put_new_lazy(opts, :id, fn -> SessionId.generate(:worker) end)
+
+    settings =
+      setting
+      |> normalize_worktree_settings()
+      |> Keyword.put_new(:repo, parent_cd(opts))
+
+    case Worktree.Server.create_for_session(opts[:id], settings) do
+      {:ok, worktree} ->
+        {:ok, opts |> Keyword.delete(:worktree) |> Keyword.put(:cd, worktree.path)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp normalize_worktree_settings(true), do: []
+  defp normalize_worktree_settings(settings) when is_list(settings), do: settings
+
+  # The parent's `cd` is the repository the work is actually in — the daemon's own working directory
+  # is not necessarily it (§7.1). Falls back to this process's `cd` when there is no parent agent to
+  # ask, so `worktree: true` still works for a caller launching a worker standalone.
+  defp parent_cd(opts) do
+    with parent_id when is_binary(parent_id) <- Keyword.get(opts, :parent_id),
+         {:ok, pid} <- lookup(parent_id) do
+      Agent.get_state(pid).cd
+    else
+      _no_parent -> File.cwd!()
+    end
   end
 
   @doc """
