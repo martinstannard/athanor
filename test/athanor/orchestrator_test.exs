@@ -81,6 +81,61 @@ defmodule Athanor.OrchestratorTest do
     assert worker_id in ids
   end
 
+  test "a worker turn without the sentinel does NOT wake the conductor (#12)", %{
+    tmp_dir: tmp_dir
+  } do
+    test_pid = self()
+    Bus.subscribe("deck:events")
+
+    # A worker that finishes a turn but never asserts completion.
+    worker_llm_fn = fn _messages, _tools, agent_pid ->
+      send(agent_pid, {:llm_delta, "Still working.\n"})
+
+      {:ok,
+       %{
+         role: "assistant",
+         content: "Still working on it — 4 of 10 files checked so far.",
+         tool_calls: []
+       }}
+    end
+
+    conductor_llm_fn = fn messages, _tools, _agent_pid ->
+      last_user =
+        messages
+        |> Enum.reverse()
+        |> Enum.find(&(&1.role == "user"))
+
+      send(test_pid, {:conductor_saw_prompt, last_user.content})
+
+      {:ok, %{role: "assistant", content: "ack", tool_calls: []}}
+    end
+
+    {:ok, conductor_id, _pid} =
+      Orchestrator.start_conductor(
+        id: "conductor-nosentinel",
+        title: "Main Conductor",
+        cd: tmp_dir,
+        llm_fn: conductor_llm_fn
+      )
+
+    {:ok, worker_id, _pid} =
+      Orchestrator.launch_subagent(
+        conductor_id,
+        "Slow Worker",
+        "Audit all files",
+        id: "worker-nosentinel",
+        cd: tmp_dir,
+        llm_fn: worker_llm_fn
+      )
+
+    # The worker's turn completes...
+    assert_receive {:agent_event, ^worker_id, {:turn_complete, _}}, 2_000
+    # ...but a completed turn is not a completed task: no child_done, and the conductor is not
+    # prompted at all.
+    refute_receive {:agent_event, ^worker_id, {:child_done, _}}, 300
+    refute_receive {:conductor_saw_prompt, _}, 300
+  end
+
   test "parse_done_sentinel/1 extracts status and summary" do
     text = """
     Finished running mix test.
