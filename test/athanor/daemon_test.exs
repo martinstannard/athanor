@@ -145,9 +145,28 @@ defmodule Athanor.DaemonTest do
     # daemon's modules are callable but `Athanor.AgentRegistry` does not exist yet.
     # `mix run --no-start` loads the code without starting the application — precisely that
     # window, deterministically, with no timing luck involved.
-    node = :"athanor_nostart_probe@127.0.0.1"
+    # Hermetic on purpose, because this test used to fail about two runs in five:
+    #
+    #   * a **unique** node name, so a probe left running by an earlier failed run can never be
+    #     attached to instead of starting a fresh one (that produced a build-marker mismatch against
+    #     a stale node);
+    #   * `--no-compile`, because the test VM has already built the project and two `mix` processes
+    #     compiling one `_build` is a race — the probe would sometimes fail to come up at all, which
+    #     looked like "the node never loaded Athanor's code";
+    #   * the probe is stopped even when the assertions fail, so a failure does not leak it.
+    unique = System.unique_integer([:positive])
+
+    # A node name is an atom by nature, and this one has to be unique per run so a probe left behind
+    # by an earlier failure can never be attached to. That is two atoms per suite run, in a VM that
+    # exits when the suite does — not the unbounded runtime atom creation the check exists for.
+    # credo:disable-for-next-line Credo.Check.Warning.UnsafeToAtom
+    node = :"athanor_nostart_probe_#{unique}@127.0.0.1"
+    # credo:disable-for-next-line Credo.Check.Warning.UnsafeToAtom
+    client = :"athanor_nostart_client_#{unique}@127.0.0.1"
     cookie = Athanor.Daemon.cookie()
     elixir = System.find_executable("elixir")
+
+    on_exit(fn -> stop_node(node) end)
 
     System.cmd(
       elixir,
@@ -162,12 +181,13 @@ defmodule Athanor.DaemonTest do
         "mix",
         "run",
         "--no-start",
-        "--no-halt"
+        "--no-halt",
+        "--no-compile"
       ],
       cd: File.cwd!()
     )
 
-    {:ok, _} = ensure_distribution(:"athanor_nostart_client@127.0.0.1")
+    {:ok, _} = ensure_distribution(client)
     Node.set_cookie(cookie)
 
     # Wait until the remote code is fully loaded but the app still has not started.
@@ -185,11 +205,37 @@ defmodule Athanor.DaemonTest do
         assert {:error, :daemon_not_ready} =
                  Daemon.connect_or_start_daemon(daemon_node: node, auto_start: false)
       after
-        :erpc.cast(node, :init, :stop, [])
+        stop_node(node)
       end
     else
-      flunk("probe node #{node} never loaded Athanor's code; cannot exercise the boot race")
+      flunk(
+        "probe node #{node} never loaded Athanor's code (#{probe_diagnosis(node)}); " <>
+          "cannot exercise the boot race"
+      )
     end
+  end
+
+  # Best effort: the node may already be gone, and that is the desired end state anyway.
+  defp stop_node(node) do
+    :erpc.cast(node, :init, :stop, [])
+  catch
+    _kind, _reason -> :ok
+  end
+
+  # "The code never loaded" covers three different situations, and they need different fixes: a node
+  # that never came up, one that came up without the code, and one that rejects the call. Say which.
+  defp probe_diagnosis(node) do
+    if Node.connect(node) do
+      "it is reachable, but calling it returned #{inspect(probe_call(node))}"
+    else
+      "it never came up: the name is #{if Daemon.registered?(node), do: "registered", else: "not registered"}"
+    end
+  end
+
+  defp probe_call(node) do
+    :erpc.call(node, Daemon, :build_marker, [], 2_000)
+  catch
+    kind, reason -> {kind, reason}
   end
 
   defp remote_build(node) do
