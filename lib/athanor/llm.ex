@@ -242,41 +242,128 @@ defmodule Athanor.LLM do
   defp maybe_put_tools(body, nil), do: body
   defp maybe_put_tools(body, tools) when is_list(tools), do: Map.put(body, "tools", tools)
 
-  defp format_messages(messages) do
-    Enum.map(messages, fn
-      %{role: "assistant", content: content, tool_calls: tool_calls}
-      when is_list(tool_calls) and tool_calls != [] ->
-        %{
-          "role" => "assistant",
-          "content" => content || "",
-          "tool_calls" =>
-            Enum.map(tool_calls, fn tc ->
-              %{
-                "id" => tc.id,
-                "type" => "function",
-                "function" => %{
-                  "name" => tc.function.name,
-                  "arguments" => tc.function.arguments
-                }
-              }
-            end)
-        }
+  @doc """
+  Converts the internal (atom- or string-keyed) message history into wire format.
 
-      %{role: "tool", tool_call_id: id, content: content} ->
-        %{
-          "role" => "tool",
-          "tool_call_id" => id,
-          "content" => content
-        }
+  # Every message is normalised through the same path regardless of how it arrived: live messages
+  # are
+  atom-keyed, messages rehydrated from the Store are string-keyed, and previously the latter were
+  passed through *untouched* — so anything the API disallows in a rehydrated message (an empty
+  `tool_calls` array, for instance) reached the wire verbatim and failed the whole request.
 
-      %{role: role, content: content} ->
-        %{
-          "role" => to_string(role),
-          "content" => content || ""
-        }
+  As a final step, `pair_tool_calls/1` guarantees the other invariant the API enforces: every
+  `tool_calls` entry must be followed by a `tool` message answering its `tool_call_id`.
 
-      other when is_map(other) ->
-        other
-    end)
+  Exposed rather than private because it is the last thing to inspect when a request is rejected —
+  `mix run -e 'Athanor.LLM.format_messages(msgs)'` is the fastest way to see what would be sent.
+  """
+  @spec format_messages([map()]) :: [map()]
+  def format_messages(messages) do
+    messages
+    |> Enum.map(&format_message/1)
+    |> pair_tool_calls()
   end
+
+  defp format_message(msg) do
+    case to_string(fetch(msg, :role)) do
+      "assistant" -> format_assistant(msg)
+      "tool" -> format_tool_result(msg)
+      role -> %{"role" => role, "content" => fetch(msg, :content) || ""}
+    end
+  end
+
+  # `tool_calls` is omitted entirely when empty: the API rejects an empty array ("Expected an
+  # array
+  # with minimum length 1"), and a message that made no calls has nothing to declare.
+  defp format_assistant(msg) do
+    base = %{"role" => "assistant", "content" => fetch(msg, :content) || ""}
+
+    case fetch(msg, :tool_calls) do
+      calls when is_list(calls) and calls != [] ->
+        Map.put(base, "tool_calls", Enum.map(calls, &format_tool_call/1))
+
+      _ ->
+        base
+    end
+  end
+
+  defp format_tool_result(msg) do
+    %{
+      "role" => "tool",
+      "tool_call_id" => fetch(msg, :tool_call_id),
+      "content" => fetch(msg, :content) || ""
+    }
+  end
+
+  defp format_tool_call(decl) do
+    function = fetch(decl, :function) || %{}
+
+    %{
+      "id" => fetch(decl, :id),
+      "type" => "function",
+      "function" => %{
+        "name" => fetch(function, :name),
+        "arguments" => fetch(function, :arguments)
+      }
+    }
+  end
+
+  # Live messages are atom-keyed; rehydrated ones are string-keyed. Accept both.
+  defp fetch(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, to_string(key))
+  defp fetch(_other, _key), do: nil
+
+  # A turn can legitimately be interrupted — cancelled, killed by the watchdog, or cut by
+  # compaction — leaving an assistant message that declares `tool_calls` whose results were never
+  # recorded. Because the transcript is append-only, *resuming* a session rehydrates those
+  # interrupted turns, and the API then rejects the entire request:
+  #
+  #   An assistant message with 'tool_calls' must be followed by tool messages responding to each
+  #   'tool_call_id'. (insufficient tool messages following tool_calls message)
+  #
+  # Under streaming that surfaces as a bare `HTTP 400: ""`, because the gateway reports an
+  # upstream
+  # failure with no body. Rather than send a request that cannot succeed, answer the missing calls
+  # explicitly: the history stays connected, and the model can see that the tool did not complete.
+  @missing_result "Error: no result was recorded for this tool call (the turn was interrupted)."
+
+  defp pair_tool_calls(messages), do: do_pair_tool_calls(messages, [])
+
+  # The API's rule is positional, not global: a tool message must answer a call declared by the
+  # assistant message it *immediately* follows. Checking only "is this id answered somewhere?"
+  # misses
+  # histories where results drifted away from their own assistant — which is exactly what an
+  # interrupted turn produces, since the next user prompt is appended where the results would have
+  # been. So walk forward and repair each group in place.
+  defp do_pair_tool_calls([], acc), do: Enum.reverse(acc)
+
+  defp do_pair_tool_calls([%{"role" => "assistant", "tool_calls" => calls} = msg | rest], acc)
+       when is_list(calls) do
+    declared = calls |> Enum.map(&Map.get(&1, "id")) |> Enum.reject(&is_nil/1)
+    {run, rest} = Enum.split_while(rest, &(Map.get(&1, "role") == "tool"))
+
+    # A result answering a *different* assistant's call cannot stand in for this one, and leaving
+    # it
+    # here would violate adjacency too. The earlier assistant already answered that call (really
+    # or
+    # synthetically), so this stray is dropped rather than forwarded.
+    {answers, _stray} = Enum.split_with(run, &(Map.get(&1, "tool_call_id") in declared))
+    missing = declared -- Enum.map(answers, &Map.get(&1, "tool_call_id"))
+
+    synth = %{"role" => "tool", "tool_call_id" => nil, "content" => @missing_result}
+
+    group =
+      [msg] ++
+        Enum.map(missing, &%{synth | "tool_call_id" => &1}) ++
+        answers
+
+    do_pair_tool_calls(rest, Enum.reverse(group, acc))
+  end
+
+  # A `tool` message reached here was not consumed by the assistant group above, so by definition
+  # it
+  # does not respond to the message it follows. The API rejects that outright, and its call was
+  # already answered by the group that declared it, so drop it.
+  defp do_pair_tool_calls([%{"role" => "tool"} | rest], acc), do: do_pair_tool_calls(rest, acc)
+
+  defp do_pair_tool_calls([msg | rest], acc), do: do_pair_tool_calls(rest, [msg | acc])
 end
