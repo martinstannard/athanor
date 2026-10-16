@@ -814,6 +814,7 @@ defmodule Athanor.Store.RecorderTest do
 
       assert Enum.map(rest, &elem(&1, 0)) == [
                Athanor.AgentSupervisor,
+               Athanor.Worktree.Server,
                Athanor.PubSub,
                Athanor.AgentRegistry
              ]

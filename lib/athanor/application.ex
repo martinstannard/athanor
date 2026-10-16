@@ -15,6 +15,9 @@ defmodule Athanor.Application do
     children = [
       {Registry, keys: :unique, name: Athanor.AgentRegistry},
       {Registry, keys: :duplicate, name: Athanor.PubSub},
+      # Before `AgentSupervisor`, like `AgentRegistry`: a Sub-Agent resolves its worktree while it
+      # is starting, and the Server is the only writer of `session_id → worktree` (§7.1, plan §2.2).
+      {Athanor.Worktree.Server, []},
       {DynamicSupervisor, strategy: :one_for_one, name: Athanor.AgentSupervisor},
       {Athanor.Store.Recorder, recorder_opts()}
     ]
