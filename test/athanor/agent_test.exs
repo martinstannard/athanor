@@ -84,6 +84,112 @@ defmodule Athanor.AgentTest do
     assert Agent.get_state(agent).status == :idle
   end
 
+  # Issue #29: a turn that ends without results must still close the tool-call group it opened,
+  # because the assistant message declaring those calls is already recorded — so an unanswered
+  # group
+  # is permanent and the API rejects every later request for that session.
+  describe "closing the tool-call group" do
+    test "cancelling mid-tool-execution answers the outstanding tool call", %{tmp_dir: tmp_dir} do
+      # Declare one call to a tool that will still be running when we cancel.
+      llm_fn = fn _messages, _tools, _agent_pid ->
+        {:ok,
+         %{
+           role: "assistant",
+           content: "",
+           tool_calls: [
+             %{
+               id: "call_slow",
+               type: "function",
+               function: %{name: "bash", arguments: ~s({"command":"sleep 5"})}
+             }
+           ]
+         }}
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+
+      assert :ok = Agent.prompt(agent, "run something slow")
+      assert_receive {:agent_event, {:tool_start, "bash", _}}, 2_000
+
+      assert :ok = Agent.cancel(agent)
+      assert_receive {:agent_event, :cancelled}
+
+      messages = Agent.get_state(agent).messages
+      assert_paired!(messages)
+
+      placeholder =
+        Enum.find(messages, fn m -> field(m, "tool_call_id") == "call_slow" end)
+
+      assert placeholder, "expected a placeholder result for the cancelled tool call"
+      assert field(placeholder, "role") == "tool"
+      assert field(placeholder, "content") =~ "no result was recorded"
+      assert field(placeholder, "content") =~ "cancelled"
+    end
+
+    test "a completed turn records the real result and no placeholder", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "marker.txt"), "here")
+
+      llm_fn = fn messages, _tools, _agent_pid ->
+        case Enum.reverse(messages) |> Enum.find(&(field(&1, "role") == "tool")) do
+          nil ->
+            {:ok,
+             %{
+               role: "assistant",
+               content: "",
+               tool_calls: [
+                 %{
+                   id: "call_read",
+                   type: "function",
+                   function: %{name: "read_file", arguments: ~s({"path":"marker.txt"})}
+                 }
+               ]
+             }}
+
+          _ ->
+            {:ok, %{role: "assistant", content: "done", tool_calls: []}}
+        end
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+      assert :ok = Agent.prompt(agent, "read it")
+      assert_receive {:agent_event, {:turn_complete, "done"}}, 2_000
+
+      messages = Agent.get_state(agent).messages
+      assert_paired!(messages)
+      refute Enum.any?(messages, &(to_string(field(&1, "content")) =~ "no result was recorded"))
+      assert Enum.any?(messages, &(field(&1, "content") == "here"))
+    end
+  end
+
+  # A `tool` message is only valid answering a call declared by the assistant message before it.
+  defp assert_paired!(messages) do
+    _ =
+      Enum.reduce(messages, MapSet.new(), fn m, declared ->
+        case field(m, "role") do
+          "assistant" ->
+            MapSet.new(Enum.map(field(m, "tool_calls") || [], &field(&1, "id")))
+
+          "tool" ->
+            assert MapSet.member?(declared, field(m, "tool_call_id")),
+                   "tool #{inspect(field(m, "tool_call_id"))} does not answer the message preceding it"
+
+            declared
+
+          _ ->
+            MapSet.new()
+        end
+      end)
+
+    :ok
+  end
+
+  # Messages may be atom-keyed (live) or string-keyed (rehydrated from the Store), and the test
+  # looks up by string name — so try the atom form too.
+  defp field(map, key) do
+    atom = if is_binary(key), do: String.to_existing_atom(key), else: key
+    Map.get(map, atom) || Map.get(map, to_string(atom))
+  end
+
   # Regression for the "stuck turn forever" wedge (docs/wedge-findings.md): a task that never
   # returns used to leave the session `:streaming`/`:executing_tools` with no recovery. The
   # watchdog kills it and transitions to `:error` with a logged reason.

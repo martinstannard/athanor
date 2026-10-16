@@ -448,6 +448,7 @@ defmodule Athanor.Agent do
     state =
       state
       |> kill_current_task()
+      |> close_tool_call_group("the turn timed out before this tool ran")
       |> Map.put(:watchdog, nil)
       |> set_status(:error)
 
@@ -467,7 +468,11 @@ defmodule Athanor.Agent do
     state = state |> Map.put(:current_task, nil) |> disarm_watchdog() |> set_status(:idle)
 
     if reason != :normal do
-      state = set_status(state, :error)
+      state =
+        state
+        |> close_tool_call_group("the tool runner crashed before this tool ran")
+        |> set_status(:error)
+
       notify(state, {:error, "Task crashed: #{inspect(reason)}"})
       {:noreply, state}
     else
@@ -502,6 +507,60 @@ defmodule Athanor.Agent do
   # it appends AND publishes the exact message map, so no append site can silently skip the
   # write path. Exactly one `{:message, _}` is broadcast per appended message — the system
   # message set in `init/1` never passes through here.
+  # A turn that ends without results — cancelled, timed out, or crashed — must still close the
+  # tool-call group it opened. The API rejects a history where an assistant message's `tool_calls`
+  # are not answered by following `tool` messages, and since that assistant message is *already*
+  # recorded the rejection would be permanent, wedging the session (issue #29; the wire-level
+  # repair
+  # in `Athanor.LLM.pair_tool_calls/1` is the backstop for histories damaged before this fix).
+  #
+  # Recorded through `record_messages/2` rather than appended directly, so the placeholder results
+  # are persisted and a later resume sees a valid history too.
+  defp close_tool_call_group(state, reason) do
+    case outstanding_tool_calls(state.messages) do
+      [] ->
+        state
+
+      ids ->
+        results =
+          Enum.map(ids, fn id ->
+            %{
+              role: "tool",
+              tool_call_id: id,
+              content: "Error: no result was recorded — #{reason}."
+            }
+          end)
+
+        record_messages(state, results)
+    end
+  end
+
+  # The ids declared by the most recent assistant message that have no `tool` result after it.
+  # Messages may be atom-keyed (live) or string-keyed (rehydrated from the Store), hence
+  # `field/2`.
+  defp outstanding_tool_calls(messages) do
+    {trailing, rest} =
+      messages
+      |> Enum.reverse()
+      |> Enum.split_while(&(field(&1, :role) != "assistant"))
+
+    with [assistant | _] <- rest,
+         calls when is_list(calls) and calls != [] <- field(assistant, :tool_calls) do
+      answered =
+        trailing
+        |> Enum.filter(&(field(&1, :role) == "tool"))
+        |> Enum.map(&field(&1, :tool_call_id))
+
+      calls
+      |> Enum.map(&field(&1, :id))
+      |> Enum.reject(&(is_nil(&1) or &1 in answered))
+    else
+      _ -> []
+    end
+  end
+
+  defp field(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, to_string(key))
+
   defp record_messages(state, messages) do
     messages = List.wrap(messages)
 
@@ -615,7 +674,12 @@ defmodule Athanor.Agent do
   # Cancel clears the queue (moduledoc): a stacked prompt must not start a fresh turn the moment
   # the killed one unwinds, because that would undo the cancel.
   defp do_cancel(state) do
-    state = state |> kill_current_task() |> set_status(:idle)
+    state =
+      state
+      |> kill_current_task()
+      |> close_tool_call_group("the turn was cancelled before this tool ran")
+      |> set_status(:idle)
+
     notify(state, :cancelled)
     do_clear_prompt_queue(state)
   end
