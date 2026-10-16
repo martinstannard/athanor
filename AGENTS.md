@@ -28,6 +28,25 @@
   - Use pattern matching and tagged tuples (`{:ok, result}` / `{:error, reason}`).
   - Add `@moduledoc` and `@doc` to public modules and functions, plus typespecs (`@spec`) on core boundaries.
 
+## Chainlink session model (read before coordinating)
+
+chainlink 0.2.0 has **one active session per database, globally** — not per agent, per
+terminal, or per harness. `db.get_current_session/0` is
+`... WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1`; `agent_id` is *recorded* on the row
+but never used to scope that lookup, and there is **no env override**. Two harnesses in the
+same checkout (e.g. Athanor's daemon and a side-by-side `opencode`/Claude terminal) therefore
+share **one** `agent.json` → **one** identity → **one** session, and will silently overwrite
+each other's `active_issue_id` / `last_action`.
+
+To run genuinely parallel work:
+
+- **Per-issue locks** — `chainlink locks claim <id> [-b branch]` (keyed by `agent_id`); this is
+  the intended multi-agent primitive.
+- **Per-worktree `.chainlink/`** — a separate checkout with its own `chainlink init` gets an
+  independent session *and* DB. (Tracked as issue **#2**, worktree isolation.)
+
+Details and the source-level proof: [`docs/chainlink.md`](docs/chainlink.md) §4.
+
 ## Quality & regular checks
 
 The "three gates" (`mix format --check-formatted`, `mix compile --warnings-as-errors`,

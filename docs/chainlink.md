@@ -140,6 +140,41 @@ chainlink timer start 5 ; chainlink timer stop ; chainlink timer show
 
 `session end --notes` is a lightweight handoff channel between agent runs.
 
+### One session, globally (verified against 0.2.0 source)
+
+There is **exactly one active session per database** — not one per agent, terminal, or harness.
+
+- `Database::get_current_session` is a single-row lookup with no agent filter:
+  ```sql
+  SELECT ... FROM sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1
+  ```
+  `agent_id` is stored on the row but never used to scope the query.
+- `session start` **refuses to open a second** while one is active (`commands/session.rs`):
+  it prints `Session #N is already active` and returns without inserting.
+- The `sessions` table *can* hold many rows (autoincrement PK, no unique constraint), but the
+  code only ever reads the newest open one — extra rows are inert.
+- There is **no override**: the crate reads only `COMPUTERNAME`/`HOSTNAME` (for `machine_id`),
+  never a `CHAINLINK_AGENT_ID`-style variable. Identity comes solely from
+  `<chainlink_dir>/agent.json`, and `find_chainlink_dir` walks *up from cwd* — so any process
+  sharing a checkout resolves to the same file, the same `agent_id`, and the same session.
+
+**Consequence:** two harnesses in one checkout collide. Both `session work <id>` and
+`session action` update the *same* row, so they will clobber each other's active issue and
+breadcrumbs. (Observed here: Athanor's conductor and a side-by-side `opencode` terminal both
+read `agent_id: conductor-main`.)
+
+**Ways to get real separation**, least invasive first:
+
+1. **Per-issue locks** — `chainlink locks claim` (§6) is keyed by `agent_id`; it is the intended
+   primitive for parallel agents, and needs no schema change.
+2. **A checkout (or worktree) with its own `.chainlink/`** — a fresh `chainlink init` yields an
+   independent session and DB. This is what issue **#2** (worktree isolation) provides.
+3. **Patch the crate** — make `get_current_session` filter by `agent_id`. Upstream change
+   against a published crate; turns the recorded column into a real scoping key.
+
+The Claude Code hooks (`.claude/`) are wired for that harness only; Athanor's own conductors run
+without hard enforcement, so these rules are advisory unless a harness implements guards.
+
 ---
 
 ## 5. Milestones, usage, archive, export
