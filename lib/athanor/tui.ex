@@ -35,6 +35,11 @@ defmodule Athanor.TUI do
   alias Athanor.{Agent, Bus, Config, Daemon, Markdown, Store, Theme}
   alias Termite.{Screen, Style, Terminal}
 
+  # Spinner frames (braille) and the tick interval. The loop wakes on `@tick_ms` to animate, but
+  # only re-renders while something is busy, so an idle TUI costs nothing extra.
+  @spinner_frames ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+  @tick_ms 120
+
   defstruct [
     :agent,
     :daemon_node,
@@ -48,7 +53,9 @@ defmodule Athanor.TUI do
     input: "",
     scroll_offset: 0,
     focus: :input,
-    sidebar_index: 0
+    sidebar_index: 0,
+    tick: 0,
+    dirty: true
   ]
 
   @type entry ::
@@ -255,17 +262,17 @@ defmodule Athanor.TUI do
   end
 
   defp loop(term, tui) do
-    term = Terminal.write(term, render_frame(tui))
+    {term, tui} = render_if_dirty(term, tui)
     reader_ref = term.reader
     target_node = tui.daemon_node || Node.self()
 
     receive do
       {^reader_ref, {:data, key}} ->
-        dispatch(term, target_node, handle_key(tui, key))
+        dispatch(term, target_node, handle_key(%{tui | dirty: true}, key))
 
       {^reader_ref, {:signal, :winch}} ->
         term = Terminal.resize(term)
-        tui = %{tui | width: term.size.width, height: term.size.height}
+        tui = %{tui | width: term.size.width, height: term.size.height, dirty: true}
         loop(term, tui)
 
       {:agent_event, session_id, event} ->
@@ -275,8 +282,43 @@ defmodule Athanor.TUI do
       {:agent_event, event} ->
         tui = handle_agent_event(tui, tui.active_id, event)
         loop(term, tui)
+    after
+      # The loop must wake on its own for the throbber to move. `tick/1` is a no-op unless
+      # something is busy, so an idle TUI keeps `dirty: false` and skips the write too.
+      @tick_ms -> loop(term, tick(tui))
     end
   end
+
+  # A frame is only rendered when something actually changed: every mutation sets `dirty`, key
+  # presses set it on the way in, and a tick sets it only while a session is busy.
+  defp render_if_dirty(term, %{dirty: false} = tui), do: {term, tui}
+
+  defp render_if_dirty(term, tui) do
+    {Terminal.write(term, render_frame(tui)), %{tui | dirty: false}}
+  end
+
+  @doc """
+  Advances the activity indicator by one frame.
+
+  Returns the state unchanged when no session is `:streaming`/`:executing_tools`, so an idle TUI
+  neither re-renders nor writes to the terminal on a tick. Called by the loop's tick.
+  """
+  @spec tick(t()) :: t()
+  def tick(tui) do
+    if busy?(tui), do: %{tui | tick: tui.tick + 1, dirty: true}, else: tui
+  end
+
+  @doc """
+  True when any session is currently `:streaming` or `:executing_tools`.
+  """
+  @spec busy?(t()) :: boolean()
+  def busy?(%__MODULE__{sessions: sessions}) do
+    Enum.any?(sessions, fn {_id, view} -> busy_status?(view.status) end)
+  end
+
+  defp busy_status?(status), do: status in [:streaming, :executing_tools]
+
+  defp spinner(tui), do: Enum.at(@spinner_frames, rem(tui.tick, length(@spinner_frames)))
 
   # Runs one `handle_key/2` command. Kept out of `loop/2` so the loop stays a loop (Credo's
   # complexity budget) and the command table reads as a table.
@@ -286,25 +328,64 @@ defmodule Athanor.TUI do
         :ok
 
       {:submit, prompt, tui} ->
-        _ = Daemon.send_session(target_node, tui.active_id, prompt)
-        loop(term, tui)
+        loop(term, note_command(tui, Daemon.send_session(target_node, tui.active_id, prompt)))
 
       # Stacked prompt: same transport as `{:submit, _}` — `send_session/2` already routes through
       # `{:enqueue_prompt, _}`, and the agent queues when busy — but the TUI bumps its own pending
       # count immediately so the `⧗ N queued` indicator is right before the round trip lands.
       {:enqueue, prompt, tui} ->
-        _ = Daemon.send_session(target_node, tui.active_id, prompt)
-        loop(term, optimistic_enqueue(tui, prompt))
+        case Daemon.send_session(target_node, tui.active_id, prompt) do
+          :ok -> loop(term, optimistic_enqueue(tui, prompt))
+          error -> loop(term, note_command(tui, error))
+        end
 
       {:cancel, tui} ->
-        _ = Daemon.cancel_session(target_node, tui.active_id)
-        loop(term, tui)
+        loop(term, note_command(tui, Daemon.cancel_session(target_node, tui.active_id)))
 
       {:cont, tui} ->
         loop(term, tui)
 
       other ->
         dispatch_session(term, target_node, other)
+    end
+  end
+
+  # Command results used to be discarded with `_ =`, so against an unreachable daemon an Enter or
+  # Esc silently did nothing — the reported "Esc doesn't cancel anything" symptom. Surface it.
+  defp note_command(tui, :ok), do: tui
+
+  defp note_command(tui, {:error, reason}) do
+    add_system(tui, "command failed — is the daemon reachable? (#{describe_rpc_error(reason)})")
+  end
+
+  defp note_command(tui, _other), do: tui
+
+  defp describe_rpc_error(:not_found), do: "no such session"
+  defp describe_rpc_error(reason), do: inspect(reason)
+
+  # Spawning is its own step so `dispatch_session/3` stays inside Credo's complexity budget, and
+  # so a failed spawn reports like any other failed command instead of raising a `MatchError`.
+  defp spawn_subagent(tui, target_node, title, prompt) do
+    parent_id = resolve_parent_conductor(tui)
+
+    case Daemon.launch_subagent(target_node, parent_id, title, prompt) do
+      {:ok, child_id, _pid} ->
+        ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
+
+      error ->
+        note_command(tui, error)
+    end
+  end
+
+  defp spawn_conductor(tui, target_node, title) do
+    case Daemon.start_conductor(target_node, title: title, model: tui.model) do
+      {:ok, cond_id, _pid} ->
+        tui
+        |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
+        |> Map.put(:active_id, cond_id)
+
+      error ->
+        note_command(tui, error)
     end
   end
 
@@ -318,21 +399,10 @@ defmodule Athanor.TUI do
         loop(term, clear_local_queue(tui))
 
       {:spawn_subagent, title, prompt, tui} ->
-        parent_id = resolve_parent_conductor(tui)
-        {:ok, child_id, _pid} = Daemon.launch_subagent(target_node, parent_id, title, prompt)
-
-        tui = ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
-        loop(term, tui)
+        loop(term, spawn_subagent(tui, target_node, title, prompt))
 
       {:spawn_conductor, title, tui} ->
-        {:ok, cond_id, _pid} = Daemon.start_conductor(target_node, title: title, model: tui.model)
-
-        tui =
-          tui
-          |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
-          |> Map.put(:active_id, cond_id)
-
-        loop(term, tui)
+        loop(term, spawn_conductor(tui, target_node, title))
 
       {:theme, name, tui} ->
         loop(term, apply_theme(tui, name))
@@ -815,7 +885,7 @@ defmodule Athanor.TUI do
     selected? = session.id == tui.active_id
     highlighted? = focused? and idx == highlight_idx
     pointer = if highlighted?, do: "▸", else: if(selected?, do: "•", else: " ")
-    badge = status_badge(session.status)
+    badge = status_badge(session.status, tui)
     role_icon = if session.role == :conductor, do: "♦ ", else: prefix
     avail_title = max(4, sidebar_w - String.length(pointer) - String.length(role_icon) - 4)
     short_title = String.slice(session.title, 0, avail_title)
@@ -875,10 +945,15 @@ defmodule Athanor.TUI do
     end)
   end
 
-  defp status_badge(:idle), do: "○"
-  defp status_badge(:streaming), do: "●"
-  defp status_badge(:executing_tools), do: "●"
-  defp status_badge(:error), do: "✕"
+  # Busy states show the live spinner frame, so a stalled stream looks different from a working
+  # one; idle/error keep static glyphs (there is nothing to animate).
+  defp status_badge(status, tui) do
+    if busy_status?(status), do: spinner(tui), else: static_badge(status)
+  end
+
+  defp static_badge(:idle), do: "○"
+  defp static_badge(:error), do: "✕"
+  defp static_badge(_status), do: "○"
 
   defp render_status_bar(tui, width) do
     status = active_status(tui)
@@ -888,10 +963,17 @@ defmodule Athanor.TUI do
 
     {status_label, colour} =
       case status do
-        :idle -> {"○ IDLE", Theme.colour(theme, :success)}
-        :streaming -> {"● STREAMING… (Esc cancel)", Theme.colour(theme, :warning)}
-        :executing_tools -> {"● RUNNING TOOLS… (Esc cancel)", Theme.colour(theme, :info)}
-        :error -> {"✕ ERROR", Theme.colour(theme, :error)}
+        :idle ->
+          {"○ IDLE", Theme.colour(theme, :success)}
+
+        :streaming ->
+          {"#{spinner(tui)} STREAMING… (Esc cancel)", Theme.colour(theme, :warning)}
+
+        :executing_tools ->
+          {"#{spinner(tui)} RUNNING TOOLS… (Esc cancel)", Theme.colour(theme, :info)}
+
+        :error ->
+          {"✕ ERROR", Theme.colour(theme, :error)}
       end
 
     left = " #{status_label} │ [#{role_tag}] #{tui.active_id}"
@@ -1304,7 +1386,12 @@ defmodule Athanor.TUI do
         append(tui.session_order, session_id)
       end
 
-    %{tui | sessions: Map.put(tui.sessions, session_id, updated), session_order: order}
+    %{
+      tui
+      | sessions: Map.put(tui.sessions, session_id, updated),
+        session_order: order,
+        dirty: true
+    }
   end
 
   # Appends one element to a list, preserving order. `List.insert_at/3` with `-1` is documented
@@ -1317,7 +1404,8 @@ defmodule Athanor.TUI do
     tui = ensure_session(tui, session_id, %{})
     session = Map.fetch!(tui.sessions, session_id)
     updated = fun.(session)
-    %{tui | sessions: Map.put(tui.sessions, session_id, updated)}
+
+    %{tui | sessions: Map.put(tui.sessions, session_id, updated), dirty: true}
   end
 
   defp flush_session_buffer(%{streaming_buffer: nil} = s), do: s

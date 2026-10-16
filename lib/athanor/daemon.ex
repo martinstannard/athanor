@@ -503,25 +503,45 @@ defmodule Athanor.Daemon do
   # (2) `:erpc.call/5` to a node that has never loaded the module raises a bare
   # `:undef` — a direct call can never do that.
 
-  @spec send_session(node(), String.t(), String.t()) :: :ok | {:error, :not_found}
+  # These are dead-daemon-safe: when the remote node is gone an `:erpc` call raises, which used
+  # to propagate into the TUI and take its loop down. Unreachability is an expected state, not
+  # an exception, so it returns `{:error, :daemon_unreachable}` and is surfaced in the transcript.
+
+  @spec send_session(node(), String.t(), String.t()) :: :ok | {:error, term()}
   def send_session(target_node, session_id, prompt) do
     rpc(target_node, Orchestrator, :send_session, [session_id, prompt])
+  rescue
+    _ -> {:error, :daemon_unreachable}
+  catch
+    _, _ -> {:error, :daemon_unreachable}
   end
 
-  @spec cancel_session(node(), String.t()) :: :ok | {:error, :not_found}
+  @spec cancel_session(node(), String.t()) :: :ok | {:error, term()}
   def cancel_session(target_node, session_id) do
     rpc(target_node, Orchestrator, :cancel_session, [session_id])
+  rescue
+    _ -> {:error, :daemon_unreachable}
+  catch
+    _, _ -> {:error, :daemon_unreachable}
   end
 
   @spec launch_subagent(node(), String.t(), String.t(), String.t(), keyword()) ::
           {:ok, String.t(), pid()} | {:error, term()}
   def launch_subagent(target_node, parent_id, title, prompt, opts \\ []) do
     rpc(target_node, Orchestrator, :launch_subagent, [parent_id, title, prompt, opts])
+  rescue
+    _ -> {:error, :daemon_unreachable}
+  catch
+    _, _ -> {:error, :daemon_unreachable}
   end
 
   @spec start_conductor(node(), keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def start_conductor(target_node, opts \\ []) do
     rpc(target_node, Orchestrator, :start_conductor, [opts])
+  rescue
+    _ -> {:error, :daemon_unreachable}
+  catch
+    _, _ -> {:error, :daemon_unreachable}
   end
 
   @doc """

@@ -85,6 +85,17 @@ defmodule Athanor.DaemonTest do
              )
   end
 
+  test "commands against an unreachable daemon return an error instead of raising" do
+    # Regression: these used to let `:erpc`'s exception escape into the TUI loop, so pressing
+    # Esc or Enter against a dead daemon could take the UI down instead of reporting it.
+    dead = :"athanor_no_such_node@127.0.0.1"
+
+    assert {:error, :daemon_unreachable} = Daemon.send_session(dead, "any", "hi")
+    assert {:error, :daemon_unreachable} = Daemon.cancel_session(dead, "any")
+    assert {:error, :daemon_unreachable} = Daemon.launch_subagent(dead, "any", "t", "p")
+    assert {:error, :daemon_unreachable} = Daemon.start_conductor(dead, title: "t")
+  end
+
   @tag :external_node
   test "a reachable-compatible node whose app never started is NOT usable (the boot race)" do
     # Regression for: `mix athanor.daemon --restart` attaching inside the window where the
