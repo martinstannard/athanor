@@ -486,6 +486,123 @@ defmodule Athanor.AgentTest do
 
       assert Agent.get_state(agent).status == :idle
     end
+
+    test "runs N stacked prompts FIFO, each as its own turn, and exposes the depth", %{
+      tmp_dir: tmp_dir
+    } do
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: test_driven_llm_fn(self()))
+
+      assert :ok = Agent.prompt(agent, "one")
+      assert_receive {:llm_messages, first_task, _}
+
+      for text <- ["two", "three", "four"], do: assert(:ok = Agent.enqueue_prompt(agent, text))
+      assert_receive {:agent_event, {:prompt_queue, %{len: 3, next: "two"}}}
+      assert Agent.get_state(agent).prompt_queue_len == 3
+      flush_prompt_queue_events()
+
+      # Each release drains exactly one prompt, in arrival order, and the depth falls with it.
+      send(first_task, {:reply, {:ok, %{role: "assistant", content: "one done", tool_calls: []}}})
+      assert_receive {:agent_event, {:prompt_queue, %{len: 2, next: "three"}}}
+      assert_receive {:llm_messages, second_task, second}
+      assert List.last(second).content == "two"
+
+      send(second_task, {:reply, {:ok, %{role: "assistant", content: "two done", tool_calls: []}}})
+      assert_receive {:agent_event, {:prompt_queue, %{len: 1, next: "four"}}}
+      assert_receive {:llm_messages, third_task, third}
+      assert List.last(third).content == "three"
+
+      send(third_task, {:reply, {:ok, %{role: "assistant", content: "three done", tool_calls: []}}})
+      assert_receive {:agent_event, {:prompt_queue, %{len: 0, next: nil}}}
+      assert_receive {:llm_messages, fourth_task, fourth}
+      assert List.last(fourth).content == "four"
+
+      send(fourth_task, {:reply, {:ok, %{role: "assistant", content: "four done", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "four done"}}
+
+      state = Agent.get_state(agent)
+      assert state.prompt_queue_len == 0
+      assert state.status == :idle
+    end
+
+    test "clear_prompt_queue/1 empties the stack and leaves the in-flight turn alone", %{
+      tmp_dir: tmp_dir
+    } do
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: holding_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "first")
+      assert_receive {:agent_event, {:status, :streaming}}
+
+      assert :ok = Agent.enqueue_prompt(agent, "second")
+      assert :ok = Agent.enqueue_prompt(agent, "third")
+      assert_receive {:agent_event, {:prompt_queue, %{len: 2, next: "second"}}}
+      flush_prompt_queue_events()
+
+      assert :ok = Agent.clear_prompt_queue(agent)
+      assert_receive {:agent_event, {:prompt_queue, %{len: 0, next: nil}}}
+
+      state = Agent.get_state(agent)
+      assert state.prompt_queue_len == 0
+      # "Forget the stack" is not "stop the turn": the held request is still in flight.
+      assert state.status == :streaming
+    end
+
+    test "drop_last_prompt/1 removes only the newest stacked prompt", %{tmp_dir: tmp_dir} do
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: holding_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "first")
+      assert_receive {:agent_event, {:status, :streaming}}
+
+      assert :ok = Agent.enqueue_prompt(agent, "keep-me")
+      assert :ok = Agent.enqueue_prompt(agent, "mistyped")
+      flush_prompt_queue_events()
+      assert Agent.get_state(agent).prompt_queue_len == 2
+
+      # The head survives, so "keep-me" is still the prompt that will run next.
+      assert :ok = Agent.drop_last_prompt(agent)
+      assert Agent.get_state(agent).prompt_queue_len == 1
+      assert_receive {:agent_event, {:prompt_queue, %{len: 1, next: "keep-me"}}}
+
+      # Dropping the last remaining prompt empties the queue...
+      assert :ok = Agent.drop_last_prompt(agent)
+      assert Agent.get_state(agent).prompt_queue_len == 0
+      assert_receive {:agent_event, {:prompt_queue, %{len: 0, next: nil}}}
+
+      # ...and dropping from an empty queue is a silent no-op (no empty notification) that leaves
+      # the in-flight turn running.
+      flush_prompt_queue_events()
+      assert :ok = Agent.drop_last_prompt(agent)
+      refute_received {:agent_event, {:prompt_queue, _}}
+      assert Agent.get_state(agent).status == :streaming
+    end
+
+    test "drop_last_prompt/1 also routes as a bus command by session id", %{tmp_dir: tmp_dir} do
+      id = "drop-bus-#{System.unique_integer([:positive])}"
+
+      {:ok, agent} =
+        Agent.start_link(id: id, subscriber: self(), cd: tmp_dir, llm_fn: holding_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "first")
+      assert_receive {:agent_event, {:status, :streaming}}
+      assert :ok = Agent.enqueue_prompt(agent, "stacked")
+      assert_receive {:agent_event, {:prompt_queue, %{len: 1, next: "stacked"}}}
+      flush_prompt_queue_events()
+
+      assert :ok = Agent.drop_last_prompt(id)
+      assert_receive {:agent_event, {:prompt_queue, %{len: 0, next: nil}}}
+    end
+
+    test "the session snapshot carries the pending depth", %{tmp_dir: tmp_dir} do
+      {:ok, _agent} =
+        Agent.start_link(
+          cd: tmp_dir,
+          id: "queue-depth-#{System.unique_integer([:positive])}",
+          subscriber: self()
+        )
+
+      assert_receive {:agent_event, {:session_started, meta}}
+      assert meta.prompt_queue_len == 0
+    end
   end
 
   # --- #30: a tool intent that arrived as text ------------------------------------
@@ -1057,6 +1174,27 @@ defmodule Athanor.AgentTest do
   defp final_answer_llm_fn do
     fn _messages, _tools, _agent_pid ->
       {:ok, %{role: "assistant", content: "final answer", tool_calls: []}}
+    end
+  end
+
+  # A provider that never returns on its own; releasing it with `send(task_pid, :release)` completes
+  # the turn. This is how a turn is held open while prompts stack behind it.
+  defp holding_llm_fn do
+    fn _messages, _tools, _agent_pid ->
+      receive do
+        :release -> {:ok, %{role: "assistant", content: "released", tool_calls: []}}
+      end
+    end
+  end
+
+  # Queue notifications are deliberately indistinguishable in shape (a client renders depth + next
+  # and nothing else), so an assertion on a later one can be satisfied by an earlier, already
+  # reasoned-about event still sitting in the mailbox. Flush them at each sync point.
+  defp flush_prompt_queue_events do
+    receive do
+      {:agent_event, {:prompt_queue, _}} -> flush_prompt_queue_events()
+    after
+      0 -> :ok
     end
   end
 

@@ -671,4 +671,115 @@ defmodule Athanor.TUITest do
       assert TUI.busy?(tui)
     end
   end
+
+  # design §2.1 + issue #18: stacking prompts while the active session streams.
+  describe "prompt stacking" do
+    test "Enter on non-empty input while streaming enqueues instead of dropping it" do
+      tui = TUI.new() |> TUI.handle_agent_event({:status, :streaming})
+
+      typed = elem(TUI.handle_key(tui, "keep going"), 1)
+      assert {:enqueue, "keep going", cleared} = TUI.handle_key(typed, "\r")
+
+      # The text is handed to the agent's FIFO queue and the input line is cleared, exactly as an
+      # immediate submit would be — the prompt is not silently dropped.
+      assert cleared.input == ""
+    end
+
+    test "executing_tools also stacks, but an idle session still submits immediately" do
+      executing = TUI.new() |> TUI.handle_agent_event({:status, :executing_tools})
+
+      typed = elem(TUI.handle_key(executing, "next"), 1)
+      assert {:enqueue, "next", _} = TUI.handle_key(typed, "\r")
+
+      idle = TUI.new()
+      typed = elem(TUI.handle_key(idle, "next"), 1)
+      assert {:submit, "next", _} = TUI.handle_key(typed, "\r")
+    end
+
+    test "Enter on empty input stays a no-op while streaming" do
+      tui = TUI.new() |> TUI.handle_agent_event({:status, :streaming})
+      assert {:cont, ^tui} = TUI.handle_key(tui, "\r")
+    end
+
+    test "renders the pending count and a preview of the next prompt" do
+      tui =
+        TUI.new(width: 120, height: 24)
+        |> TUI.handle_agent_event({:status, :streaming})
+        |> TUI.handle_agent_event({:prompt_queue, %{len: 2, next: "second follow-up"}})
+
+      assert TUI.active_queue_len(tui) == 2
+
+      frame = TUI.render_frame(tui)
+      assert frame =~ "⧗ 2 queued"
+      assert frame =~ "next: second follow-up"
+
+      # The agent's authoritative event is what the indicator follows: a drained prompt moves both
+      # the count and the preview.
+      drained = TUI.handle_agent_event(tui, {:prompt_queue, %{len: 1, next: "third"}})
+      assert TUI.active_queue_len(drained) == 1
+      assert TUI.render_frame(drained) =~ "⧗ 1 queued"
+      refute TUI.render_frame(drained) =~ "second follow-up"
+    end
+
+    test "no indicator is rendered when nothing is stacked" do
+      refute TUI.render_frame(TUI.new(width: 120, height: 24)) =~ "queued"
+    end
+
+    test "/clear-queue forgets the stack, reports what it dropped, and leaves the turn running" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event({:status, :streaming})
+        |> TUI.handle_agent_event({:prompt_queue, %{len: 3, next: "one"}})
+
+      typed = elem(TUI.handle_key(tui, "/clear-queue"), 1)
+      assert {:clear_queue, cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      local = TUI.clear_local_queue(cleared)
+      assert TUI.active_queue_len(local) == 0
+
+      assert Enum.any?(entries(local), fn
+               {:system, msg} -> msg =~ "Cleared 3 stacked prompt(s)"
+               _ -> false
+             end)
+
+      # Clearing the stack is not a cancel: the in-flight turn is untouched.
+      assert TUI.active_status(local) == :streaming
+    end
+
+    test "/clear-queue on an empty stack adds no noise" do
+      tui = TUI.new() |> TUI.handle_agent_event({:status, :streaming})
+      typed = elem(TUI.handle_key(tui, "/clear-queue"), 1)
+      {:clear_queue, cleared} = TUI.handle_key(typed, "\r")
+
+      assert TUI.clear_local_queue(cleared).sessions["conductor-main"].entries ==
+               cleared.sessions["conductor-main"].entries
+    end
+
+    test "/unqueue drops only the most recently stacked prompt" do
+      tui =
+        TUI.new(width: 120, height: 24)
+        |> TUI.handle_agent_event({:status, :streaming})
+        |> TUI.handle_agent_event({:prompt_queue, %{len: 2, next: "first follow-up"}})
+
+      typed = elem(TUI.handle_key(tui, "/unqueue"), 1)
+      assert {:drop_queued, cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      dropped = TUI.drop_last_local_queue(cleared)
+      assert TUI.active_queue_len(dropped) == 1
+      # The head is untouched, so the preview still names the next prompt to run.
+      assert TUI.render_frame(dropped) =~ "next: first follow-up"
+
+      # Dropping the last remaining prompt empties the queue (and the preview with it).
+      empty = TUI.drop_last_local_queue(dropped)
+      assert TUI.active_queue_len(empty) == 0
+      refute TUI.render_frame(empty) =~ "queued"
+    end
+
+    test "a longer verb is still an ordinary prompt" do
+      typed = elem(TUI.handle_key(TUI.new(), "/unqueuex"), 1)
+      assert {:submit, "/unqueuex", _} = TUI.handle_key(typed, "\r")
+    end
+  end
 end

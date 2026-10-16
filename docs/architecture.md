@@ -182,7 +182,9 @@ implements both roles; only the default system prompt and the tool set differ by
      emits `{:error, "Reached maximum tool-call turns (…)"}`, otherwise it calls `start_llm_turn/1`
      again. Steps 4–6 are the recursion that makes it an *agent* rather than a single completion.
 - **Cancellation**: `do_cancel/1` demonitors and `Process.exit(pid, :kill)`s the in-flight task, sets
-  `:idle`, and emits `:cancelled`.
+  `:idle`, and emits `:cancelled`. It clears `prompt_queue` too: cancel means *stop*, not "start the
+  next stacked prompt the moment this one dies". `clear_prompt_queue/1` (drop the whole stack) and
+  `drop_last_prompt/1` (drop only the newest entry) are the selective verbs that leave the turn alone.
 - **Queuing**: `do_enqueue_prompt/2` starts a turn immediately when `:idle`/`:error`, and otherwise
   appends to `prompt_queue`; `drain_prompt_queue/1` pops one prompt per completed turn. This is what
   lets a Conductor absorb several concurrent child completions without dropping any.

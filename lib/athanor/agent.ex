@@ -58,7 +58,9 @@ defmodule Athanor.Agent do
   Retaining the queue would start the very next stacked prompt the moment the killed turn unwound —
   indistinguishable from not cancelling at all — and, because `drain_prompt_queue/1` runs only at a
   turn boundary, a retained queue would otherwise sit stranded until some later turn finished.
-  `clear_prompt_queue/1` drops the pending queue on its own, leaving the in-flight turn alone.
+  `clear_prompt_queue/1` drops the pending queue on its own, leaving the in-flight turn alone, and
+  `drop_last_prompt/1` is the narrowest edit of all: it forgets only the most recently stacked
+  prompt, so a mistyped follow-up can be pulled back without losing the rest of the stack.
 
   ## Project instructions (`AGENTS.md`, #33)
 
@@ -201,6 +203,24 @@ defmodule Athanor.Agent do
 
   def clear_prompt_queue(agent) do
     GenServer.call(agent, :clear_prompt_queue)
+  end
+
+  @doc """
+  Drops only the **most recently** stacked prompt, leaving the in-flight turn and any earlier
+  stacked prompts alone.
+
+  The selective counterpart to `clear_prompt_queue/1` — "forget the follow-up I just mistyped"
+  without losing the rest of the stack. A no-op when the queue is empty, and a no-op for the turn
+  in flight; otherwise it publishes `{:prompt_queue, %{len: n, next: next | nil}}` so clients
+  re-render the depth immediately.
+  """
+  @spec drop_last_prompt(GenServer.server() | String.t()) :: :ok
+  def drop_last_prompt(agent_id) when is_binary(agent_id) do
+    Bus.send_command(agent_id, :drop_last_prompt)
+  end
+
+  def drop_last_prompt(agent) do
+    GenServer.call(agent, :drop_last_prompt)
   end
 
   @doc """
@@ -377,6 +397,10 @@ defmodule Athanor.Agent do
     {:reply, :ok, do_clear_prompt_queue(state)}
   end
 
+  def handle_call(:drop_last_prompt, _from, state) do
+    {:reply, :ok, do_drop_last_prompt(state)}
+  end
+
   def handle_call(:clear_context, _from, state) do
     {:reply, :ok, do_clear_context(state)}
   end
@@ -415,6 +439,11 @@ defmodule Athanor.Agent do
   end
 
   @impl GenServer
+  def handle_cast(:drop_last_prompt, state) do
+    {:noreply, do_drop_last_prompt(state)}
+  end
+
+  @impl GenServer
   def handle_cast(:clear_context, state) do
     {:noreply, do_clear_context(state)}
   end
@@ -431,6 +460,10 @@ defmodule Athanor.Agent do
 
   def handle_info({:bus_command, :clear_prompt_queue}, state) do
     {:noreply, do_clear_prompt_queue(state)}
+  end
+
+  def handle_info({:bus_command, :drop_last_prompt}, state) do
+    {:noreply, do_drop_last_prompt(state)}
   end
 
   def handle_info({:bus_command, :clear_context}, state) do
@@ -797,6 +830,17 @@ defmodule Athanor.Agent do
       state
     else
       notify_prompt_queue(%{state | prompt_queue: :queue.new()})
+    end
+  end
+
+  # Removes only the rear of the queue. `:queue.drop_r/1` raises on an empty queue (and would be a
+  # pointless notification), hence the guard; dropping the rear leaves the front — and therefore
+  # the next prompt to run (`next_queued/1`) — untouched, so only the depth changes.
+  defp do_drop_last_prompt(%{prompt_queue: queue} = state) do
+    if :queue.is_empty(queue) do
+      state
+    else
+      notify_prompt_queue(%{state | prompt_queue: :queue.drop_r(queue)})
     end
   end
 

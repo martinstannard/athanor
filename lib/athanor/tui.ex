@@ -65,8 +65,9 @@ defmodule Athanor.TUI do
   The pending depth is rendered as `⧗ N queued` (plus a one-line preview of the next prompt when it
   fits) at the right of the input line, fed by the agent's `{:prompt_queue, %{len:, next:}}` event
   and updated optimistically on enqueue so the count is right before the round trip completes.
-  `/clear-queue` discards the stack without touching the in-flight turn. `Esc` is the
-  **stop-the-line** gesture: it always issues a cancel (never gated on a cached status, which
+  `/clear-queue` discards the stack without touching the in-flight turn, and `/unqueue` drops only
+  the most recently stacked prompt (the "pull back the follow-up I just mistyped" verb). `Esc` is
+  the **stop-the-line** gesture: it always issues a cancel (never gated on a cached status, which
   could go stale and make Esc a silent no-op — see `docs/wedge-findings.md`), and a cancel stops
   the turn *and* clears the queue (`Athanor.Agent`'s documented choice: cancel means *stop*, not
   "start the next stacked prompt the moment this one dies").
@@ -74,7 +75,8 @@ defmodule Athanor.TUI do
   `/clear` is the heavier sibling: it drops the queue **and** wipes the conversation context, so it
   is consistent with the same "stop, don't resume the stack" rule (the agent stops any in-flight
   turn and drops the pending prompts as part of the reset). `/clear-queue` remains the narrow
-  "forget the stack but let the current turn finish" verb.
+  "forget the stack but let the current turn finish" verb, and `/unqueue` the narrowest of all:
+  it drops just the newest stacked prompt.
 
   ## Responsiveness
 
@@ -214,7 +216,7 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear to reset the active session's context, /clear-queue to drop stacked prompts. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear to reset the active session's context, /clear-queue to drop all stacked prompts, /unqueue to drop the last one. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
       streaming_buffer: nil,
       prompt_queue_len: 0,
@@ -535,8 +537,12 @@ defmodule Athanor.TUI do
   defp dispatch_session(term, target_node, command) do
     case command do
       {:clear_queue, tui} ->
-        _ = clear_remote_queue(target_node, tui)
+        _ = send_queue_command(target_node, tui.active_id, :clear_prompt_queue)
         loop(term, clear_local_queue(tui))
+
+      {:drop_queued, tui} ->
+        _ = send_queue_command(target_node, tui.active_id, :drop_last_prompt)
+        loop(term, drop_last_local_queue_note(tui))
 
       {:spawn_subagent, title, prompt, tui} ->
         parent_id = resolve_parent_conductor(tui)
@@ -696,6 +702,7 @@ defmodule Athanor.TUI do
           | {:submit, String.t(), t()}
           | {:enqueue, String.t(), t()}
           | {:clear_queue, t()}
+          | {:drop_queued, t()}
           | {:clear_context, t()}
           | {:spawn_subagent, String.t(), String.t(), t()}
           | {:spawn_conductor, String.t(), t()}
@@ -956,18 +963,16 @@ defmodule Athanor.TUI do
     end)
   end
 
-  # `/clear-queue`: forget the stack locally and tell the agent to do the same. The
-  # remote half must be published on the *owning* node's PubSub (the agent subscribes there), so
-  # a daemon-attached client RPCs `Bus.send_command/2` on the daemon; `--local` short-circuits.
-  # Bounded like every other RPC (`Athanor.Config.rpc_timeout_ms/0`): an unbounded `:erpc.call/4`
-  # would freeze the TUI loop if the daemon hung between rendering and this call.
-  defp clear_remote_queue(target_node, tui) do
+  # `/clear-queue` and `/unqueue` both mutate the agent-owned queue, so the remote half must be
+  # published on the *owning* node's PubSub (the agent subscribes there): a daemon-attached client
+  # RPCs `Bus.send_command/2` on the daemon, a local client short-circuits. Bounded like every other
+  # RPC (`Athanor.Config.rpc_timeout_ms/0`): an unbounded `:erpc.call/4` would freeze the TUI loop if
+  # the daemon hung between rendering and this call.
+  defp send_queue_command(target_node, session_id, command) do
     if target_node == Node.self() do
-      Agent.clear_prompt_queue(tui.active_id)
+      Bus.send_command(session_id, command)
     else
-      _ =
-        Daemon.rpc(target_node, Bus, :send_command, [tui.active_id, :clear_prompt_queue])
-
+      _ = Daemon.rpc(target_node, Bus, :send_command, [session_id, command])
       :ok
     end
   rescue
@@ -975,7 +980,16 @@ defmodule Athanor.TUI do
     _ -> :ok
   end
 
-  defp clear_local_queue(tui) do
+  @doc """
+  Empties the active session's local view of the pending prompt stack — the client half of
+  `/clear-queue`.
+
+  Pure and public so it can be asserted without a terminal (the agent owns the real queue and
+  converges this view through its `{:prompt_queue, _}` event). The in-flight turn is untouched:
+  clearing the stack is deliberately *not* a cancel.
+  """
+  @spec clear_local_queue(t()) :: t()
+  def clear_local_queue(tui) do
     dropped = queued_len(tui)
 
     tui =
@@ -984,6 +998,35 @@ defmodule Athanor.TUI do
       end)
 
     if dropped > 0, do: add_system(tui, "Cleared #{dropped} stacked prompt(s)."), else: tui
+  end
+
+  @doc """
+  Drops the newest stacked prompt from the active session's local view — the client half of
+  `/unqueue`.
+
+  Public and pure for the same reason as `clear_local_queue/1`; the authoritative
+  `{:prompt_queue, _}` event converges the count afterwards. `queue_next` (the *head*, i.e. the
+  next prompt to run) only changes when the queue empties, because dropping the tail cannot
+  promote it.
+  """
+  @spec drop_last_local_queue(t()) :: t()
+  def drop_last_local_queue(tui) do
+    update_session(tui, tui.active_id, fn s ->
+      remaining = max(0, s.prompt_queue_len - 1)
+      %{s | prompt_queue_len: remaining, queue_next: if(remaining == 0, do: nil, else: s.queue_next)}
+    end)
+  end
+
+  # `/unqueue` with the user-visible acknowledgement: an empty stack says so instead of silently
+  # doing nothing, and a real drop moves the indicator immediately (the agent's event confirms it).
+  defp drop_last_local_queue_note(tui) do
+    if queued_len(tui) == 0 do
+      add_system(tui, "No stacked prompts to drop.")
+    else
+      tui
+      |> drop_last_local_queue()
+      |> add_system("Dropped the last stacked prompt.")
+    end
   end
 
   @doc """
@@ -1028,10 +1071,12 @@ defmodule Athanor.TUI do
 
   # The whole-line "clear" verbs are matched as their own function heads: `/clear` discards the
   # active session's **whole conversation context** in place, `/clear-queue` only forgets the
-  # *stacked prompts*. Both are exact matches, so `/clearx` / `/clear-queuex` stay ordinary
-  # prompts, and neither belongs in the argument-parsing `cond` below.
+  # *stacked prompts*, and `/unqueue` drops just the newest of them. Each is an exact match, so
+  # `/clearx` / `/clear-queuex` / `/unqueuex` stay ordinary prompts, and none belongs in the
+  # argument-parsing `cond` below.
   defp slash_command(tui, "/clear"), do: {:clear_context, %{tui | input: ""}}
   defp slash_command(tui, "/clear-queue"), do: {:clear_queue, %{tui | input: ""}}
+  defp slash_command(tui, "/unqueue"), do: {:drop_queued, %{tui | input: ""}}
 
   defp slash_command(tui, trimmed) do
     cond do
