@@ -33,3 +33,5 @@ athanor-*.tar
 /.claude/
 /.chainlink/
 
+# Local handover notes: deliberately kept out of git (machine paths, PIDs, daemon internals).
+/docs/handover.md
