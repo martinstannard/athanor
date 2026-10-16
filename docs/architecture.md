@@ -1,13 +1,16 @@
 # Athanor Architecture
 
-Athanor separates HTTP streaming, state management, tool execution, orchestration, and terminal
-rendering into independent BEAM processes that communicate over `Athanor.Bus` PubSub and ordinary
-Erlang message passing. Because every session is a supervised process, an in-flight LLM stream, a
-crash, or a slow shell command never blocks the terminal UI.
+Athanor separates HTTP streaming, state management, tool execution, orchestration, persistence, and
+terminal rendering into independent BEAM processes that communicate over `Athanor.Bus` PubSub and
+ordinary Erlang message passing. Because every session is a supervised process, an in-flight LLM
+stream, a crash, or a slow shell command never blocks the terminal UI — and because
+`Athanor.Store.Recorder` persists every appended message (§12), neither does a daemon restart.
 
 *Everything below was verified against `lib/` at commit `a29ec7f` (2026-10-15); the file/function
 that backs each claim is cited inline. The working tree may contain uncommitted work-in-progress
-beyond that commit — such work is deliberately **not** described here.*
+beyond that commit — such work is deliberately **not** described here, with **one exception**:
+`Athanor.Store` (design §7.4, "Resume v1") has since landed and is described in §12, with pointers
+from §1, §2, §5, §6, §7 and §11.*
 
 ---
 
@@ -20,11 +23,12 @@ supervision tree (`lib/athanor/application.ex`):
 Athanor.Supervisor (:one_for_one)
 ├── Athanor.AgentRegistry    (Registry, keys: :unique)     # session id -> Agent pid + metadata
 ├── Athanor.PubSub           (Registry, keys: :duplicate)  # topic -> [subscriber pid] (backs Athanor.Bus)
-└── Athanor.AgentSupervisor  (DynamicSupervisor, :one_for_one)
-      ├── Athanor.Agent "conductor-main"  (role: :conductor, parent_id: nil)
-      │     ├── Athanor.Agent "worker-3-a1b2"  (role: :worker, parent_id: "conductor-main")
-      │     └── Athanor.Agent "worker-4-c3d4"  (role: :worker, parent_id: "conductor-main")
-      └── Athanor.Agent "ops"             (role: :conductor, parent_id: nil)
+├── Athanor.AgentSupervisor  (DynamicSupervisor, :one_for_one)
+│     ├── Athanor.Agent "conductor-main"  (role: :conductor, parent_id: nil)
+│     │     ├── Athanor.Agent "worker-3-a1b2"  (role: :worker, parent_id: "conductor-main")
+│     │     └── Athanor.Agent "worker-4-c3d4"  (role: :worker, parent_id: "conductor-main")
+│     └── Athanor.Agent "ops"             (role: :conductor, parent_id: nil)
+└── Athanor.Store.Recorder   (GenServer, :permanent)       # single writer of ~/.athanor/sessions (§12)
 ```
 
 - Every session is an `Athanor.Agent` GenServer started as a `:temporary` child of
@@ -34,6 +38,9 @@ Athanor.Supervisor (:one_for_one)
   `false` (used by unit tests).
 - `:temporary` means a session is *not* restarted if it crashes — a crashed worker is gone, not
   respawned.
+- `Athanor.Store.Recorder` is `:permanent` (persistence must come back if it dies) and is placed
+  **last** so every other child can publish before it subscribes. It consumes `"deck:events"` and is
+  the only process that writes the sessions tree (§12).
 
 There is **no `config/` directory**. All defaults live as module attributes in `Athanor.Config`
 combined with `Application.get_env(:athanor, …)` and environment variables.
@@ -42,7 +49,7 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 
 | Module | Kind | Responsibility |
 |---|---|---|
-| `Athanor.Application` | `Application` | Boots the three children above. |
+| `Athanor.Application` | `Application` | Boots the children above — the registries, `Athanor.AgentSupervisor`, and the `Athanor.Store.Recorder` singleton (§12). |
 | `Athanor.Agent` | `GenServer` | The recursive agent loop and per-session state machine — used for both Conductors and Workers. |
 | `Athanor.Orchestrator` | module | The only writer of agent child specs: spawn / lookup / list / read / prompt / cancel sessions. |
 | `Athanor.Bus` | module | PubSub helpers over `Athanor.PubSub`: `subscribe/1`, `unsubscribe/1`, `broadcast/2`, `publish_event/3`, `send_command/2`. |
@@ -51,7 +58,11 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 | `Athanor.TUI` | struct + pure funcs | `Termite` split-pane "agent-deck"-style terminal UI. |
 | `Athanor.Markdown` | module | Dependency-free Markdown → ANSI-styled line renderer used by the TUI. |
 | `Athanor.Daemon` | module | Persistent BEAM daemon node and remote client attach/hydrate bridge (design §7.7). |
-| `Athanor.Config` | module | Base URL / model / API-key resolution (env vars, app config, `auth.json`). |
+| `Athanor.Config` | module | Base URL / model / API-key resolution (env vars, app config, `auth.json`). Also the Store root and compaction knobs. |
+| `Athanor.Store` | module | On-disk session persistence facade (design §7.4): `~/.athanor/sessions/<id>/` paths, `ensure_session/2`, `load/2`, `load_records/2`, `list/1`, `delete/2`, version check. |
+| `Athanor.Store.{Session,Transcript,Schema,Tokens}` | modules | Pure formats and helpers: `meta.json` struct/schema, append-only JSONL transcript, version/migration dispatch, token estimation. |
+| `Athanor.Store.{Handoff,Compactor}` | modules | Pure rolling-summary render/write/parse, and the C5-safe compaction policy (user-boundary cut + hysteresis). |
+| `Athanor.Store.Recorder` | `GenServer` | The single writer of `~/.athanor/sessions/**`: subscribes `"deck:events"` and persists messages, status, errors and compactions. |
 | `Mix.Tasks.Athanor` | Mix task | `mix athanor` — connect to the daemon and start the TUI. |
 | `Mix.Tasks.Athanor.Daemon` | Mix task | `mix athanor.daemon` — run / `--status` / `--stop` / `--restart` the daemon node. |
 
@@ -108,7 +119,8 @@ Stateless OpenAI-compatible SSE client built on `Req` (`lib/athanor/llm.ex`).
 - The **only** message it sends to the caller process mid-stream is `{:llm_delta, text_chunk}`
   (from `apply_content_delta/3`). There is no `:llm_tool_call_delta`, `:llm_done`, or `:llm_error`
   push message — tool-call fragments are accumulated silently, and the final result is the
-  *return value* of `stream/4`.
+  *return value* of `stream/4`. A provider `usage` frame is **discarded**, which is why §12's
+  compaction trigger uses the `Athanor.Store.Tokens` heuristic instead of a real token count.
 - Returns `{:ok, assistant_message}` (where `assistant_message` is
   `%{role: "assistant", content: String.t(), tool_calls: [tool_call()]}`) or `{:error, String.t()}`.
 - The SSE accumulator is exposed as pure, testable helpers: `new_stream_state/0`,
@@ -130,6 +142,12 @@ implements both roles; only the default system prompt and the tool set differ by
     cancellation and overlap-detection possible).
   - `turn_count`, `max_turns` (default `100`), `notify_parent_on_done`, `prompt_queue`
     (`:queue.new()` by default).
+  - `compaction_opts`, `compacted?` — the §12 compaction seam: the init option `:compaction_opts`
+    feeds `Compactor` (thresholds, `:summarizer_fn`), and `compacted?` is the hysteresis latch the
+    Agent holds because the Compactor is pure.
+  - The init option `:messages` pre-seeds the working set behind a freshly derived `system` message
+    (`initial_messages/2`) — the shape `Orchestrator.resume_all/1` uses to restore history; any
+    `system` message in the pre-seed is dropped so exactly one always leads the list.
 - **Public API**: `start_link/1`, `prompt/2`, `enqueue_prompt/2`, `cancel/1`, `subscribe/2`,
   `get_state/1`, `parse_done_sentinel/1`.
   - `prompt/2` and `cancel/1` accept a PID/name (GenServer call) **or** a session-id string (PubSub
@@ -169,7 +187,10 @@ implements both roles; only the default system prompt and the tool set differ by
   `summary=<rest of line>`, returning `{:ok, %{status:, summary:}}` or `:none`.
 - **Event emission** (`notify/2`): if `subscriber` is a PID it receives the bare event as
   `{:agent_event, event}`; in all cases the event is also published with the 3-tuple shape
-  `{:agent_event, id, event}` through `Athanor.Bus.publish_event/3`.
+  `{:agent_event, id, event}` through `Athanor.Bus.publish_event/3`. Separately, every message the
+  agent appends goes through the `record_messages/2` choke point, which publishes the **exact**
+  message map via `Bus.publish_message/3` as `{:message, id, msg}` — the input to §12's persistence
+  (the `system` message is never published; it is re-derived on resume).
 
 ## 6. `Athanor.Bus`, Topics & Message Flow
 
@@ -182,7 +203,7 @@ silently drop messages for topics with no live subscriber.
 | `"agent:<id>:inbox"` | `Athanor.Agent.prompt/2`, `enqueue_prompt/2`, `cancel/1`; `Athanor.Orchestrator.send_session/2`, `cancel_session/1`, `spawn_session/1`; `Athanor.TUI` via `Athanor.Daemon` RPC | the `Athanor.Agent` with that `id` | `{:bus_command, {:prompt, text} \| {:enqueue_prompt, text} \| :cancel}` |
 | `"agent:<id>:events"` | `Athanor.Agent` (`notify/2` → `Bus.publish_event/3`) | blocking `launch_subagent(wait: true)` callers, any other subscriber | `{:agent_event, id, event}` |
 | `"conductor:<id>:children"` | any `Athanor.Agent` whose `parent_id == id` | the parent `Athanor.Agent` (subscribed in `init/1` when `role: :conductor`) | `{:agent_event, child_id, event}` — in practice the `{:child_done, report}` wakeup |
-| `"deck:events"` | every `Athanor.Agent` | `Athanor.TUI` (via the daemon relay), `Athanor.Orchestrator.subscribe/0` callers, monitors | `{:agent_event, id, event}` |
+| `"deck:events"` | every `Athanor.Agent` | `Athanor.TUI` (via the daemon relay), `Athanor.Store.Recorder`, `Athanor.Orchestrator.subscribe/0` callers, monitors | `{:agent_event, id, event}` — plus `{:message, id, msg}` for every appended message (`Bus.publish_message/3`, §12) |
 
 Two shapes of `{:agent_event, …}` therefore coexist: the 3-tuple on every PubSub topic, and the
 2-tuple delivered directly to a session's `subscriber` PID (or to `Daemon.attach_subscriber/2`
@@ -228,10 +249,14 @@ Coordinates sessions under `Athanor.AgentSupervisor` and routes control over Pub
   registered session: `id`, `pid`, `title`, `role`, `parent_id`, `status`, `model`, `message_count`,
   `last_assistant`.
 - `session_output/1` (alias `read_agent/1`) — one session's snapshot including its full `messages`.
+- `resume_all/1` / `resume_session/2` — rehydrate persisted sessions from `~/.athanor/sessions`,
+  parents before children, with a `:messages` pre-seed (design §7.4; see §12).
 - `subscribe/0` — subscribe the caller to `"deck:events"`.
 - IDs are generated as `"<prefix>-<registry-count+1>-<4 hex chars>"` (`generate_id/1`), so they are
   *not* globally unique in the presence of concurrent spawns; callers that need stable ids pass one
-  explicitly. **Open question — see §12.**
+  explicitly. **Open question — see §13.** *(Superseded: ids are now generated by
+  `Athanor.SessionId.generate/1` from `:erlang.unique_integer/1` + random bytes, and
+  `spawn_session/1` retries on collision — see design §8.2.)*
 
 ## 8. `Athanor.TUI` (`Termite` Terminal UI)
 
@@ -252,6 +277,8 @@ A pure-Elixir, non-blocking split-pane UI (`lib/athanor/tui.ex`).
   subscriber, hydrates the session tree from the daemon, then enters the raw-mode loop. On exit it
   detaches the relay and restores the screen.
 - **Interactive commands / shortcuts** (`handle_key/2`):
+  - `/resume` / `/resume <id>` — list resumable sessions / rehydrate one from `~/.athanor/sessions`
+    (design §7.4; §12). A bare `/resume` renders a plain `Store.list/1` transcript listing.
   - `Ctrl+C`, `Ctrl+D`, `Ctrl+Q` — quit/detach. `/quit`, `/exit`, `/detach` — the same.
   - `Tab` — toggle focus between the input line and the session deck. `Esc` — cancel the active
     session's in-flight turn (only when it is not `:idle`); when the deck is focused, `Esc` instead
@@ -279,7 +306,7 @@ Implements a client/daemon split so an SSH session can attach to the live server
   session tree (including message history) and guarantee a `"conductor-main"` Conductor exists.
   `messages_to_tui_entries/1` converts historical messages back into TUI entries.
 - Remote-aware RPC wrappers: `send_session/3`, `cancel_session/2`, `launch_subagent/5`,
-  `start_conductor/2`.
+  `start_conductor/2`, `resume_all/2`, `resume_session/2`.
 - **Multiple clients can attach at once** and each gets its own relay, so several terminals (local +
   SSH) mirror the same live token streams. Detaching kills only the client's relay; conductors and
   workers keep running on the daemon.
@@ -306,24 +333,152 @@ env var, then `Application.get_env(:athanor, …)`, then a module-attribute defa
 | OpenCode auth file | — | — | `~/.local/share/opencode/auth.json` (`"opencode-go" -> "key"`) |
 | Daemon node | `ATHANOR_DAEMON_NODE` | `:daemon_node` | `:athanor_daemon@127.0.0.1` |
 | Daemon cookie | `ATHANOR_COOKIE` | `:cookie` | `:athanor_local_secret_cookie` |
+| Store root (§12) | `ATHANOR_HOME` | `:home` | `~/.athanor` |
+| Store enable (§12) | `ATHANOR_STORE` | `:store_enabled` | `true` |
+| Compaction threshold (§12) | `ATHANOR_COMPACTION_THRESHOLD` | `:compaction_threshold` | `0.8` |
+| Context window (§12) | `ATHANOR_CONTEXT_LIMIT_TOKENS` | `:context_limit_tokens` | `128_000` |
+| Compaction keep fraction (§12) | `ATHANOR_COMPACTION_KEEP_FRACTION` | `:compaction_keep_fraction` | `0.4` |
 
 `model/0` strips a leading `"opencode-go/"` prefix. `api_key/0` returns a descriptive error string
 when no key can be found.
 
 ---
 
-## 12. Future Work & Open Questions
+## 12. `Athanor.Store` (persistence)
 
-The realised system above covers design §1–§5 (philosophy, session taxonomy, PubSub, tools and TUI)
-plus §7.7. The rest of design §7 is **planned, not implemented** — no supporting module exists in
-`lib/`:
+Realises design §7.4, "Resume v1" (`lib/athanor/store.ex` and `lib/athanor/store/*.ex`). Sessions
+are now durable on disk: `mix athanor.daemon --restart` no longer destroys context, and a persisted
+session can be rehydrated with `mix athanor --resume` / `--session <id>`,
+`mix athanor.daemon --resume` / `--session <id>`, or the TUI's `/resume <id>`.
+
+| Module | Kind | Responsibility |
+|---|---|---|
+| `Athanor.Store` | module | Facade: path resolution (`root/1`, `sessions_root/1`, `session_dir/2`, `meta_path/2`, `transcript_path/2`, `handoff_path/2`), `ensure_session/2`, `load/2`, `load_records/2`, `list/1`, `delete/2`, `write_meta/2`, `check_version/1`, atomic `meta.json` replacement. No processes. `reconcile/1` is a documented `{:error, :not_implemented}` stub (plan M6). |
+| `Athanor.Store.Session` | `struct` + pure funcs | The `%Session{}` struct and the `meta.json` encode/decode pair (`to_map/1`, `from_map/1`); tolerant of unknown fields, requires only `id` and `role`. |
+| `Athanor.Store.Transcript` | module | The append-only `transcript.jsonl`: `new_record/3`, `open_append/1` + `append/2` (one complete line + `:file.datasync/1`), and a reader that drops a torn **tail** line but rejects an **interior** malformed one as `{:error, :corrupt}`. |
+| `Athanor.Store.Schema` | module | Three format versions (`meta.json`, transcript records, `HANDOFF.md` sentinel) plus the `migrate/1` dispatch table; readers reject `version > current` with `{:error, {:unsupported_version, n}}`. |
+| `Athanor.Store.Tokens` | module | Heuristic token estimation (~4 bytes/token + per-message framing) used as the compaction trigger, since `Athanor.LLM` discards the provider `usage` frame. |
+| `Athanor.Store.Handoff` | module | Pure `HANDOFF.md` builder/renderer/parser (`build/2`, `render/2`, `parse/1`, `to_summary_text/1`) and the atomic `write/3` (tmp + `datasync` + `rename`). |
+| `Athanor.Store.Compactor` | module | Pure compaction policy: `should_compact?/2` (threshold + hysteresis, caller-supplied latch), `cut_index/2` (C5: snaps back to a `user` boundary so no `tool_calls`/`tool` pair is split), `compact/2`. Deterministic summary; `:summarizer_fn` is the seam for a future LLM one. |
+| `Athanor.Store.Recorder` | `GenServer` | The single writer: `:permanent` singleton in the supervision tree, subscribed to `"deck:events"`, turns the event firehose into transcript records and `meta.json` updates. |
+
+### On-disk layout
+
+```text
+~/.athanor/                                    # root: Athanor.Config.home/0 — ATHANOR_HOME, then
+├── sessions/                                  #   :athanor, :home, then ~/.athanor; a per-call
+│   └── <session_id>/                          #   `root:` option overrides everything (0700 dirs)
+│       ├── meta.json                          # session metadata; atomic replace (tmp + datasync + rename)
+│       ├── transcript.jsonl                   # append-only JSON Lines, one record per line
+│       └── HANDOFF.md                         # rolling structured summary; atomic replace
+```
+
+- The directory name **is** the Athanor session id (a `[a-z0-9_-]` string — `Athanor.SessionId`),
+  so no id can escape the sessions root. The OpenCode Go `x-opencode-session` value lives *inside*
+  `meta.json` as `"session_id"`.
+- `meta.json` is written **before** the first transcript record (`Store.ensure_session/2`), so a
+  session directory is never "transcript without metadata"; `Store.list/1` globs `*/meta.json`, so a
+  half-created directory is simply invisible and one corrupt session never aborts a sweep.
+- Each `transcript.jsonl` record is one JSON object:
+  `%{"v" => 1, "seq" => 7, "ts" => …, "session_id" => id, "kind" => …, "payload" => …}`, where
+  `kind ∈ user | assistant | tool | status | event | compaction | resume | checkpoint` and, for
+  `user`/`assistant`/`tool`, `payload` is the **exact** message map. `seq` is per-session and
+  monotonic, and a reopened append handle first repairs a torn tail — completing a final fragment
+  that still parses as a record, truncating away one that does not — so the next record can never be
+  spliced onto a fragment and turned into an *interior* malformed line.
+
+### The write path — the Recorder is the only writer
+
+`Athanor.Agent` owns `state.messages` and publishes every message it appends through the single
+`record_messages/2` choke point, calling `Athanor.Bus.publish_message/3`, which broadcasts
+`{:message, id, msg}` on `"deck:events"` — the same topic, no new subscription. `Athanor.Store.Recorder`
+consumes that firehose and writes the files; nothing else touches the sessions tree.
+
+| Event on `"deck:events"` | Recorder effect |
+|---|---|
+| `{:message, id, %{role: "user" \| "assistant" \| "tool"}}` | append a transcript record of that `kind` with the exact message map as payload |
+| `{:message, id, %{role: "system"}}` | dropped — `Athanor.Agent.init/1` re-derives exactly one on resume |
+| `{:agent_event, id, {:session_started, meta}}` | create the session directory + `meta.json` (idempotent) |
+| `{:agent_event, id, {:status, s}}` | update `meta.json#last_status`, debounced 500 ms (flushed on `terminate/2`) |
+| `{:agent_event, id, {:error, r}}` / `{:agent_event, id, :cancelled}` | `kind: "event"` audit record + `last_status: "error"`, written through immediately |
+| `{:agent_event, id, {:child_done, report}}` | `kind: "event"` audit record |
+| `{:agent_event, id, {:compaction, %{summary: _, kept: _, dropped: _}}}` | `kind: "compaction"` marker + `HANDOFF.md` rewrite + `meta.json#compaction` bump |
+| `{:agent_event, id, {:resume, %{from: v}}}` | `kind: "resume"` marker |
+| `{:text_delta, _}`, `{:tool_start, _}`, `{:tool_end, _}`, `{:user_message, _}`, `{:turn_complete, _}` | dropped (deltas would write one line per token) |
+
+- **One writer per file** is what makes ordering trivial: append-only JSONL plus an atomic
+  `meta.json` replace means a crash can at worst truncate the transcript's final line, which
+  load-back tolerates. Nothing on the write path raises — an unencodable event or an I/O error is
+  logged and dropped, because a crash-looping firehose consumer would exhaust the supervisor's
+  restart budget and take the tree down with it.
+- The Recorder is `restart: :permanent`, placed **last** in `Athanor.Application`'s children so every
+  other subsystem can publish before it listens, and it subscribes to `"deck:events"` **exactly
+  once** (`Athanor.PubSub` is a `:duplicate` `Registry`, so a second subscribe would double-write).
+- It **never reads `state.messages` back**; the transcript is the source of truth and `meta.json` a
+  cache. Its `stats/1` call reports per-session `seq`, record and `meta.json` counts as a barrier for
+  tests.
+- Persistence is disabled by `ATHANOR_STORE=0` / `config :athanor, store_enabled: false`, and
+  `Athanor.Application` starts the singleton `enabled: false` under `mix test` — decided at
+  **runtime** (`MIX_ENV` / `Code.ensure_loaded?(Mix)`), never by a compile-time `Mix.env()`, so a
+  shared `MIX_BUILD_PATH` cannot bake in the wrong environment. A disabled Recorder still subscribes
+  but writes nothing; tests that need real persistence start their own anonymous instance with an
+  explicit `root:`.
+
+### Resume
+
+`Athanor.Orchestrator` owns rehydration, and the **daemon** performs it (the daemon owns the
+Recorder, so a TUI client never reads or writes the Store itself).
+
+| Entry point | Behaviour |
+|---|---|
+| `Orchestrator.resume_all/1` | `Store.list/1` discovery, then a topological spawn order — conductors first, then a depth-first walk of the `parent_id` forest — so a child is spawned only *after* the parent it names. Returns `{:ok, ids, skipped}`, where `skipped` carries `%{id:, reason:}` for directories that could not be read or spawned. |
+| `Orchestrator.resume_session/2` | Single-session form; `{:error, :not_found}` for an unknown id, `{:error, {:unsupported_version, n}}` for a too-new `meta.json`. |
+| `Daemon.resume_all/2` / `Daemon.resume_session/2` | Thin `:erpc` wrappers the CLI and TUI call; `ensure_main_conductor_and_hydrate/2` routes `resume: true` / `session: "<id>"` to them (an explicit `--session` beats a blanket `--resume`), and a resume that matches nothing on disk falls back to a fresh `conductor-main`. |
+| `Mix.Tasks.Athanor` / `Mix.Tasks.Athanor.Daemon` | `--resume` and `--session <id>` (two flags, because `OptionParser` cannot express `--resume [id]`); the resume request travels with `--restart`, since the restart re-initialises the daemon. |
+| `Athanor.TUI` | `/resume` lists what is on disk (`Store.list/1`, no daemon round trip); `/resume <id>` rehydrates one session on the daemon and hydrates its viewport. A failed resume shows a banner and keeps a fresh Conductor rather than crashing the UI. |
+
+The restoration itself is deliberately conservative:
+
+- the working set is rebuilt from the transcript's `user`/`assistant`/`tool` records in `seq` order,
+  and passed to `Orchestrator.spawn_session/1` **pre-seeded** as `messages:`; `system` is *not*
+  restored, because `Athanor.Agent.init/1` re-derives exactly one from the role;
+- sessions come up **`:idle`** with `current_task: nil` and **no prompt is ever dispatched** —
+  resume restores history, it never re-runs an interrupted turn; a `{:resume, %{from: version}}`
+  event is published so the Recorder leaves a marker in the transcript;
+- parent links resolve because the ordering is parents-before-children, so a child's
+  `"conductor:<parent_id>:children"` topic and `Orchestrator.lookup/1` both work on arrival.
+
+### Compaction
+
+The Agent owns `state.messages`, so it owns the *trigger*: at the end of a text turn — never
+mid-stream and never mid-tool-loop, where an `assistant(tool_calls)` message is still awaiting its
+`tool` results — it asks `Compactor.should_compact?/2`. If the estimate (plus a reserve) exceeds
+`Config.compaction_threshold/0` × `Config.context_limit_tokens/0`, `Compactor.compact/2` cuts back to
+the nearest `user` message that fits `compaction_keep_fraction/0` of the window (C5), replaces the
+dropped prefix with one deterministic summary message, and publishes
+`{:compaction, %{summary:, kept:, dropped:}}`. A hysteresis latch (`:compacted?`, held by the Agent
+because the Compactor is pure) stops a session near the boundary from compacting every turn.
+
+`Athanor.Store.Recorder` then persists the outcome in three separate, each-atomic steps: append the
+`kind: "compaction"` transcript marker, re-render `HANDOFF.md` from `meta.json` **plus the complete
+transcript on disk** (never from the already-compacted working set, which no longer holds the dropped
+turns), and bump `meta.json#compaction` to `%{count, last_at, transcript_bytes}`. The transcript is
+**never** truncated — only the in-memory working set and `HANDOFF.md` shrink.
+
+---
+
+## 13. Future Work & Open Questions
+
+The realised system above covers design §1–§5 (philosophy, session taxonomy, PubSub, tools and TUI),
+§7.4 (`Athanor.Store` — §12) and §7.7. The rest of design §7 is **planned, not implemented** — no
+supporting module exists in `lib/`:
 
 | design § | Feature | Status |
 |---|---|---|
 | 7.1 | Git worktree isolation (`Athanor.Worktree`) | Not implemented. `launch_subagent` has no `worktree` argument. |
 | 7.2 | Goal-driven autonomy (`Athanor.Goal` / `Verifier` / `GoalManager`) | Not implemented. Plan lives at `docs/plans/7.2-goal-driven-autonomy.md`. |
 | 7.3 | Watchers / external channels (`Athanor.Watcher`) | Not implemented. |
-| 7.4 | Session history, resume & compaction (`Athanor.Store`) | Not implemented. Session state is in-memory only; there is no `~/.athanor/sessions`, no `--resume`, and no transcript log. |
+| 7.4 | Session history, resume & compaction (`Athanor.Store`) | **Implemented ("Resume v1")** — see §12. Deferred: transcript rotation, provider-`usage`-based token accounting, live migration between nodes, LLM-written `HANDOFF.md` summaries. |
 | 7.5 | Hierarchical memory (`Athanor.Memory`) | Not implemented. No `remember`/`recall` tools. |
 | 7.6 | `glob`/`grep`, tool guard, MCP client (`Athanor.MCP`) | Not implemented. Tool set is exactly the eight tools in §3. |
 | 7.7 | Persistent daemon & remote attach (`Athanor.Daemon`) | **Partly implemented** — see §9. Not implemented: systemd/auto-install, an `:ssh.daemon/2` subsystem, a standalone `athanor attach` binary; the node is named `athanor_daemon@127.0.0.1` rather than design's `athanor@127.0.0.1`. |
@@ -337,9 +492,11 @@ These cannot be answered from the code alone and are flagged rather than guessed
    worker turn, while design §1.3/§2.2 describes a sentinel-gated completion. Is the per-turn wakeup
    intentional (a Conductor wants each sub-agent turn) or should it be gated on
    `parse_done_sentinel/1`?
-2. **ID uniqueness.** `Orchestrator.generate_id/1` derives the counter from `Registry.count/1`, which
-   is racy under concurrent spawns. Callers currently pass explicit ids in the places that matter
-   (tests, `"conductor-main"`). Should id generation be made collision-proof?
+2. **~~ID uniqueness.~~ _Resolved._** Ids now come from `Athanor.SessionId.generate/1`
+   (`:erlang.unique_integer/1` + 4 random bytes, `[a-z0-9_-]` only), `spawn_session/1` retries a
+   bounded number of times, and a duplicate or invalid id is refused rather than started
+   unregistered (`{:duplicate_session_id, id}` / `{:invalid_session_id, id}`). There is no
+   `Orchestrator.generate_id/1` derived from `Registry.count/1` any more.
 3. **`mix athanor --local`.** The in-process mode bypasses the daemon and therefore loses
    multi-client mirroring and detach-safety. Is it a supported long-term mode or a debugging aid?
 4. **Placeholder module.** `Athanor.hello/0` still exists (and is doctested). Keep or remove?

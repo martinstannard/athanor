@@ -9,6 +9,10 @@ on the machine.
 > (`.claude/`) are **gitignored** at the repo root, so issues are machine-local and
 > are not shared by committing. Cross-machine coordination is handled separately by
 > the git-branch-backed **locks** mechanism (see [Multi-agent locks](#multi-agent-locks)).
+>
+> **Back it up.** With no `git remote` configured, the seeded roadmap in
+> `.chainlink/issues.db` — and the repo itself — exist on one disk only. Back up the
+> DB (or `chainlink export -f json`) and push to a remote. See `docs/handover.md` §1.
 
 ---
 
@@ -235,3 +239,16 @@ Each issue's description points at the corresponding detailed plan under
 **Recommended build order** (design §9.3): 1) #5 Store → 2) #2 Worktrees →
 3) #3 Goals → 4) #6 Memory → 5) #7 Tool guard + MCP → 6) #4 Watchers → 7) #9 Cluster.
 Steps 2 and 5 are independent and parallelisable.
+
+Also tracked: **#12** the per-turn `child_done` wakeup bug (blocks #3; design §8 OQ1)
+and **#13** the detached daemon's missing log file.
+
+A second epic covers **external agent interoperability** (distinct from the
+BEAM-native §7 roadmap):
+
+- **#14** *(epic)* Add external agent interoperability
+  - **#15** agent-deck integration (CLI/JSON + cross-orchestrator session bridge)
+  - **#16** Claude Code as a sub-agent backend ("claude controller" sub-agent)
+
+For the current pause-state, module gotchas, open decisions and verification
+commands, see [`docs/handover.md`](handover.md).

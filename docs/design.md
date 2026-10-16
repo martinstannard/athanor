@@ -4,7 +4,9 @@
 
 Unlike traditional single-threaded CLI agents or tmux-wrappers that stitch external processes together with shell scripts and polling, Athanor treats **Conductors**, **Sub-Agents (Workers)**, **Verifiers**, **Watchers**, and the **Terminal UI** as lightweight, supervised BEAM processes communicating over **PubSub** (`Athanor.Bus`).
 
-> *Implemented today:* Conductors, Sub-Agents (Workers) and the Terminal UI. **Verifiers** (§7.2) and **Watchers** (§7.3) are part of the target architecture and do not exist in the code yet.
+> *Implemented today:* Conductors, Sub-Agents (Workers), the Terminal UI, and session
+> persistence/resume (§7.4 `Athanor.Store`). **Verifiers** (§7.2) and **Watchers** (§7.3) are part of
+> the target architecture and do not exist in the code yet.
 
 ---
 
@@ -167,11 +169,15 @@ Assistant output is rendered through `Athanor.Markdown`, so headings, lists, cod
 
 ## 7. Future Plans
 
-> **Status legend (verified against `lib/` at commit `fa3bd3b`):** §7.1, §7.2, §7.3, §7.5 and §7.8 are
-> **planned, not implemented** — no supporting module exists in `lib/`. §7.4 is **planned**. §7.6 is
-> **partly implemented**: `glob` and `grep` shipped (`Athanor.Tools.{Glob,Grep,Ignore}`); the tool
-> guard and the MCP client do not exist. §7.7 is **partly implemented** as `Athanor.Daemon`. Each
-> heading below is annotated accordingly.
+> **Status legend (verified against `lib/` at commit `fa3bd3b`, plus the §7.4 work in the working
+> tree):** §7.1, §7.2, §7.3, §7.5 and §7.8 are **planned, not implemented** — no supporting module
+> exists in `lib/`. **§7.4 is implemented ("Resume v1")**: `Athanor.Store` plus its seven
+> sub-modules persist, resume and compact sessions (see the *Implemented subset* note under §7.4);
+> deferred are transcript rotation, provider-`usage`-based token accounting, live migration
+> between nodes, and LLM-written `HANDOFF.md` summaries. §7.6 is **partly implemented**: `glob` and
+> `grep` shipped (`Athanor.Tools.{Glob,Grep,Ignore}`); the tool guard and the MCP client do not
+> exist. §7.7 is **partly implemented** as `Athanor.Daemon`. Each heading below is annotated
+> accordingly.
 
 ### 7.1 Git Worktree Isolation (`Athanor.Worktree`) — *planned*
 - When a Conductor spawns multiple coding sub-agents in parallel, editing the same working directory causes git index and file conflicts.
@@ -191,10 +197,42 @@ Event-driven OTP GenServers ("doorbells, not messengers") that listen for extern
 - **GitHub / CI Watcher**: Polls or receives webhooks for PR review comments and CI failures, waking the responsible Conductor to spawn a fix worker.
 - **Remote Chat Channels (Telegram / Slack / Discord)**: Pairs 1-to-1 with a specific Conductor via PubSub so you can message your Conductor and receive escalations from your phone.
 
-### 7.4 Session History, Resumability & Context Compaction (`Athanor.Store`) — *planned*
-> Implementation plan: `docs/plans/7.4-session-history-resumability.md` (status: proposed, not implemented).
-> Nothing is persisted today: session state (including message history) lives only in the live
-> `Athanor.Agent` process. There is no `~/.athanor/sessions`, no `--resume`, and no transcript log.
+### 7.4 Session History, Resumability & Context Compaction (`Athanor.Store`) — *implemented (Resume v1)*
+
+> **Implemented subset** — modules: `Athanor.Store` (facade: paths, `ensure_session/2`, `load/2`,
+> `load_records/2`, `list/1`, `delete/2`, version check; `reconcile/1` is a documented
+> `{:error, :not_implemented}` stub) plus `Athanor.Store.{Session,Transcript,Tokens,Schema,Handoff,
+> Compactor,Recorder}`. On-disk layout: `~/.athanor/sessions/<id>/{meta.json,transcript.jsonl,
+> HANDOFF.md}` — root from `Athanor.Config.home/0` (`ATHANOR_HOME` → `:athanor, :home` →
+> `~/.athanor`, per-call `root:` overrides), directories chmod `0700`, `meta.json` replaced
+> atomically (tmp + `datasync` + rename), `transcript.jsonl` append-only (one complete line +
+> `datasync` per record; a torn final line is repaired when the handle reopens — completed if it
+> still parses, truncated away if not). Write path: `Athanor.Agent` publishes every
+> *exact* appended message via `Bus.publish_message/3` as `{:message, id, msg}` on `"deck:events"`,
+> and `Athanor.Store.Recorder` — a `:permanent` singleton and the **only** writer — persists it
+> (`system` messages are dropped and re-derived on resume; `{:status, _}` is debounced 500 ms;
+> `{:error, _}`/`:cancelled` are written through; `ATHANOR_STORE=0` disables persistence, and the
+> singleton boots `enabled: false` under `mix test`). Resume: `Orchestrator.resume_all/1` /
+> `resume_session/2` re-create sessions via `spawn_session/1` with a `:messages` pre-seed,
+> parents-before-children (topological), each restored session comes up **`:idle`** and an
+> interrupted turn is **never re-run** (a `{:resume, from}` marker is recorded instead). Surfaces:
+> `mix athanor --resume` / `--session <id>`, `mix athanor.daemon --resume` / `--session <id>`,
+> `Daemon.resume_all/2` + `Daemon.resume_session/2` (`:erpc`), TUI `/resume <id>` (bare `/resume`
+> lists what is resumable). Compaction: the Agent's post-turn trigger → `Athanor.Store.Compactor`
+> (C5 user-boundary cut + hysteresis, deterministic summary) → `{:compaction, %{summary, kept,
+> dropped}}` → Recorder rewrites `HANDOFF.md` from `meta.json` + the on-disk transcript, appends a
+> `kind: "compaction"` marker and bumps `meta.json#compaction` — the transcript is **never**
+> truncated.
+> **Deferred:** transcript rotation (multi-file parts), provider-`usage`-based token accounting
+> (`Athanor.LLM` still discards the `usage` frame; `Athanor.Store.Tokens` is a ~4-bytes-per-token
+> heuristic), live migration of a session between nodes, and LLM-generated `HANDOFF.md` summaries.
+
+> Implementation plan: `docs/plans/7.4-session-history-resumability.md` (**implemented, M1–M5; M6
+> hardening partly open** — `Store.reconcile/1` is still a stub).
+> *As originally written:* nothing is persisted — session state (including message history) lives
+> only in the live `Athanor.Agent` process, there is no `~/.athanor/sessions`, no `--resume`, and no
+> transcript log. **That is no longer the state of the code** — see the *Implemented subset* note
+> above; the prose below is kept as the original design rationale.
 To ensure Athanor can restart cleanly without losing in-progress work or re-learning context from scratch:
 - **Append-Only Session Transcripts (`~/.athanor/sessions/<session_id>/`)**:
   - `meta.json` — Session metadata (`id`, `title`, `role`, `parent_id`, `model`, `cd`, `session_id` for OpenCode Go, timestamps, and last status).
@@ -277,8 +315,15 @@ Decisions the code cannot settle on its own (kept here so the docs do not silent
    multi-client mirroring and detach-safety. Supported long-term, or a debugging aid?
 4. **Daemon naming.** §7.7 writes `athanor@127.0.0.1`; the implementation uses
    `athanor_daemon@127.0.0.1`. Reconcile the doc, or rename the node?
-5. **Store/`config` conventions.** There is no `config/` directory and no persistence layer. Should
-   §7.4/§7.5 introduce one, or continue the `Athanor.Config` module-attribute + env-var idiom?
+5. **~~Store/`config` conventions.~~ _Settled._** §7.4 shipped with **no `config/` directory**: the
+   Store root, the enable switch and the compaction knobs are all `Athanor.Config` module
+   attributes + `Application.get_env(:athanor, …)` + env vars (`ATHANOR_HOME`, `ATHANOR_STORE`,
+   `ATHANOR_COMPACTION_THRESHOLD`, `ATHANOR_CONTEXT_LIMIT_TOKENS`,
+   `ATHANOR_COMPACTION_KEEP_FRACTION`), with a per-call `root:` override as the injection seam.
+   The one place `Mix.env/0` was tempting (disabling the Recorder under `mix test`) is resolved at
+   **runtime** (`MIX_ENV` / `Code.ensure_loaded?(Mix)`) precisely so a shared `MIX_BUILD_PATH`
+   cannot bake the wrong environment in. §7.5 should continue the idiom unless a real reason for
+   `config/` appears.
 
 ---
 
@@ -297,6 +342,11 @@ re-derived later if priorities change.
    whole message history) lives only in the live `Athanor.Agent` process; the daemon's own
    `fetch_full_sessions/1` already reconstructs a session tree and transcript *in memory* — so the
    data model for persistence already exists and simply isn't written down anywhere.
+
+> *Status note:* this section and §9.3–§9.7 are the **pre-implementation rationale** and are kept
+> for that reason. Their premise no longer holds — §7.4 has shipped, so a restart is no longer
+> destructive (`mix athanor.daemon --restart` now loses nothing — `--resume` rehydrates it). Item 1
+> of §9.3 is done, so the sequence starts at item 2.
 
 That combination makes §7.4 the highest-value next step, and it happens to be the stated goal:
 *shut down, come back, and find your Conductors, Sub-Agents and transcripts intact.*
@@ -342,6 +392,13 @@ the first step with a hard "must be after" edge in both directions.
 - **It is independently valuable.** Even if 7.2/7.5/7.8 never get built, resume stands on its own.
 
 ### 9.5 The minimum Store slice ("Resume v1")
+
+> *Delivered.* This slice **shipped** — `meta.json`, append-only `transcript.jsonl` write-through on
+> turn boundaries, load-back at daemon start, `--resume` / `--session <id>` / `/resume <id>`, and
+> `:idle` neutralisation are all in the code (see the §7.4 *Implemented subset* note). Two rows of
+> the "Deferred" column below did **not** ship and stay deferred: **live migration between nodes**
+> and **LLM-written `HANDOFF.md` summaries** — `HANDOFF.md` itself *did* ship, but from a
+> deterministic renderer, not an LLM.
 
 Deliberately **not** the whole of §7.4 — compaction ("HANDOFF.md") is the part that needs an LLM in
 the loop and should land later.
@@ -422,11 +479,14 @@ idiom for moving around a session list.
 | `tmux ls` | `mix athanor.daemon --status` |
 | survives an SSH drop | yes — the relay dies with the client, the agents do not |
 | session-list navigation | `Tab` focuses the deck; `j`/`k` + `Enter` navigate |
-| **survives a reboot** | **no — nothing is persisted** |
+| **survives a reboot** | **yes now — §7.4 persists transcripts**, so `mix athanor --resume` brings the session tree back |
 | `attach -t`, `rename-session`, `kill-session` | **no** |
 | one input per session | **no — every attached client can prompt the same agent** |
 
 ### 10.2 The prerequisite is §7.4
+
+> *Status note:* §7.4 **has** landed, so the prerequisite below is satisfied — the remaining work is
+> the naming/verb surface and the writer lock, not the durability itself.
 
 tmux itself only survives *client* detach; without a resurrect-style plugin it loses everything on a
 machine restart. So "tmux-like" and the §9 goal are the same goal: **persistence is what makes
@@ -519,7 +579,7 @@ lock holder should be visible in the status bar.
 
 Suggested order: land §7.4 first (it is §9's step 1 anyway), then the naming and verb surface, then
 the writer lock. The verbs are a good "while you're in there" addition to the §7.7 daemon surface
-rather than a reason to reorder §9.
+rather than a reason to reorder §9. *(§7.4 is done — start with the naming and verb surface.)*
 
 ### 10.9 Open questions
 
