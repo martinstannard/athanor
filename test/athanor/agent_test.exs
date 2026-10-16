@@ -552,7 +552,10 @@ defmodule Athanor.AgentTest do
     end
 
     test "the rebuilt system message is the one derived at init", %{tmp_dir: tmp_dir} do
-      {:ok, agent} = Agent.start_link(cd: tmp_dir, system_prompt: "You are a test prompt.")
+      # `project_context: false` keeps this a test of /clear, not of AGENTS.md injection: the
+      # temp dir sits inside this repo, whose own AGENTS.md would otherwise be composed in.
+      {:ok, agent} =
+        Agent.start_link(cd: tmp_dir, system_prompt: "You are a test prompt.", project_context: false)
 
       assert :ok = Agent.clear_context(agent)
 
@@ -914,6 +917,101 @@ defmodule Athanor.AgentTest do
       assert_receive {:agent_event, {:turn_complete, "second answer"}}
     end
   end
+
+  # --- project instructions (AGENTS.md, #33) ---------------------------------------------
+
+  describe "project instructions (AGENTS.md)" do
+    test "both roles get the sentinel and the file body", %{tmp_dir: tmp_dir} do
+      repo = Path.join(tmp_dir, "repo")
+      File.mkdir_p!(Path.join(repo, ".git"))
+      File.write!(Path.join(repo, "AGENTS.md"), "Always use tabs.")
+      worker_cd = Path.join(repo, "lib/deep")
+      File.mkdir_p!(worker_cd)
+
+      for {role, cd, role_prefix} <- [
+            {:conductor, repo, "You are an Athanor Conductor"},
+            {:worker, worker_cd, "You are an Athanor Sub-Agent worker"}
+          ] do
+        {:ok, agent} = Agent.start_link(cd: cd, role: role)
+        assert [%{role: "system", content: content}] = Agent.get_state(agent).messages
+
+        assert String.starts_with?(content, role_prefix)
+        assert content =~ Athanor.ProjectContext.sentinel()
+        assert content =~ "Always use tabs."
+      end
+    end
+
+    test "an absent file leaves the prompt byte-identical to injection being off", %{
+      tmp_dir: tmp_dir
+    } do
+      # A fake checkout boundary keeps the walk from escaping into this very repo's AGENTS.md.
+      File.mkdir_p!(Path.join(tmp_dir, ".git"))
+
+      {:ok, plain} = Agent.start_link(cd: tmp_dir)
+      {:ok, off} = Agent.start_link(cd: tmp_dir, project_context: false)
+
+      [%{content: plain}] = Agent.get_state(plain).messages
+      [%{content: off}] = Agent.get_state(off).messages
+
+      assert plain == off
+      refute plain =~ Athanor.ProjectContext.sentinel()
+    end
+
+    test "project_context: false suppresses injection", %{tmp_dir: tmp_dir} do
+      File.mkdir_p!(Path.join(tmp_dir, ".git"))
+      File.write!(Path.join(tmp_dir, "AGENTS.md"), "SECRET CONVENTION")
+
+      {:ok, agent} = Agent.start_link(cd: tmp_dir, project_context: false)
+      [%{content: content}] = Agent.get_state(agent).messages
+
+      refute content =~ "SECRET CONVENTION"
+      refute content =~ Athanor.ProjectContext.sentinel()
+    end
+
+    test "resume drops the seeded system message and rebuilds it from AGENTS.md", %{
+      tmp_dir: tmp_dir
+    } do
+      File.mkdir_p!(Path.join(tmp_dir, ".git"))
+      File.write!(Path.join(tmp_dir, "AGENTS.md"), "Resumed convention")
+
+      history = [
+        %{role: "system", content: "STALE PROMPT"},
+        %{role: "user", content: "hello"}
+      ]
+
+      {:ok, agent} = Agent.start_link(cd: tmp_dir, messages: history)
+      messages = Agent.get_state(agent).messages
+
+      assert [%{role: "system", content: content} | rest] = messages
+      assert content =~ Athanor.ProjectContext.sentinel()
+      assert content =~ "Resumed convention"
+      assert rest == tl(history)
+      assert Enum.count(messages, &(&1.role == "system")) == 1
+    end
+
+    test "/clear rebuilds the same project-injected prompt without re-reading the file", %{
+      tmp_dir: tmp_dir
+    } do
+      File.mkdir_p!(Path.join(tmp_dir, ".git"))
+      path = Path.join(tmp_dir, "AGENTS.md")
+      File.write!(path, "Original convention")
+
+      {:ok, agent} = Agent.start_link(cd: tmp_dir)
+      [%{content: before_clear}] = Agent.get_state(agent).messages
+
+      File.write!(path, "Changed on disk")
+
+      assert :ok = Agent.clear_context(agent)
+      assert [%{role: "system", content: after_clear}] = Agent.get_state(agent).messages
+
+      # Stable within a session: the file is read at init only.
+      assert after_clear == before_clear
+      refute after_clear =~ "Changed on disk"
+    end
+  end
+
+  # --- project instructions env toggle (#33) lives in its own `async: false` module because it
+  # mutates process-global environment (see `Athanor.ProjectContextEnvTest`).
 
   # -- compaction test fixtures ------------------------------------------------------------
 

@@ -8,6 +8,8 @@ defmodule Athanor.Config do
   @default_theme :default
   @default_search_max_results 200
   @default_search_max_file_bytes 1_048_576
+  @default_project_context_enabled true
+  @default_project_context_max_bytes 1_048_576
   @default_home "~/.athanor"
   @default_store_enabled true
   @default_recorder_max_open_fds 64
@@ -466,6 +468,49 @@ defmodule Athanor.Config do
   def worktree_branch_prefix do
     System.get_env("ATHANOR_WORKTREE_BRANCH_PREFIX") ||
       Application.get_env(:athanor, :worktree_branch_prefix, @default_worktree_branch_prefix)
+  end
+
+  # -- project context (AGENTS.md, #33) --------------------------------------------------
+
+  @doc """
+  Whether `Athanor.Agent` injects a project's `AGENTS.md` into the system prompt
+  (default `#{@default_project_context_enabled}`).
+
+  `ATHANOR_PROJECT_CONTEXT=0` (or `"false"`) disables injection, as does
+  `config :athanor, project_context: false`. Mirrors `store_enabled?/0`'s toggle shape — the
+  whole point is a single switch a user can throw when a repo's instructions are unhelpful or
+  untrusted, without editing code. An explicit `:project_context` init option on the Agent wins
+  over this value.
+  """
+  @spec project_context_enabled?() :: boolean()
+  def project_context_enabled? do
+    case System.get_env("ATHANOR_PROJECT_CONTEXT") do
+      nil ->
+        Application.get_env(:athanor, :project_context, @default_project_context_enabled) != false
+
+      value ->
+        normalised = value |> String.trim() |> String.downcase()
+        normalised not in ["0", "false", "no", "off"]
+    end
+  end
+
+  @doc """
+  Maximum number of bytes of an `AGENTS.md` that `Athanor.ProjectContext` will inject
+  (default `#{@default_project_context_max_bytes}`).
+
+  Follows the `search_max_file_bytes/0` idiom — the file is human-authored and can hold the
+  whole repo's conventions, but it is still bounded so a pathological file cannot blow the
+  context window before compaction ever runs. Over-limit content is truncated with a visible
+  marker, never silently. Overridable via `ATHANOR_PROJECT_CONTEXT_MAX_BYTES` or
+  `:athanor, :project_context_max_bytes`.
+  """
+  @spec project_context_max_bytes() :: pos_integer()
+  def project_context_max_bytes do
+    positive_int(
+      "ATHANOR_PROJECT_CONTEXT_MAX_BYTES",
+      :project_context_max_bytes,
+      @default_project_context_max_bytes
+    )
   end
 
   defp boolean_env(env, key, default) do

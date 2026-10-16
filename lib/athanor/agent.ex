@@ -60,6 +60,16 @@ defmodule Athanor.Agent do
   turn boundary, a retained queue would otherwise sit stranded until some later turn finished.
   `clear_prompt_queue/1` drops the pending queue on its own, leaving the in-flight turn alone.
 
+  ## Project instructions (`AGENTS.md`, #33)
+
+  The effective system prompt is the role prompt plus the nearest `AGENTS.md` above the session's
+  `cd` (walking up, stopping at the `.git` boundary), wrapped in the `Athanor.ProjectContext`
+  sentinel. Both roles get it — a Conductor rooted at the repo and a worker whose `cd` is a
+  subdirectory or a git worktree. Disable it per session with `project_context: false` or
+  globally with `ATHANOR_PROJECT_CONTEXT=0`. The file is read **once** at init and kept in
+  `state.system_prompt`; `/clear` rebuilds from that same text rather than re-reading the file,
+  so the session's conventions do not change underfoot (see `ProjectContext`).
+
   ## Context reset (`:clear_context`)
 
   `/clear` in the TUI (and `clear_context/1` here) wipes a session's conversation context **in
@@ -87,7 +97,7 @@ defmodule Athanor.Agent do
 
   require Logger
 
-  alias Athanor.{Bus, Config, LLM, SessionId, Tools}
+  alias Athanor.{Bus, Config, LLM, ProjectContext, SessionId, Tools}
   alias Athanor.Store.{Compactor, Tokens}
 
   @default_max_turns 100
@@ -275,9 +285,9 @@ defmodule Athanor.Agent do
         :worker -> @default_worker_prompt
       end
 
-    system_prompt = Keyword.get(opts, :system_prompt, default_prompt)
     model = Keyword.get(opts, :model, Config.model())
     cd = Keyword.get(opts, :cd, File.cwd!())
+    system_prompt = compose_system_prompt(Keyword.get(opts, :system_prompt, default_prompt), cd, opts)
     max_turns = Keyword.get(opts, :max_turns, @default_max_turns)
     notify_parent = Keyword.get(opts, :notify_parent_on_done, parent_id != nil)
 
@@ -546,6 +556,32 @@ defmodule Athanor.Agent do
   end
 
   # Internal Helpers
+
+  # Composes the effective system prompt for this session: the role prompt plus the nearest
+  # project's `AGENTS.md`, wrapped in `ProjectContext.sentinel/0` so the injected text is
+  # identifiable in the transcript and cannot be read as part of the role prompt. The file is
+  # read **once**, at init: `state.system_prompt` is what `/clear` rebuilds from
+  # (`reset_context/1`), so conventions stay stable for the life of a session and are re-read
+  # only on a new session or a daemon restart. Re-reading on every `/clear` would swap the
+  # instructions mid-conversation without the transcript recording why. Absent or empty file =
+  # no sentinel, no trailing separators: the prompt is byte-identical to the literal.
+  defp compose_system_prompt(role_prompt, cd, opts) do
+    if project_context_enabled?(opts) do
+      case ProjectContext.load(cd) do
+        {:ok, body} -> role_prompt <> "\n\n" <> ProjectContext.sentinel() <> "\n" <> body
+        :none -> role_prompt
+      end
+    else
+      role_prompt
+    end
+  end
+
+  # The init option wins over `ATHANOR_PROJECT_CONTEXT`/`:athanor, :project_context`, so a caller
+  # that knows better can force either direction per session; the config accessor is the global
+  # default.
+  defp project_context_enabled?(opts) do
+    Keyword.get(opts, :project_context, Config.project_context_enabled?()) != false
+  end
 
   # Builds the initial working set: a freshly derived `system` message followed by any
   # pre-seeded history (C3). The system message is never persisted (C13), so a resumed session
