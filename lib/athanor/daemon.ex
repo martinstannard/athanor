@@ -170,6 +170,71 @@ defmodule Athanor.Daemon do
   def reachable?(node), do: Node.connect(node) == true
 
   @doc """
+  Classifies what is currently on `target`'s node name.
+
+    * `:online` — reachable, compatible, supervision tree up
+    * `:registered_but_unreachable` — the name is registered with `epmd`, but we cannot talk to it:
+      almost always a **different distribution cookie** (or a different build). Nothing can be
+      started under that name until it goes away, so callers must report it rather than spawn a
+      second daemon that cannot bind the name.
+    * `:not_running` — nothing there
+
+  `:registered` and `:online` can be injected so the decision is testable without a live node.
+  """
+  @spec classify(node(), keyword()) :: :online | :registered_but_unreachable | :not_running
+  def classify(target, opts \\ []) do
+    online? = Keyword.get_lazy(opts, :online, fn -> usable?(target) end)
+    registered? = Keyword.get_lazy(opts, :registered, fn -> registered?(target) end)
+
+    cond do
+      online? -> :online
+      registered? -> :registered_but_unreachable
+      true -> :not_running
+    end
+  end
+
+  @doc """
+  True when a node with `target`'s name is registered with `epmd`.
+
+  This is what separates "the daemon is not running" from "the daemon is running but will not answer
+  us" — `Node.connect/1` returns `false` for both, which is why a cookie mismatch used to be
+  reported as "not running" and then chased with a doomed restart (issue #27).
+  """
+  @spec registered?(node()) :: boolean()
+  def registered?(target) do
+    target |> Atom.to_string() |> String.split("@") |> List.first() |> epmd_has_name?()
+  end
+
+  @doc """
+  Parses the node names out of `epmd -names` output.
+
+  ```
+  epmd: up and running on port 4369 with data:
+  name athanor_daemon at port 44937
+  ```
+  """
+  @spec parse_epmd_names(String.t()) :: [String.t()]
+  def parse_epmd_names(output) when is_binary(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn line ->
+      case String.split(line, " ", trim: true) do
+        ["name", name | _] -> [name]
+        _ -> []
+      end
+    end)
+  end
+
+  defp epmd_has_name?(name) do
+    case System.cmd("epmd", ["-names"], stderr_to_stdout: true) do
+      {output, 0} -> name in parse_epmd_names(output)
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  @doc """
   True when `node` is reachable but is **not** a compatible Athanor daemon — a different build, an
   older release, or an unrelated application squatting the node name.
 
@@ -214,9 +279,7 @@ defmodule Athanor.Daemon do
   end
 
   defp client_node_name do
-    dynamic_atom(
-      "athanor_tui_#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}@127.0.0.1"
-    )
+    dynamic_atom("athanor_tui_#{Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)}@127.0.0.1")
   end
 
   # The single conversion point for the daemon node name, the distribution cookie and this
@@ -255,6 +318,12 @@ defmodule Athanor.Daemon do
         # second node with the same name.
         incompatible?(target) ->
           {:error, {:incompatible_daemon, target}}
+
+        # The name is taken by something we cannot talk to. Spawning a second daemon cannot work
+        # (it cannot bind the name) and the wait then reports a timeout that blames the wrong
+        # process, so fail fast with the real reason instead.
+        auto_start? and registered?(target) ->
+          {:error, {:name_in_use, target}}
 
         auto_start? ->
           start_or_wait(target, Keyword.get(opts, :timeout, 15_000))
@@ -684,6 +753,7 @@ defmodule Athanor.Daemon do
         cond do
           incompatible?(target_node) -> {:error, {:incompatible_daemon, target_node}}
           reachable?(target_node) -> {:error, :daemon_not_ready}
+          registered?(target_node) -> {:error, {:name_in_use, target_node}}
           true -> {:error, :daemon_start_timeout}
         end
 

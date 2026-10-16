@@ -17,8 +17,7 @@ defmodule Athanor.OrchestratorTest do
       {:ok,
        %{
          role: "assistant",
-         content:
-           "Checked 10 files.\n===ATHANOR_DONE=== status=ok summary=All 10 files passed audit",
+         content: "Checked 10 files.\n===ATHANOR_DONE=== status=ok summary=All 10 files passed audit",
          tool_calls: []
        }}
     end

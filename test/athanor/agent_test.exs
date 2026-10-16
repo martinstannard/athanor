@@ -281,8 +281,7 @@ defmodule Athanor.AgentTest do
 
       assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
 
-      assert_receive {:message, "conductor-main",
-                      %{role: "user", content: "What is inside secret.txt?"}}
+      assert_receive {:message, "conductor-main", %{role: "user", content: "What is inside secret.txt?"}}
 
       assert :ok = Agent.cancel(agent)
     end
@@ -293,8 +292,7 @@ defmodule Athanor.AgentTest do
 
       assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
 
-      assert_receive {:message, "conductor-main",
-                      %{role: "assistant", tool_calls: [%{id: "call_1"} = tool_call]}}
+      assert_receive {:message, "conductor-main", %{role: "assistant", tool_calls: [%{id: "call_1"} = tool_call]}}
 
       assert tool_call.function.name == "read_file"
     end
@@ -305,8 +303,7 @@ defmodule Athanor.AgentTest do
 
       assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
 
-      assert_receive {:message, "conductor-main",
-                      %{role: "tool", tool_call_id: "call_1", content: "alchemical_gold"}}
+      assert_receive {:message, "conductor-main", %{role: "tool", tool_call_id: "call_1", content: "alchemical_gold"}}
     end
 
     test "the system message is NEVER published on the wire", %{tmp_dir: tmp_dir} do
@@ -496,8 +493,7 @@ defmodule Athanor.AgentTest do
       assert summary_msg.content =~ "Completed steps"
 
       # (b) the pinned {:compaction, %{summary:, kept:, dropped:}} event rides "deck:events"
-      assert_receive {:agent_event,
-                      {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
+      assert_receive {:agent_event, {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
 
       assert is_binary(summary) and summary =~ "Handoff for"
       assert kept == length(state.messages)
@@ -531,8 +527,7 @@ defmodule Athanor.AgentTest do
 
       assert :ok = Agent.prompt(agent, "follow-up question")
 
-      assert_receive {:agent_event,
-                      {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
+      assert_receive {:agent_event, {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
 
       assert_receive {:agent_event, {:turn_complete, _}}
 

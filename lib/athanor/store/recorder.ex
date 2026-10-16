@@ -728,9 +728,7 @@ defmodule Athanor.Store.Recorder do
         state
 
       not SessionId.valid?(id) ->
-        Logger.warning(
-          "Athanor.Store.Recorder: dropping a record for invalid session id #{inspect(id)}"
-        )
+        Logger.warning("Athanor.Store.Recorder: dropping a record for invalid session id #{inspect(id)}")
 
         state
 

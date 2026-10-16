@@ -930,8 +930,7 @@ defmodule Athanor.Store.Handoff do
       id: str(fetch(payload, :child_id)) || str(fetch(payload, :id)),
       title: str(fetch(payload, :title)),
       status: str(fetch(payload, :status)),
-      last_summary:
-        str(fetch(payload, :last_summary) || fetch(payload, :summary) || fetch(payload, :report))
+      last_summary: str(fetch(payload, :last_summary) || fetch(payload, :summary) || fetch(payload, :report))
     }
   end
 

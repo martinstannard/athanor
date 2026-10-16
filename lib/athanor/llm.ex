@@ -85,14 +85,7 @@ defmodule Athanor.LLM do
             |> Map.get(:sse_acc, initial_acc)
             |> flush_buffer(caller_pid)
 
-          err_text =
-            cond do
-              final_acc.raw_error != "" -> String.trim(final_acc.raw_error)
-              is_binary(resp.body) and resp.body != "" -> String.trim(resp.body)
-              true -> inspect(resp.body)
-            end
-
-          {:error, "HTTP #{status}: #{err_text}"}
+          {:error, "HTTP #{status}: #{response_error(final_acc, resp.body)}"}
 
         {:error, exception} ->
           {:error, Exception.message(exception)}
@@ -129,6 +122,17 @@ defmodule Athanor.LLM do
       end)
 
     %{state_after_lines | buffer: remainder}
+  end
+
+  # A streaming 4xx can arrive with no body at all (the gateway reports an upstream failure), which
+  # used to render as a bare `HTTP 400: ""` and cost real debugging time (issue #27). Say what is
+  # missing and how to obtain it.
+  defp response_error(final_acc, body) do
+    cond do
+      final_acc.raw_error != "" -> String.trim(final_acc.raw_error)
+      is_binary(body) and String.trim(body) != "" -> String.trim(body)
+      true -> "no response body — retry the same request without streaming to see the reason"
+    end
   end
 
   @doc """

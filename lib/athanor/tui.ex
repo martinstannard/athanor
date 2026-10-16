@@ -1091,8 +1091,7 @@ defmodule Athanor.TUI do
 
     cursor_col = String.length(prefix) + String.length(visible_input) + 1
 
-    {styled_prefix <> visible_input <> indicator_padding(tui, width, visible_input, indicator),
-     min(cursor_col, width)}
+    {styled_prefix <> visible_input <> indicator_padding(tui, width, visible_input, indicator), min(cursor_col, width)}
   end
 
   defp indicator_padding(_tui, _width, _visible_input, ""), do: ""
@@ -1392,6 +1391,12 @@ defmodule Athanor.TUI do
     "Stand-alone mode (no daemon). Agents stop when you quit."
   end
 
+  defp mode_banner({:local_fallback, {:name_in_use, node}}, _node) do
+    "Running stand-alone: something is registered as #{node} but not answering (usually a different " <>
+      "distribution cookie). Stop it, then re-run `mix athanor --resume` — agents started now will " <>
+      "stop when you quit."
+  end
+
   defp mode_banner({:local_fallback, reason}, _node) do
     "Daemon unavailable (#{describe_daemon_error(reason)}) — running stand-alone; " <>
       "agents stop when you quit. Fix with `mix athanor.daemon --restart`."
@@ -1399,6 +1404,9 @@ defmodule Athanor.TUI do
 
   defp describe_daemon_error({:incompatible_daemon, node}),
     do: "#{node} is running an older Athanor build"
+
+  defp describe_daemon_error({:name_in_use, node}),
+    do: "#{node} is registered but not answering (different cookie?)"
 
   defp describe_daemon_error(:daemon_start_timeout), do: "daemon did not start in time"
   defp describe_daemon_error(:daemon_not_ready), do: "daemon is still starting up"

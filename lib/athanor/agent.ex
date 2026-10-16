@@ -371,8 +371,7 @@ defmodule Athanor.Agent do
 
   # Child completion event arriving on "conductor:<id>:children"
   def handle_info(
-        {:agent_event, _child_id,
-         {:child_done, %{child_id: cid, title: ctitle, status: cstatus, summary: csummary}}},
+        {:agent_event, _child_id, {:child_done, %{child_id: cid, title: ctitle, status: cstatus, summary: csummary}}},
         %{role: :conductor} = state
       ) do
     msg =

@@ -105,6 +105,39 @@ defmodule Athanor.DaemonTest do
     end
   end
 
+  describe "classify/2 (issue #27)" do
+    test "reports online when the daemon answers" do
+      assert Daemon.classify(:"any@127.0.0.1", online: true, registered: true) == :online
+    end
+
+    test "distinguishes a registered-but-unreachable daemon from one that is not running" do
+      # This is the case that used to read as "not running": the name is taken (usually by a
+      # daemon
+      # holding a different cookie), so a restart cannot bind it and the wait blamed the wrong
+      # process.
+      assert Daemon.classify(:"any@127.0.0.1", online: false, registered: true) ==
+               :registered_but_unreachable
+
+      assert Daemon.classify(:"any@127.0.0.1", online: false, registered: false) == :not_running
+    end
+
+    test "parses node names out of epmd output" do
+      output = """
+      epmd: up and running on port 4369 with data:
+      name athanor_daemon at port 44937
+      name athanor_tui_4cb217 at port 41331
+      """
+
+      assert Daemon.parse_epmd_names(output) == ["athanor_daemon", "athanor_tui_4cb217"]
+      assert Daemon.parse_epmd_names("") == []
+      assert Daemon.parse_epmd_names("epmd: no nodes registered") == []
+    end
+
+    test "registered?/1 is false for a name nothing is using" do
+      refute Daemon.registered?(:"athanor_definitely_not_registered@127.0.0.1")
+    end
+  end
+
   @tag :external_node
   test "a reachable-compatible node whose app never started is NOT usable (the boot race)" do
     # Regression for: `mix athanor.daemon --restart` attaching inside the window where the

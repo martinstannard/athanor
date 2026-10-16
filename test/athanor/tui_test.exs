@@ -112,8 +112,7 @@ defmodule Athanor.TUITest do
         TUI.new()
         |> TUI.handle_agent_event(
           "worker-1",
-          {:session_started,
-           %{id: "worker-1", title: "Audit", role: :worker, parent_id: "conductor-main"}}
+          {:session_started, %{id: "worker-1", title: "Audit", role: :worker, parent_id: "conductor-main"}}
         )
 
       assert tui.focus == :input
@@ -192,8 +191,7 @@ defmodule Athanor.TUITest do
         TUI.new(model: "deepseek-v4.1-flash", width: 100, height: 24)
         |> TUI.handle_agent_event(
           "worker-1",
-          {:session_started,
-           %{id: "worker-1", title: "test-runner", role: :worker, parent_id: "conductor-main"}}
+          {:session_started, %{id: "worker-1", title: "test-runner", role: :worker, parent_id: "conductor-main"}}
         )
         |> TUI.handle_agent_event({:user_message, "Read mix.exs"})
         |> TUI.handle_agent_event({:status, :executing_tools})
@@ -422,8 +420,7 @@ defmodule Athanor.TUITest do
         TUI.new(width: 100, height: 24)
         |> TUI.handle_agent_event(
           "worker-9",
-          {:session_started,
-           %{id: "worker-9", title: "busy worker", role: :worker, parent_id: "conductor-main"}}
+          {:session_started, %{id: "worker-9", title: "busy worker", role: :worker, parent_id: "conductor-main"}}
         )
         |> TUI.handle_agent_event("worker-9", {:status, :executing_tools})
 

@@ -132,8 +132,7 @@ defmodule Athanor.Tools do
               },
               "path" => %{
                 "type" => "string",
-                "description" =>
-                  "Directory to search, relative to the session cd. Defaults to the session cd."
+                "description" => "Directory to search, relative to the session cd. Defaults to the session cd."
               },
               "max_results" => %{
                 "type" => "integer",
@@ -160,13 +159,11 @@ defmodule Athanor.Tools do
               },
               "path" => %{
                 "type" => "string",
-                "description" =>
-                  "File or directory to search, relative to the session cd. Defaults to the session cd."
+                "description" => "File or directory to search, relative to the session cd. Defaults to the session cd."
               },
               "glob" => %{
                 "type" => "string",
-                "description" =>
-                  "Optional glob restricting which files are searched (e.g. \"**/*.ex\")."
+                "description" => "Optional glob restricting which files are searched (e.g. \"**/*.ex\")."
               },
               "ignore" => %{
                 "type" => "array",
@@ -247,8 +244,7 @@ defmodule Athanor.Tools do
         "type" => "function",
         "function" => %{
           "name" => "send_session",
-          "description" =>
-            "Send a follow-up message or prompt to an existing sub-agent or conductor over PubSub.",
+          "description" => "Send a follow-up message or prompt to an existing sub-agent or conductor over PubSub.",
           "parameters" => %{
             "type" => "object",
             "properties" => %{
@@ -480,8 +476,7 @@ defmodule Athanor.Tools do
         write_edit(full_path, Enum.join(parts, new_str), path)
 
       count ->
-        {:error,
-         "old_string matched #{count} locations in #{path}; include more context to make it unique"}
+        {:error, "old_string matched #{count} locations in #{path}; include more context to make it unique"}
     end
   end
 

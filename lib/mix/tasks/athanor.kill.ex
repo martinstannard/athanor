@@ -135,9 +135,7 @@ defmodule Mix.Tasks.Athanor.Kill do
   end
 
   defp report_kept(id) do
-    Mix.shell().info(
-      "Removed session #{id} (transcript kept — `mix athanor --session #{id}` can resume it)."
-    )
+    Mix.shell().info("Removed session #{id} (transcript kept — `mix athanor --session #{id}` can resume it).")
   end
 
   defp report_deleted(id) do

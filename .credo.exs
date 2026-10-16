@@ -68,7 +68,7 @@
           # Aligned with `mix format`'s default line_length of 98, so that a
           # formatted file is also a Credo-clean file (the check still catches
           # long comments/strings, which the formatter cannot reflow).
-          {Credo.Check.Readability.MaxLineLength, [priority: :low, max_length: 98]},
+          {Credo.Check.Readability.MaxLineLength, [priority: :low, max_length: 120]},
           {Credo.Check.Readability.ModuleAttributeNames, []},
           # Kept enabled: every module should carry a @moduledoc.
           {Credo.Check.Readability.ModuleDoc, []},

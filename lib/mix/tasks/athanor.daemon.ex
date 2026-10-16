@@ -59,6 +59,9 @@ defmodule Mix.Tasks.Athanor.Daemon do
     :ok = Daemon.ensure_client_node()
 
     cond do
+      Daemon.classify(target) == :registered_but_unreachable ->
+        Mix.shell().info(name_in_use_message(target))
+
       not Daemon.reachable?(target) ->
         Mix.shell().info("Athanor daemon is not running (#{target}).")
 
@@ -77,9 +80,7 @@ defmodule Mix.Tasks.Athanor.Daemon do
         end
 
       true ->
-        Mix.shell().info(
-          "Athanor daemon at #{target} is reachable but its supervision tree is not up yet."
-        )
+        Mix.shell().info("Athanor daemon at #{target} is reachable but its supervision tree is not up yet.")
     end
   end
 
@@ -89,12 +90,17 @@ defmodule Mix.Tasks.Athanor.Daemon do
 
     # `:init.stop/0` is stdlib, so this works even against a stale daemon whose own
     # modules we cannot call.
-    if Daemon.reachable?(target) do
-      :erpc.cast(target, :init, :stop, [])
-      wait_until_stopped(target, 5_000)
-      Mix.shell().info("Stopped Athanor daemon at #{target}.")
-    else
-      Mix.shell().info("Athanor daemon is not running (#{target}).")
+    cond do
+      Daemon.reachable?(target) ->
+        :erpc.cast(target, :init, :stop, [])
+        wait_until_stopped(target, 5_000)
+        Mix.shell().info("Stopped Athanor daemon at #{target}.")
+
+      Daemon.registered?(target) ->
+        Mix.shell().info(name_in_use_message(target))
+
+      true ->
+        Mix.shell().info("Athanor daemon is not running (#{target}).")
     end
   end
 
@@ -110,6 +116,9 @@ defmodule Mix.Tasks.Athanor.Daemon do
           "#{node} is still running an older Athanor build and could not be stopped.\n" <>
             "Kill it manually (e.g. `epmd -names` to find it, then `pkill -f #{node}`) and retry."
         )
+
+      {:error, {:name_in_use, node}} ->
+        Mix.raise(name_in_use_message(node))
 
       {:error, :daemon_start_timeout} ->
         Mix.raise(
@@ -150,6 +159,25 @@ defmodule Mix.Tasks.Athanor.Daemon do
       )
   end
 
+  # Issue #27: `Node.connect/1` cannot tell "nothing there" from "there, wrong cookie", so this
+  # used to read as "not running" — and the restart that followed spawned a daemon that could not
+  # bind the name, then reported a timeout that blamed the new daemon instead of the one in the
+  # way.
+  defp name_in_use_message(target) do
+    """
+    A process is registered as #{target} but is not answering us.
+    The usual cause is a different distribution cookie (see the README's "Distribution cookie"), \
+    or a daemon from an older build.
+
+    It must be stopped before Athanor can start a daemon under that name:
+    \s\spgrep -af 'name #{target}'   # find it
+    \s\skill <pid>                   # stop it (its sessions are resumed from the Store)
+
+    Then re-run: mix athanor --resume
+    """
+    |> String.trim_trailing()
+  end
+
   defp wait_until_stopped(target, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_stopped(target, deadline)
@@ -171,9 +199,7 @@ defmodule Mix.Tasks.Athanor.Daemon do
         {:ok, main_id, _} = Daemon.ensure_main_conductor_and_hydrate(node_name, opts)
         Mix.shell().info("Athanor daemon running on #{node_name} (main conductor: #{main_id})")
 
-        Mix.shell().info(
-          "Attach from any terminal with `mix athanor`. Ctrl+C here stops the daemon."
-        )
+        Mix.shell().info("Attach from any terminal with `mix athanor`. Ctrl+C here stops the daemon.")
 
         Process.sleep(:infinity)
 
