@@ -503,12 +503,17 @@ defmodule Athanor.Daemon do
   # (2) `:erpc.call/5` to a node that has never loaded the module raises a bare
   # `:undef` — a direct call can never do that.
 
-  @spec send_session(node(), String.t(), String.t()) :: :ok | {:error, :not_found}
+  # Every one of these RPC wrappers is dead-daemon-safe: `rpc/4` bounds the call with
+  # `Athanor.Config.rpc_timeout_ms/0` and turns a timeout or `noconnection` into
+  # `{:error, :rpc_timeout}` / `{:error, :rpc_failed}`, so an unreachable daemon can never block
+  # the TUI loop forever or crash it. Unreachability is an expected state, not an exception.
+
+  @spec send_session(node(), String.t(), String.t()) :: :ok | {:error, term()}
   def send_session(target_node, session_id, prompt) do
     rpc(target_node, Orchestrator, :send_session, [session_id, prompt])
   end
 
-  @spec cancel_session(node(), String.t()) :: :ok | {:error, :not_found}
+  @spec cancel_session(node(), String.t()) :: :ok | {:error, term()}
   def cancel_session(target_node, session_id) do
     rpc(target_node, Orchestrator, :cancel_session, [session_id])
   end
@@ -574,11 +579,51 @@ defmodule Athanor.Daemon do
 
   # Internal Node / Daemon Helpers
 
-  defp rpc(node, module, function, args) do
+  # Every TUI→daemon RPC goes through here. The timeout is *not* optional: `:erpc.call/4`'s
+  # default is `:infinity`, so a wedged (or reachable-but-unresponsive) daemon would block the
+  # caller forever — and the caller is usually the single TUI loop process, so the whole UI
+  # freezes with no way to recover. `Athanor.Config.rpc_timeout_ms/0` bounds it, and a timeout
+  # is reported as `{:error, :rpc_timeout}` rather than crashing the caller, so a client can
+  # degrade gracefully. See `docs/wedge-findings.md` (finding "RPC has no timeout").
+  @doc """
+  Bounded remote-procedure call to `target_node`.
+
+  Runs locally (a direct `apply/3`) when `target_node` is this node, otherwise through
+  `:erpc.call/5` with `Athanor.Config.rpc_timeout_ms/0`. Unlike `:erpc.call/4`, it **never**
+  waits forever, and a timeout or transport error comes back as `{:error, :rpc_timeout}` /
+  `{:error, :rpc_failed}` (with a `wedge` log line) instead of raising — so a caller that is
+  also a UI loop cannot be frozen by a wedged peer. Exposed for callers outside this module
+  (`Athanor.TUI`) that need the same guarantee.
+  """
+  @spec rpc(node(), module(), atom(), [term()]) :: term()
+  def rpc(node, module, function, args) do
     if node == Node.self() do
       apply(module, function, args)
     else
-      :erpc.call(node, module, function, args)
+      timeout = Config.rpc_timeout_ms()
+
+      try do
+        :erpc.call(node, module, function, args, timeout)
+      rescue
+        error ->
+          Athanor.Log.wedge(:rpc_error,
+            node: node,
+            mfa: "#{inspect(module)}.#{function}",
+            error: inspect(error)
+          )
+
+          {:error, :rpc_failed}
+      catch
+        kind, reason ->
+          Athanor.Log.wedge(:rpc_timeout,
+            node: node,
+            mfa: "#{inspect(module)}.#{function}",
+            timeout_ms: timeout,
+            reason: inspect({kind, reason})
+          )
+
+          {:error, :rpc_timeout}
+      end
     end
   end
 

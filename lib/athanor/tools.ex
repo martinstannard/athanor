@@ -329,13 +329,21 @@ defmodule Athanor.Tools do
   def execute("bash", %{"command" => command}, opts) when is_binary(command) do
     cd = Keyword.get(opts, :cd, File.cwd!())
     timeout = Keyword.get(opts, :timeout, @default_bash_timeout_ms)
+    caller = self()
 
-    task =
-      Task.async(fn ->
-        System.cmd("bash", ["-c", command], cd: cd, stderr_to_stdout: true)
-      end)
+    task = Task.async(fn -> run_bash(command, cd, caller) end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task) do
+    # The task reports its port's `os_pid` as soon as the process is up, so a timeout can reap
+    # the child's whole process group rather than just closing the port. `setsid --wait` makes
+    # the port's `os_pid` the group leader, so `kill -TERM -<os_pid>` reaches grandchildren too.
+    os_pid =
+      receive do
+        {:athanor_bash_os_pid, task_pid, pid} when task_pid == task.pid -> pid
+      after
+        2_000 -> nil
+      end
+
+    case Task.yield(task, timeout) do
       {:ok, {output, 0}} ->
         {:ok, output}
 
@@ -343,7 +351,14 @@ defmodule Athanor.Tools do
         {:error, "Command exited with status #{exit_code}:\n#{output}"}
 
       nil ->
+        # Timed out: kill the subtree, then the task, so nothing outlives the call. Ordering
+        # matters — reap the tree first (while `os_pid` is still valid), then shut the task.
+        kill_tree(os_pid)
+        _ = Task.shutdown(task, :brutal_kill)
         {:error, "Command timed out after #{timeout}ms"}
+
+      {:exit, _reason} ->
+        {:error, "Command execution crashed"}
     end
   end
 
@@ -475,6 +490,85 @@ defmodule Athanor.Tools do
       :ok -> {:ok, "Edited #{path} successfully"}
       {:error, reason} -> {:error, "Failed to write #{path}: #{:file.format_error(reason)}"}
     end
+  end
+
+  # Runs `bash -c command` in a port that reports its OS pid to `caller` immediately, so a
+  # timeout can reap the child *and everything it spawned*. Output is collected with a plain
+  # port receive and `:exit_status` is requested so the caller sees the exit code.
+  #
+  # Why a plain `bash`, not `setsid`: a wrapper (`setsid`, with or without `--wait`) forks, so
+  # the port's `os_pid` is the wrapper rather than the new process-group leader, and a group
+  # kill against `-os_pid` misses (verified: `kill: sending signal to -<pid> failed`). The
+  # robust primitive is instead to walk the process *tree* from the reported pid and kill the
+  # descendants bottom-up (`kill_tree/1`), which reaps a `bash -c` that backgrounded children
+  # just as well as one that `exec`'d a single process (the confirmed leak).
+  defp run_bash(command, cd, caller) do
+    bash = System.find_executable("bash") || "bash"
+
+    port =
+      Port.open({:spawn_executable, bash}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        :hide,
+        args: ["-c", command],
+        cd: cd
+      ])
+
+    with {:os_pid, os_pid} <- Port.info(port, :os_pid) do
+      send(caller, {:athanor_bash_os_pid, self(), os_pid})
+    end
+
+    collect_bash_output(port, [])
+  end
+
+  defp collect_bash_output(port, acc) do
+    receive do
+      {^port, {:data, data}} -> collect_bash_output(port, [acc, data])
+      {^port, {:exit_status, status}} -> {IO.iodata_to_binary(acc), status}
+    end
+  end
+
+  # Best-effort subtree reap on timeout: TERM the whole subtree (polite), then KILL whatever
+  # survived, so neither a backgrounded child nor a TERM-ignoring process outlives the call.
+  # Nothing here may raise — the caller is already on the timeout path, and a reaping failure
+  # must never turn into a tool crash.
+  defp kill_tree(nil), do: :ok
+
+  defp kill_tree(os_pid) when is_integer(os_pid) do
+    descendants = descendants(os_pid)
+    targets = [os_pid | descendants]
+
+    signal_tree(targets, "TERM")
+    Process.sleep(50)
+    signal_tree(targets, "KILL")
+    Athanor.Log.wedge(:bash_kill, os_pid: os_pid, descendants: length(descendants))
+    :ok
+  rescue
+    _error -> :ok
+  end
+
+  # Depth-first descendant pids of `pid`, collected *before* any signal is sent: once the parent
+  # dies its children reparent to init and the link is lost, so the walk must come first.
+  defp descendants(pid) do
+    Enum.flat_map(child_pids(pid), fn child -> [child | descendants(child)] end)
+  end
+
+  defp child_pids(pid) do
+    case System.cmd("pgrep", ["-P", to_string(pid)], stderr_to_stdout: true) do
+      {out, 0} -> out |> String.split() |> Enum.reject(&(&1 == ""))
+      _other -> []
+    end
+  rescue
+    _error -> []
+  end
+
+  defp signal_tree(pids, signal) do
+    Enum.each(pids, fn pid ->
+      _ = System.cmd("kill", ["-#{signal}", to_string(pid)], stderr_to_stdout: true)
+    end)
+
+    :ok
   end
 
   defp await_subagent(child_id, timeout) do

@@ -122,6 +122,56 @@ defmodule Athanor.ToolsTest do
       assert {:error, "Command timed out after 50ms"} =
                Tools.execute("bash", %{"command" => "sleep 2"}, cd: tmp_dir, timeout: 50)
     end
+
+    # Regression for the confirmed OS-process leak (docs/wedge-findings.md): a timed-out command
+    # used to leave its child running. The fix reaps the child's whole subtree from the port's
+    # os_pid, so neither an `exec`'d process nor a backgrounded child survives.
+    test "reaps the child process tree on timeout", %{tmp_dir: tmp_dir} do
+      marker = "athanor_tools_test_#{System.unique_integer([:positive])}"
+
+      assert {:error, msg} =
+               Tools.execute("bash", %{"command" => "exec sleep 30 # #{marker}"},
+                 cd: tmp_dir,
+                 timeout: 300
+               )
+
+      assert msg =~ "timed out"
+
+      # Give the reap a moment to be observable.
+      wait_until(fn -> living(marker) == [] end, 40)
+      assert living(marker) == []
+    end
+
+    test "reaps backgrounded grandchildren on timeout", %{tmp_dir: tmp_dir} do
+      marker = "athanor_tools_test_bg_#{System.unique_integer([:positive])}"
+
+      assert {:error, _msg} =
+               Tools.execute(
+                 "bash",
+                 %{"command" => "sleep 30 & sleep 30; # #{marker}"},
+                 cd: tmp_dir,
+                 timeout: 300
+               )
+
+      wait_until(fn -> living(marker) == [] end, 40)
+      assert living(marker) == []
+    end
+  end
+
+  defp living(marker) do
+    case System.cmd("pgrep", ["-f", marker], stderr_to_stdout: true) do
+      {out, 0} -> String.split(out, "\n", trim: true)
+      _ -> []
+    end
+  end
+
+  defp wait_until(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(25)
+      wait_until(fun, attempts - 1)
+    end
   end
 
   describe "JSON string arguments and unknown tools" do

@@ -35,6 +35,27 @@ defmodule Athanor.TUITest do
       assert {:cancel, _} = TUI.handle_key(tui, "\e")
     end
 
+    # Regression for "Esc doesn't cancel anything" (docs/wedge-findings.md): Esc used to be gated
+    # on the client's cached `active_status/1`, so a stale/missed status event made it a silent
+    # no-op even while the daemon-side session was busy. It must always dispatch a cancel now.
+    test "Esc issues a cancel even when the cached status says idle" do
+      tui = TUI.new()
+      assert TUI.active_status(tui) == :idle
+      assert {:cancel, _} = TUI.handle_key(tui, "\e")
+    end
+
+    test "Esc issues a cancel for a session that never reported a status" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event(
+          "worker-x",
+          {:session_started, %{id: "worker-x", title: "x", role: :worker, parent_id: nil}}
+        )
+
+      # A freshly attached client may have missed the status events entirely.
+      assert {:cancel, _} = TUI.handle_key(tui, "\e")
+    end
+
     test "switches themes with /theme and lists them with a bare /theme" do
       tui = TUI.new()
       original = tui.theme.key
@@ -141,6 +162,27 @@ defmodule Athanor.TUITest do
 
       {:cont, tui} = TUI.handle_key(tui, "/conductor ops")
       assert {:spawn_conductor, "ops", _} = TUI.handle_key(tui, "\r")
+    end
+
+    # Regression for the streaming wedge (docs/wedge-findings.md): a token burst used to be
+    # re-rendered per token, starving input and making Esc feel dead. `drain_pending_events/1`
+    # folds every queued event into the state before the next render.
+    test "drains a queued burst of deltas into one state update" do
+      tui = TUI.new()
+
+      for chunk <- ["a", "b", "c", "d", "e"],
+          do: send(self(), {:agent_event, "conductor-main", {:text_delta, chunk}})
+
+      coalesced = TUI.drain_pending_events(tui)
+      session = coalesced.sessions["conductor-main"]
+      assert session.streaming_buffer == "abcde"
+      # The queue is empty afterwards: everything was folded, nothing re-rendered.
+      refute_received {:agent_event, _, _}
+    end
+
+    test "leaves an empty queue untouched" do
+      tui = TUI.new()
+      assert TUI.drain_pending_events(tui) == tui
     end
   end
 

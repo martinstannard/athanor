@@ -24,6 +24,10 @@ defmodule Athanor.Config do
     ".athanor"
   ]
   @opencode_auth_path "~/.local/share/opencode/auth.json"
+  @default_log_enabled true
+  @default_log_max_bytes 5_000_000
+  @default_rpc_timeout_ms 15_000
+  @default_turn_timeout_ms 900_000
 
   @doc """
   Returns the OpenCode Go base URL.
@@ -310,5 +314,79 @@ defmodule Athanor.Config do
       {value, _rest} when value > 0.0 and value <= 1.0 -> value
       _other -> default
     end
+  end
+
+  # -- diagnostics & responsiveness (wedge fix) ------------------------------------------
+
+  @doc """
+  Whether Athanor writes a diagnostic log to disk (default `true`).
+
+  When enabled, `Athanor.Log` installs a `Logger` handler that appends to
+  `<home>/logs/athanor.log`, so a wedged daemon leaves evidence behind instead of vanishing
+  into a detached VM's stdout. Disable with `ATHANOR_LOG=0` or `config :athanor, log_enabled:
+  false` (tests do this by pointing the log at a scratch `:log_path`).
+  """
+  @spec log_enabled?() :: boolean()
+  def log_enabled? do
+    case System.get_env("ATHANOR_LOG") do
+      nil ->
+        Application.get_env(:athanor, :log_enabled, @default_log_enabled) != false
+
+      value ->
+        normalised = value |> String.trim() |> String.downcase()
+        normalised not in ["0", "false", "no", "off"]
+    end
+  end
+
+  @doc """
+  Directory that holds Athanor's diagnostic logs (`<home>/logs`).
+
+  Overridable via `:athanor, :log_dir`; resolved through `Athanor.Log` so every writer agrees.
+  """
+  @spec log_dir() :: String.t()
+  def log_dir do
+    case Application.get_env(:athanor, :log_dir) do
+      dir when is_binary(dir) -> Path.expand(dir)
+      _ -> Path.join(home(), "logs")
+    end
+  end
+
+  @doc """
+  Rotate the log file once it exceeds this many bytes (default `#{@default_log_max_bytes}`),
+  keeping one previous file (`athanor.log.1`). Overridable via `ATHANOR_LOG_MAX_BYTES` or
+  `:athanor, :log_max_bytes`.
+  """
+  @spec log_max_bytes() :: pos_integer()
+  def log_max_bytes do
+    positive_int("ATHANOR_LOG_MAX_BYTES", :log_max_bytes, @default_log_max_bytes)
+  end
+
+  @doc """
+  Timeout, in milliseconds, for every TUI→daemon RPC (default `#{@default_rpc_timeout_ms}`).
+
+  `Athanor.Daemon.rpc/4` passes this to `:erpc.call/5`; without it `:erpc.call/4`'s default
+  is `:infinity`, so a wedged or unreachable-but-connected daemon would block the caller
+  (the single TUI loop process) forever — one of the confirmed wedge causes. Overridable via
+  `ATHANOR_RPC_TIMEOUT_MS` or `:athanor, :rpc_timeout_ms`. A non-positive value falls back to
+  the default, so the timeout can never be disabled by accident.
+  """
+  @spec rpc_timeout_ms() :: pos_integer()
+  def rpc_timeout_ms do
+    positive_int("ATHANOR_RPC_TIMEOUT_MS", :rpc_timeout_ms, @default_rpc_timeout_ms)
+  end
+
+  @doc """
+  Watchdog deadline, in milliseconds, for one agent turn (default `#{@default_turn_timeout_ms}`).
+
+  `Athanor.Agent` arms a timer when it starts an LLM stream or tool-execution task; if no
+  result arrives within this window the task is killed and the session transitions to `:error`
+  with a logged reason, instead of staying `:streaming`/`:executing_tools` forever (the
+  confirmed "stuck turn" state). It must comfortably exceed the transport's own timeouts
+  (LLM `receive_timeout` 120 s, bash 30 s) so it only fires on a genuine hang. Overridable via
+  `ATHANOR_TURN_TIMEOUT_MS` or `:athanor, :turn_timeout_ms`.
+  """
+  @spec turn_timeout_ms() :: pos_integer()
+  def turn_timeout_ms do
+    positive_int("ATHANOR_TURN_TIMEOUT_MS", :turn_timeout_ms, @default_turn_timeout_ms)
   end
 end

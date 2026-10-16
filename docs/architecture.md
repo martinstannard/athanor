@@ -58,7 +58,8 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 | `Athanor.TUI` | struct + pure funcs | `Termite` split-pane "agent-deck"-style terminal UI. |
 | `Athanor.Markdown` | module | Dependency-free Markdown → ANSI-styled line renderer used by the TUI. |
 | `Athanor.Daemon` | module | Persistent BEAM daemon node and remote client attach/hydrate bridge (design §7.7). |
-| `Athanor.Config` | module | Base URL / model / API-key resolution (env vars, app config, `auth.json`). Also the Store root and compaction knobs. |
+| `Athanor.Config` | module | Base URL / model / API-key resolution (env vars, app config, `auth.json`). Also the Store root and compaction knobs, plus the responsiveness/diagnostic knobs `rpc_timeout_ms/0`, `turn_timeout_ms/0`, `log_enabled?/0`, `log_dir/0`, `log_max_bytes/0`. |
+| `Athanor.Log` | module + `:logger` handler | On-disk diagnostic log (`<home>/logs/athanor.log`, rotating) installed at boot so a detached daemon leaves evidence behind; `event/2`/`wedge/2` for structured "we avoided a hang" lines. |
 | `Athanor.Store` | module | On-disk session persistence facade (design §7.4): `~/.athanor/sessions/<id>/` paths, `ensure_session/2`, `load/2`, `load_records/2`, `list/1`, `delete/2`, version check. |
 | `Athanor.Store.{Session,Transcript,Schema,Tokens}` | modules | Pure formats and helpers: `meta.json` struct/schema, append-only JSONL transcript, version/migration dispatch, token estimation. |
 | `Athanor.Store.{Handoff,Compactor}` | modules | Pure rolling-summary render/write/parse, and the C5-safe compaction policy (user-boundary cut + hysteresis). |
@@ -339,6 +340,11 @@ env var, then `Application.get_env(:athanor, …)`, then a module-attribute defa
 | Compaction threshold (§12) | `ATHANOR_COMPACTION_THRESHOLD` | `:compaction_threshold` | `0.8` |
 | Context window (§12) | `ATHANOR_CONTEXT_LIMIT_TOKENS` | `:context_limit_tokens` | `128_000` |
 | Compaction keep fraction (§12) | `ATHANOR_COMPACTION_KEEP_FRACTION` | `:compaction_keep_fraction` | `0.4` |
+| Diagnostic log on/off | `ATHANOR_LOG` | `:log_enabled` | `true` |
+| Diagnostic log dir | — | `:log_dir` | `<ATHANOR_HOME>/logs` |
+| Diagnostic log rotation cap | `ATHANOR_LOG_MAX_BYTES` | `:log_max_bytes` | `5_000_000` |
+| Daemon RPC timeout (ms) | `ATHANOR_RPC_TIMEOUT_MS` | `:rpc_timeout_ms` | `15_000` |
+| Agent turn watchdog (ms) | `ATHANOR_TURN_TIMEOUT_MS` | `:turn_timeout_ms` | `900_000` |
 
 `model/0` strips a leading `"opencode-go/"` prefix. `api_key/0` returns a descriptive error string
 when no key can be found.

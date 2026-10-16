@@ -84,6 +84,47 @@ defmodule Athanor.AgentTest do
     assert Agent.get_state(agent).status == :idle
   end
 
+  # Regression for the "stuck turn forever" wedge (docs/wedge-findings.md): a task that never
+  # returns used to leave the session `:streaming`/`:executing_tools` with no recovery. The
+  # watchdog kills it and transitions to `:error` with a logged reason.
+  describe "turn watchdog" do
+    test "recovers a turn whose task never returns", %{tmp_dir: tmp_dir} do
+      llm_fn = fn _messages, _tools, _agent_pid ->
+        # Never returns and never sends a result: simulates a wedged HTTP read.
+        receive do
+          :never -> :ok
+        end
+      end
+
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, turn_timeout_ms: 300)
+
+      assert :ok = Agent.prompt(agent, "hang please")
+      assert_receive {:agent_event, {:status, :streaming}}
+
+      assert_receive {:agent_event, {:error, msg}}, 2_000
+      assert msg =~ "timed out"
+
+      assert Agent.get_state(agent).status == :error
+    end
+
+    test "disarms the watchdog when a normal turn completes", %{tmp_dir: tmp_dir} do
+      llm_fn = fn _messages, _tools, _agent_pid ->
+        {:ok, %{role: "assistant", content: "done", tool_calls: []}}
+      end
+
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, turn_timeout_ms: 150)
+
+      assert :ok = Agent.prompt(agent, "quick")
+      assert_receive {:agent_event, {:turn_complete, "done"}}
+
+      # The watchdog must not fire after a completed turn.
+      refute_receive {:agent_event, {:error, _}}, 400
+      assert Agent.get_state(agent).status == :idle
+    end
+  end
+
   # --- §7.4 write path (C1/C3/C4) ----------------------------------------------------------
 
   describe "Bus.publish_message/3 write path (C1)" do

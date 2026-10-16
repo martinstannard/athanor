@@ -97,11 +97,13 @@ defmodule Athanor.Agent do
     :max_turns,
     :notify_parent_on_done,
     :compaction_opts,
+    :turn_timeout_ms,
     status: :idle,
     turn_count: 0,
     compacted?: false,
     messages: [],
-    prompt_queue: :queue.new()
+    prompt_queue: :queue.new(),
+    watchdog: nil
   ]
 
   # Client API
@@ -261,6 +263,7 @@ defmodule Athanor.Agent do
         cd: cd,
         max_turns: max_turns,
         notify_parent_on_done: notify_parent,
+        turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, Config.turn_timeout_ms()),
         compaction_opts: normalize_compaction_opts(opts),
         llm_fn: Keyword.get(opts, :llm_fn, default_llm_fn),
         messages: initial_messages(system_prompt, Keyword.get(opts, :messages))
@@ -385,7 +388,12 @@ defmodule Athanor.Agent do
 
   def handle_info({:llm_result, {:ok, assistant_msg}}, %{current_task: {_pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
-    state = state |> Map.put(:current_task, nil) |> record_messages(assistant_msg)
+
+    state =
+      state
+      |> Map.put(:current_task, nil)
+      |> disarm_watchdog()
+      |> record_messages(assistant_msg)
 
     case Map.get(assistant_msg, :tool_calls, []) do
       [] ->
@@ -401,14 +409,17 @@ defmodule Athanor.Agent do
 
   def handle_info({:llm_result, {:error, reason}}, %{current_task: {_pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
-    state = %{state | current_task: nil} |> set_status(:error)
+    state = %{state | current_task: nil} |> disarm_watchdog() |> set_status(:error)
     notify(state, {:error, reason})
     {:noreply, state}
   end
 
   def handle_info({:tools_result, tool_messages}, %{current_task: {_pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
-    state = state |> Map.put(:current_task, nil) |> record_messages(tool_messages)
+
+    state =
+      state |> Map.put(:current_task, nil) |> disarm_watchdog() |> record_messages(tool_messages)
+
     state = %{state | turn_count: state.turn_count + 1}
 
     if state.turn_count >= state.max_turns do
@@ -420,13 +431,40 @@ defmodule Athanor.Agent do
     end
   end
 
+  # The watchdog firing: no result arrived within `turn_timeout_ms`. Kill the wedged task,
+  # return to `:error`, and leave a durable `wedge` line in the log naming the phase so the
+  # hang is diagnosable afterwards. Reached only when the transport's own timeout failed to
+  # fire, so this is genuinely "stuck", not merely "slow".
+  def handle_info({:turn_watchdog, phase}, %{watchdog: %{phase: phase}} = state) do
+    elapsed = System.monotonic_time(:millisecond) - state.watchdog.started_at
+
+    Athanor.Log.wedge(:turn_timeout,
+      session: state.id,
+      phase: phase,
+      timeout_ms: state.turn_timeout_ms,
+      elapsed_ms: elapsed
+    )
+
+    state =
+      state
+      |> kill_current_task()
+      |> Map.put(:watchdog, nil)
+      |> set_status(:error)
+
+    notify(state, {:error, "Turn timed out in #{phase} after #{state.turn_timeout_ms}ms"})
+    {:noreply, drain_prompt_queue(state)}
+  end
+
+  # A stale timer from a task that already completed (the `disarm` raced it): ignore.
+  def handle_info({:turn_watchdog, _phase}, state), do: {:noreply, state}
+
   def handle_info({:tool_event, event}, state) do
     notify(state, event)
     {:noreply, state}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{current_task: {_task_pid, ref}} = state) do
-    state = %{state | current_task: nil} |> set_status(:idle)
+    state = state |> Map.put(:current_task, nil) |> disarm_watchdog() |> set_status(:idle)
 
     if reason != :normal do
       state = set_status(state, :error)
@@ -643,7 +681,9 @@ defmodule Athanor.Agent do
         send(agent_pid, {:llm_result, llm_fn.(messages, tools, agent_pid)})
       end)
 
-    %{state | current_task: {pid, ref}}
+    state
+    |> Map.put(:current_task, {pid, ref})
+    |> arm_watchdog("llm_stream")
   end
 
   defp start_tool_execution(state, tool_calls) do
@@ -658,7 +698,9 @@ defmodule Athanor.Agent do
         send(agent_pid, {:tools_result, tool_messages})
       end)
 
-    %{state | current_task: {pid, ref}}
+    state
+    |> Map.put(:current_task, {pid, ref})
+    |> arm_watchdog("tool_execution")
   end
 
   defp run_tool(tc, agent_pid, cd, session_id) do
@@ -720,7 +762,35 @@ defmodule Athanor.Agent do
   defp kill_current_task(%{current_task: {pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
     Process.exit(pid, :kill)
-    %{state | current_task: nil}
+    state |> Map.put(:current_task, nil) |> disarm_watchdog()
+  end
+
+  # -- turn watchdog ----------------------------------------------------------------------
+  #
+  # `spawn_monitor` gives the agent the in-flight task's result and a `:DOWN` if it crashes, but
+  # *nothing* fires when the task simply never returns: the LLM transport has its own
+  # `receive_timeout` (120 s) and `bash` its own tool timeout (30 s), yet a wedged socket, a
+  # DNS black hole or a tool that hangs past its bound would leave the session `:streaming`/
+  # `:executing_tools` forever — the confirmed live state (`docs/wedge-findings.md`). The
+  # watchdog is the outer bound: arm a timer when a task starts, cancel it when the result
+  # arrives, and on expiry kill the task, transition to `:error` and log a `wedge` event so the
+  # failure is diagnosable afterwards. `Config.turn_timeout_ms/0` is deliberately generous so
+  # this never races the transport's own timeouts.
+  defp arm_watchdog(state, phase) do
+    state = disarm_watchdog(state)
+    ref = Process.send_after(self(), {:turn_watchdog, phase}, state.turn_timeout_ms)
+
+    %{
+      state
+      | watchdog: %{ref: ref, phase: phase, started_at: System.monotonic_time(:millisecond)}
+    }
+  end
+
+  defp disarm_watchdog(%{watchdog: nil} = state), do: state
+
+  defp disarm_watchdog(%{watchdog: %{ref: ref}} = state) do
+    Process.cancel_timer(ref)
+    %{state | watchdog: nil}
   end
 
   defp set_status(state, new_status) do

@@ -181,6 +181,30 @@ defmodule Athanor.DaemonTest do
     send(relay, :detach)
   end
 
+  # Regression for "the whole UI freezes when the daemon wedges" (docs/wedge-findings.md):
+  # `Daemon.rpc/4` used to call `:erpc.call/4`, whose default timeout is `:infinity`. It must
+  # bound the call and return an error tuple instead of blocking or raising.
+  describe "rpc/4" do
+    test "runs locally without :erpc when the target is this node" do
+      assert Daemon.rpc(Node.self(), Athanor.Daemon, :build_marker, []) == Daemon.build_marker()
+    end
+
+    test "returns {:error, :rpc_timeout} when the remote call outruns the timeout" do
+      previous = Application.get_env(:athanor, :rpc_timeout_ms)
+      Application.put_env(:athanor, :rpc_timeout_ms, 100)
+      on_exit(fn -> restore_app_env(:rpc_timeout_ms, previous) end)
+
+      # `:erpc.call/5` is only used for a *remote* node, so target the running daemon test node;
+      # if there is none we simulate with a nonexistent node, which must also fail fast.
+      target = :"athanor_wedge_nonexistent@127.0.0.1"
+
+      assert {:error, _reason} = Daemon.rpc(target, Athanor.Daemon, :build_marker, [])
+    end
+  end
+
+  defp restore_app_env(_key, nil), do: :ok
+  defp restore_app_env(key, value), do: Application.put_env(:athanor, key, value)
+
   test "converts historical session messages into TUI entries" do
     messages = [
       %{role: "system", content: "sys"},

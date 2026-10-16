@@ -26,10 +26,24 @@ defmodule Athanor.TUI do
   The pending depth is rendered as `⧗ N queued` (plus a one-line preview of the next prompt when it
   fits) at the right of the input line, fed by the agent's `{:prompt_queue, %{len:, next:}}` event
   and updated optimistically on enqueue so the count is right before the round trip completes.
-  `/clear-queue` (or `Esc` on a session whose only thing pending is the queue) discards the stack
-  without touching the in-flight turn; `Esc` on a busy session still cancels, and a cancel clears
-  the queue too (`Athanor.Agent`'s documented choice: cancel means *stop*, not "start the next
-  stacked prompt the moment this one dies").
+  `/clear-queue` discards the stack without touching the in-flight turn. `Esc` is the
+  **stop-the-line** gesture: it always issues a cancel (never gated on a cached status, which
+  could go stale and make Esc a silent no-op — see `docs/wedge-findings.md`), and a cancel stops
+  the turn *and* clears the queue (`Athanor.Agent`'s documented choice: cancel means *stop*, not
+  "start the next stacked prompt the moment this one dies").
+
+  ## Responsiveness
+
+  Two guards keep the single TUI loop responsive under load, because a frozen loop is
+  indistinguishable from a wedged daemon:
+
+    * **Event coalescing.** A streaming turn delivers one `{:text_delta, _}` per token and
+      `render_frame/1` re-renders the whole transcript per frame; rendering per token starves
+      input, so a token burst made Esc feel dead mid-stream. The loop folds every already-queued
+      agent event into the state before the next render, collapsing a burst into one frame.
+    * **Bounded RPC.** Every daemon call goes through `Athanor.Daemon.rpc/4`, which passes
+      `Athanor.Config.rpc_timeout_ms/0` to `:erpc.call/5`. Without it `:erpc.call/4` defaults to
+      `:infinity`, so a wedged daemon would block the loop forever.
   """
 
   alias Athanor.{Agent, Bus, Config, Daemon, Markdown, Store, Theme}
@@ -106,7 +120,7 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear-queue to drop stacked prompts. Enter while streaming stacks the prompt for the next turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear-queue to drop stacked prompts. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
       streaming_buffer: nil,
       prompt_queue_len: 0,
@@ -270,34 +284,83 @@ defmodule Athanor.TUI do
 
       {:agent_event, session_id, event} ->
         tui = handle_agent_event(tui, session_id, event)
-        loop(term, tui)
+        loop(term, drain_pending_events(tui))
 
       {:agent_event, event} ->
         tui = handle_agent_event(tui, tui.active_id, event)
-        loop(term, tui)
+        loop(term, drain_pending_events(tui))
+    end
+  end
+
+  # Renders once per rendered frame, but a streaming turn delivers one `{:text_delta, _}` per
+  # token and `render_frame/1` re-renders the whole transcript each time (measured ~20 ms/frame at
+  # a few hundred entries — see `docs/wedge-findings.md`). Rendering per token therefore
+  # saturates the loop and starves input handling, which is exactly the "streaming wedge" and why
+  # Esc felt dead. Coalescing folds every already-queued agent event into the state *before* the
+  # next render, collapsing a token burst into a single frame. The batch is bounded so a
+  # continuous firehose still renders and still services keys.
+  @coalesce_batch 500
+
+  @doc """
+  Folds already-queued `{:agent_event, …}` messages into `tui` without re-rendering.
+
+  The TUI loop renders once per iteration, but a streaming turn delivers one `{:text_delta, _}`
+  per token; rendering per token starves input handling, which is what made Esc feel dead
+  mid-stream (`docs/wedge-findings.md`). The loop therefore drains the burst here first, so a
+  token flood collapses into a single frame while keys still interleave. Bounded to
+  `#{@coalesce_batch}` events per call so a *continuous* firehose still yields to input.
+
+  Handles both message shapes the relay uses: the 3-tuple `{:agent_event, session_id, event}` and
+  the 2-tuple `{:agent_event, event}` (which belongs to the active session).
+  """
+  @spec drain_pending_events(t()) :: t()
+  def drain_pending_events(tui), do: drain_pending_events(tui, @coalesce_batch)
+
+  @doc false
+  @spec drain_pending_events(t(), non_neg_integer()) :: t()
+  def drain_pending_events(tui, 0), do: tui
+
+  def drain_pending_events(tui, budget) do
+    receive do
+      {:agent_event, session_id, event} ->
+        drain_pending_events(handle_agent_event(tui, session_id, event), budget - 1)
+
+      {:agent_event, event} ->
+        drain_pending_events(handle_agent_event(tui, tui.active_id, event), budget - 1)
+    after
+      0 -> tui
     end
   end
 
   # Runs one `handle_key/2` command. Kept out of `loop/2` so the loop stays a loop (Credo's
   # complexity budget) and the command table reads as a table.
+  #
+  # Every daemon RPC here is now bounded (`Athanor.Config.rpc_timeout_ms/0`) and may return
+  # `{:error, :rpc_timeout | :rpc_failed}`, so the loop can never be blocked forever by a wedged
+  # daemon — and a failure is reported in the transcript instead of vanishing. See
+  # `docs/wedge-findings.md`.
   defp dispatch(term, target_node, command) do
     case command do
       {:quit, _tui} ->
         :ok
 
       {:submit, prompt, tui} ->
-        _ = Daemon.send_session(target_node, tui.active_id, prompt)
+        tui =
+          rpc_note(tui, Daemon.send_session(target_node, tui.active_id, prompt), "send prompt")
+
         loop(term, tui)
 
       # Stacked prompt: same transport as `{:submit, _}` — `send_session/2` already routes through
       # `{:enqueue_prompt, _}`, and the agent queues when busy — but the TUI bumps its own pending
       # count immediately so the `⧗ N queued` indicator is right before the round trip lands.
       {:enqueue, prompt, tui} ->
-        _ = Daemon.send_session(target_node, tui.active_id, prompt)
+        tui =
+          rpc_note(tui, Daemon.send_session(target_node, tui.active_id, prompt), "queue prompt")
+
         loop(term, optimistic_enqueue(tui, prompt))
 
       {:cancel, tui} ->
-        _ = Daemon.cancel_session(target_node, tui.active_id)
+        tui = rpc_note(tui, Daemon.cancel_session(target_node, tui.active_id), "cancel")
         loop(term, tui)
 
       {:cont, tui} ->
@@ -308,9 +371,25 @@ defmodule Athanor.TUI do
     end
   end
 
+  # Surfaces a failed control RPC (a timeout against a wedged/unreachable daemon) as a `system`
+  # entry, so "nothing happened when I pressed Esc" has a visible cause. A success is silent.
+  defp rpc_note(tui, :ok, _what), do: tui
+
+  defp rpc_note(tui, {:error, :not_found}, what),
+    do: add_system(tui, "[#{what}] no such session: #{tui.active_id}")
+
+  defp rpc_note(tui, {:error, reason}, what),
+    do: add_system(tui, "[#{what}] daemon did not respond (#{inspect(reason)}); is it wedged?")
+
+  defp rpc_note(tui, _other, _what), do: tui
+
   # The `{:spawn_*}`, `{:theme, _}` and `{:resume, _}` commands each rebuild the TUI state before
   # continuing; kept in their own table so neither this nor `dispatch/3` exceeds the complexity
   # budget.
+  #
+  # The spawn commands no longer pattern-match the RPC result with `{:ok, _, _} = …`: a bounded
+  # RPC can now fail, and an unconditional match would crash the TUI loop on exactly the wedge
+  # these fixes exist to survive.
   defp dispatch_session(term, target_node, command) do
     case command do
       {:clear_queue, tui} ->
@@ -319,26 +398,38 @@ defmodule Athanor.TUI do
 
       {:spawn_subagent, title, prompt, tui} ->
         parent_id = resolve_parent_conductor(tui)
-        {:ok, child_id, _pid} = Daemon.launch_subagent(target_node, parent_id, title, prompt)
-
-        tui = ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
-        loop(term, tui)
+        loop(term, spawn_subagent(target_node, tui, parent_id, title, prompt))
 
       {:spawn_conductor, title, tui} ->
-        {:ok, cond_id, _pid} = Daemon.start_conductor(target_node, title: title, model: tui.model)
-
-        tui =
-          tui
-          |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
-          |> Map.put(:active_id, cond_id)
-
-        loop(term, tui)
+        loop(term, start_conductor(target_node, tui, title))
 
       {:theme, name, tui} ->
         loop(term, apply_theme(tui, name))
 
       {:resume, id, tui} ->
         loop(term, handle_resume(tui, target_node, id))
+    end
+  end
+
+  defp spawn_subagent(target_node, tui, parent_id, title, prompt) do
+    case Daemon.launch_subagent(target_node, parent_id, title, prompt) do
+      {:ok, child_id, _pid} ->
+        ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
+
+      {:error, reason} ->
+        add_system(tui, "Could not launch sub-agent '#{title}': #{inspect(reason)}")
+    end
+  end
+
+  defp start_conductor(target_node, tui, title) do
+    case Daemon.start_conductor(target_node, title: title, model: tui.model) do
+      {:ok, cond_id, _pid} ->
+        tui
+        |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
+        |> Map.put(:active_id, cond_id)
+
+      {:error, reason} ->
+        add_system(tui, "Could not start conductor '#{title}': #{inspect(reason)}")
     end
   end
 
@@ -479,15 +570,15 @@ defmodule Athanor.TUI do
     handle_deck_key(tui, data)
   end
 
-  # Escape key cancels the in-flight turn on the active session. With the input line empty and no
-  # turn running, it instead clears a pending prompt queue — the same "unstick me" gesture, in the
-  # only state where a bare Esc would otherwise be a no-op.
+  # Escape is the "stop the line" gesture and must *always* do something. It previously cancelled
+  # only when the client's cached `active_status/1` was non-`:idle`, so a missed or stale status
+  # event (a dropped relay message, a client that attached mid-turn) turned Esc into a silent
+  # no-op — the "Esc doesn't cancel anything" report. It now issues a cancel unconditionally; the
+  # agent makes an idle cancel a cheap no-op and a busy one a real stop that also clears the
+  # stacked prompts (`Athanor.Agent.cancel/1`). `/clear-queue` remains for "forget the stack but
+  # let the turn run". See `docs/wedge-findings.md`.
   def handle_key(tui, "\e") do
-    cond do
-      active_status(tui) != :idle -> {:cancel, tui}
-      tui.input == "" and queued_len(tui) > 0 -> {:clear_queue, tui}
-      true -> {:cont, tui}
-    end
+    {:cancel, tui}
   end
 
   # PageUp / Up arrow scrolls up
@@ -602,14 +693,19 @@ defmodule Athanor.TUI do
     end)
   end
 
-  # `/clear-queue` / idle-Esc: forget the stack locally and tell the agent to do the same. The
+  # `/clear-queue`: forget the stack locally and tell the agent to do the same. The
   # remote half must be published on the *owning* node's PubSub (the agent subscribes there), so
   # a daemon-attached client RPCs `Bus.send_command/2` on the daemon; `--local` short-circuits.
+  # Bounded like every other RPC (`Athanor.Config.rpc_timeout_ms/0`): an unbounded `:erpc.call/4`
+  # would freeze the TUI loop if the daemon hung between rendering and this call.
   defp clear_remote_queue(target_node, tui) do
     if target_node == Node.self() do
       Agent.clear_prompt_queue(tui.active_id)
     else
-      :erpc.call(target_node, Bus, :send_command, [tui.active_id, :clear_prompt_queue])
+      _ =
+        Daemon.rpc(target_node, Bus, :send_command, [tui.active_id, :clear_prompt_queue])
+
+      :ok
     end
   rescue
     # A client must never die because the daemon hung up between rendering and the RPC.
