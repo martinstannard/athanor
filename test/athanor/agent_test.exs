@@ -488,6 +488,31 @@ defmodule Athanor.AgentTest do
     end
   end
 
+  # --- #30: a tool intent that arrived as text ------------------------------------
+
+  describe "a turn whose tool intent arrived as text (#30)" do
+    test "fails loudly instead of completing an empty, successful-looking turn", %{
+      tmp_dir: tmp_dir
+    } do
+      # Exactly what `Athanor.LLM.assemble_result/2` returns when the provider leaks its tool-call
+      # markup into `content`. Read as prose it would be a silent no-op: no tool runs, the agent
+      # publishes `{:turn_complete, _}` and goes `:idle`, and the user sees markup — the same shape
+      # as a wedge. The turn must end `:error` instead.
+      reason = "the model returned its tool calls as text markup instead of structured tool_calls"
+
+      llm_fn = fn _messages, _tools, _agent_pid -> {:error, reason} end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+
+      assert :ok = Agent.prompt(agent, "do the thing")
+
+      assert_receive {:agent_event, {:error, message}}
+      assert message =~ "tool calls as text"
+      assert Agent.get_state(agent).status == :error
+      refute_received {:agent_event, {:turn_complete, _}}
+    end
+  end
+
   # --- §5.4 compaction trigger (M5, #28) -------------------------------------------------
 
   describe "pre-flight compaction trigger (§5.4, #28)" do

@@ -5,12 +5,28 @@ defmodule Athanor.LLM do
   Streams Server-Sent Events (SSE) from `/chat/completions`, sending real-time
   `{:llm_delta, text}` messages to the caller and returning the assembled
   assistant message (including any accumulated tool calls).
+
+  One case is deliberately *not* returned as a normal completion: a turn whose only sign of tool
+  use is the provider's tool-call markup leaking through as text in `content` (see
+  `assemble_result/2`). Returned as prose, such a turn runs nothing and still reports success.
   """
 
   alias Athanor.Config
 
   # Placeholder for a tool call slot seen for the first time in a streaming delta.
   @empty_tool_call %{id: "", type: "function", function: %{name: "", arguments: ""}}
+
+  # The provider's internal tool-call markup, observed leaking through as *text* in `content` when
+  # the gateway fails to convert it into a structured `tool_calls` entry (issue #30). The bars are
+  # U+FF5C FULLWIDTH VERTICAL LINE, so nothing the model writes as ordinary prose contains this:
+  # that is what makes it safe to treat as a signal. It is matched together with one of the
+  # markup's two element keywords so that merely *quoting* the delimiter (as this repo's own
+  # documents do) is not mistaken for a lost call.
+  @tool_calls_as_text ~r/<｜｜DSML｜｜\s*(?:calls|invoke)\b/
+
+  # How much of the offending `content` an error message carries: enough to see what the model
+  # tried to call, bounded so one turn cannot bloat the log or the TUI.
+  @error_excerpt_chars 2_000
 
   @type tool_call :: %{
           id: String.t(),
@@ -77,7 +93,7 @@ defmodule Athanor.LLM do
             |> Map.get(:sse_acc, initial_acc)
             |> flush_buffer(caller_pid)
 
-          {:ok, finalize_message(final_acc)}
+          assemble_result(final_acc, session_id)
 
         {:ok, %Req.Response{status: status} = resp} ->
           final_acc =
@@ -160,6 +176,67 @@ defmodule Athanor.LLM do
       content: state.content,
       tool_calls: tool_calls
     }
+  end
+
+  @doc """
+  Assembles a stream's final result: `{:ok, assistant_message}` for a normal turn, or
+  `{:error, message}` when the turn's tool intent arrived as text instead of structured calls.
+
+  An assistant message with no `tool_calls` whose `content` carries the provider's tool-call markup
+  (`tool_calls_as_text?/1`) is a **failed turn**, not a completed one (issue #30). Reporting it as
+  prose is a silent no-op: no tool runs, the agent publishes `{:turn_complete, _}` and goes
+  `:idle`, and the user is shown markup — indistinguishable from a wedge, and it re-enters the
+  history verbatim. So it fails loudly, naming the shape, carrying a bounded excerpt of the payload
+  for the next investigation, and writing a `wedge` line that names the session.
+
+  A message that *does* carry structured `tool_calls` is unaffected even if its content mentions
+  the markup: the structured calls are what the agent runs.
+
+  The markup itself is never parsed into calls — it is an undocumented provider internal, and a
+  parser would silently inherit whatever the provider changes. Public because `stream/4` reaches
+  this through an HTTP request: this is the seam that makes the behaviour testable from a
+  hand-built accumulator, like the rest of the SSE helpers here.
+  """
+  @spec assemble_result(map(), String.t()) :: {:ok, assistant_message()} | {:error, String.t()}
+  def assemble_result(acc, session_id) do
+    message = finalize_message(acc)
+
+    if message.tool_calls == [] and tool_calls_as_text?(message.content) do
+      Athanor.Log.wedge(:tool_calls_as_text,
+        session: session_id,
+        bytes: byte_size(message.content)
+      )
+
+      {:error, tool_calls_as_text_error(message.content)}
+    else
+      {:ok, message}
+    end
+  end
+
+  @doc """
+  Whether `content` carries the provider's tool-call markup rather than structured tool calls.
+
+  Detects the element forms (`…calls`, `…invoke`), not a bare mention of the delimiter, so prose
+  that quotes the markup is left alone. Non-binary input is never a match.
+  """
+  @spec tool_calls_as_text?(term()) :: boolean()
+  def tool_calls_as_text?(content) when is_binary(content),
+    do: Regex.match?(@tool_calls_as_text, content)
+
+  def tool_calls_as_text?(_content), do: false
+
+  defp tool_calls_as_text_error(content) do
+    "the model returned its tool calls as text markup instead of structured tool_calls, so " <>
+      "nothing would have run. The request itself was accepted, so this is a provider-side " <>
+      "conversion failure rather than a transport error. Content:\n" <> excerpt(content)
+  end
+
+  defp excerpt(content) do
+    if String.length(content) > @error_excerpt_chars do
+      String.slice(content, 0, @error_excerpt_chars) <> "… (truncated)"
+    else
+      content
+    end
   end
 
   defp process_sse_line("", state, _caller_pid), do: state

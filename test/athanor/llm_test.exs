@@ -69,6 +69,103 @@ defmodule Athanor.LLMTest do
     end
   end
 
+  # Issue #30: the provider can hand a tool intent back as *text* in `content`. Read as prose the
+  # turn "succeeds" while running nothing — a silent no-op that looks like a wedge, and the markup
+  # is recorded into history verbatim. These pin the loud failure and its precision.
+  describe "tool calls returned as text (#30)" do
+    @marker "<｜｜DSML｜｜"
+
+    test "fails the turn, names the marker and logs it instead of completing an empty one" do
+      payload = """
+      Noted on the sub-agent — it aborted as instructed and wrote nothing.
+
+      #{@marker} calls>
+      #{@marker} invoke name="bash">
+      #{@marker} parameter name="command" string="true">chainlink issue next</#{@marker} parameter>
+      </#{@marker} invoke>
+      """
+
+      state = stream_state_with_content(payload)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, message} = LLM.assemble_result(state, "ses_marker")
+
+          # The shape is named, and the payload is carried for the next investigation.
+          assert message =~ "tool calls as text"
+          assert message =~ "chainlink issue next"
+          assert message =~ @marker
+        end)
+
+      assert log =~ "tool_calls_as_text"
+      assert log =~ "ses_marker"
+    end
+
+    test "caps the excerpt so one turn cannot bloat the error" do
+      state = stream_state_with_content(@marker <> " invoke name=\"bash\">" <> String.duplicate("x", 5_000))
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, message} = LLM.assemble_result(state, "ses_long")
+        assert String.length(message) < 3_000
+        assert message =~ "(truncated)"
+      end)
+    end
+
+    test "leaves ordinary prose alone" do
+      state = stream_state_with_content("All done — nothing needed calling.")
+
+      assert {:ok, %{content: "All done — nothing needed calling.", tool_calls: []}} =
+               LLM.assemble_result(state, "ses_prose")
+    end
+
+    test "leaves structured tool calls alone, even when the content mentions the markup" do
+      # The structured calls are what the agent runs, so mentioning the markup beside them is not a
+      # lost call. (This is the "a worker quotes issue #30" case.)
+      sse = """
+      data: {"choices":[{"delta":{"content":"Calling bash, as seen in the <｜｜DSML｜｜ markup."}}]}
+
+      data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}
+
+      data: [DONE]
+      """
+
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(sse, self())
+        |> LLM.flush_buffer(self())
+
+      assert {:ok, %{tool_calls: [%{id: "call_1"}]}} = LLM.assemble_result(state, "ses_tools")
+    end
+
+    test "the bare delimiter is a mention, not a call" do
+      state =
+        stream_state_with_content("Athanor logs the #{@marker} delimiter when a provider leaks tool calls as text.")
+
+      assert {:ok, _message} = LLM.assemble_result(state, "ses_mention")
+    end
+
+    test "tool_calls_as_text?/1 answers the question the assembler asks" do
+      assert LLM.tool_calls_as_text?(~s|<｜｜DSML｜｜ invoke name="bash"|)
+      assert LLM.tool_calls_as_text?(~s|<｜｜DSML｜｜ calls>|)
+      assert LLM.tool_calls_as_text?("text before\n<｜｜DSML｜｜ invoke")
+
+      refute LLM.tool_calls_as_text?("just prose")
+      refute LLM.tool_calls_as_text?("<｜｜DSML｜｜ alone")
+      refute LLM.tool_calls_as_text?(nil)
+      refute LLM.tool_calls_as_text?(%{role: "assistant"})
+    end
+
+    # Builds the accumulator a stream ends with for a turn whose content arrived in one delta.
+    defp stream_state_with_content(content) do
+      payload =
+        JSON.encode!(%{"choices" => [%{"delta" => %{"role" => "assistant", "content" => content}}]})
+
+      LLM.new_stream_state()
+      |> LLM.consume_sse_chunk("data: " <> payload <> "\n\ndata: [DONE]\n\n", self())
+      |> LLM.flush_buffer(self())
+    end
+  end
+
   # The API validates the message array strictly, and a rejected array comes back as a bare
   # `HTTP 400: ""` under streaming. These cover the three shapes that were actually rejected in
   # production (issue #29); every case asserts the invariant the API enforces: a `tool` message
