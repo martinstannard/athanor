@@ -9,9 +9,30 @@ defmodule Athanor.TUI do
     Assistant output is rendered through `Athanor.Markdown`, so headings, emphasis,
     inline/code blocks, links, lists, and box-drawing tables are syntax-highlighted inline.
   - All events and commands flow through `Athanor.Bus` PubSub (`"deck:events"` and `"agent:<id>:inbox"`).
+  - `/resume <id>` rehydrates a persisted session (design §7.4) and restores its viewport via
+    `hydrate_sessions/2`; a bare `/resume` lists what can be resumed.
+  - Stacked prompts: `Enter` on non-empty input while the active session is `:streaming` or
+    `:executing_tools` **enqueues** the prompt instead of dropping it (see "Prompt stacking").
+
+  ## Prompt stacking
+
+  An agent processes one turn at a time, but a human types ahead. While the active session is
+  `:streaming`/`:executing_tools`, `Enter` on non-empty input routes to
+  `Athanor.Agent.enqueue_prompt/2` (via `Athanor.Daemon.send_session/2` ->
+  `Athanor.Orchestrator.send_session/2`), the input line is cleared, and the prompt is **not**
+  lost: the agent runs it FIFO once the current turn ends. Empty input keeps its old "re-render"
+  no-op, and an idle session still submits immediately.
+
+  The pending depth is rendered as `⧗ N queued` (plus a one-line preview of the next prompt when it
+  fits) at the right of the input line, fed by the agent's `{:prompt_queue, %{len:, next:}}` event
+  and updated optimistically on enqueue so the count is right before the round trip completes.
+  `/clear-queue` (or `Esc` on a session whose only thing pending is the queue) discards the stack
+  without touching the in-flight turn; `Esc` on a busy session still cancels, and a cancel clears
+  the queue too (`Athanor.Agent`'s documented choice: cancel means *stop*, not "start the next
+  stacked prompt the moment this one dies").
   """
 
-  alias Athanor.{Agent, Config, Daemon, Markdown, Theme}
+  alias Athanor.{Agent, Bus, Config, Daemon, Markdown, Store, Theme}
   alias Termite.{Screen, Style, Terminal}
 
   defstruct [
@@ -44,7 +65,9 @@ defmodule Athanor.TUI do
           parent_id: String.t() | nil,
           status: Agent.status(),
           entries: [entry()],
-          streaming_buffer: String.t() | nil
+          streaming_buffer: String.t() | nil,
+          prompt_queue_len: non_neg_integer(),
+          queue_next: String.t() | nil
         }
 
   @type focus :: :input | :sessions
@@ -83,9 +106,11 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear-queue to drop stacked prompts. Enter while streaming stacks the prompt for the next turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
-      streaming_buffer: nil
+      streaming_buffer: nil,
+      prompt_queue_len: 0,
+      queue_next: nil
     }
 
     base = %__MODULE__{
@@ -134,14 +159,16 @@ defmodule Athanor.TUI do
         parent_id: Map.get(s, :parent_id),
         status: Map.get(s, :status, :idle),
         entries: entries,
-        streaming_buffer: nil
+        streaming_buffer: nil,
+        prompt_queue_len: Map.get(s, :prompt_queue_len, 0),
+        queue_next: Map.get(s, :queue_next)
       }
 
       order =
         if s.id in acc.session_order do
           acc.session_order
         else
-          acc.session_order ++ [s.id]
+          append(acc.session_order, s.id)
         end
 
       %{acc | sessions: Map.put(acc.sessions, s.id, view), session_order: order}
@@ -173,24 +200,22 @@ defmodule Athanor.TUI do
     local? = Keyword.get(opts, :local, false)
 
     {target_node, mode} =
-      cond do
-        local? ->
-          {Node.self(), :local}
-
-        true ->
-          case Daemon.connect_or_start_daemon(opts) do
-            {:ok, daemon} -> {daemon, :daemon}
-            {:error, reason} -> {Node.self(), {:local_fallback, reason}}
-          end
+      if local? do
+        {Node.self(), :local}
+      else
+        case Daemon.connect_or_start_daemon(opts) do
+          {:ok, daemon} -> {daemon, :daemon}
+          {:error, reason} -> {Node.self(), {:local_fallback, reason}}
+        end
       end
 
     {:ok, relay_pid} = Daemon.attach_subscriber(target_node, self())
 
-    {:ok, main_id, hydrated_sessions} =
-      Daemon.ensure_main_conductor_and_hydrate(target_node,
-        main_id: "conductor-main",
-        model: model
-      )
+    # `--resume` / `--session <id>` are handled on the daemon (which owns the Store), so the TUI
+    # asks for the Conductor it should show and receives its rehydrated history in one round trip
+    # (plan §6.3/§6.4). A failed resume degrades to a fresh Conductor with a banner rather than a
+    # `MatchError` in the middle of starting the terminal.
+    {main_id, hydrated_sessions, resume_error} = start_sessions(target_node, model, opts)
 
     term =
       Terminal.start()
@@ -208,6 +233,12 @@ defmodule Athanor.TUI do
         hydrated_sessions: hydrated_sessions
       )
       |> add_system(mode_banner(mode, target_node))
+
+    tui =
+      case resume_error do
+        nil -> tui
+        reason -> add_system(tui, resume_error_banner(reason))
+      end
 
     try do
       loop(term, tui)
@@ -230,44 +261,7 @@ defmodule Athanor.TUI do
 
     receive do
       {^reader_ref, {:data, key}} ->
-        case handle_key(tui, key) do
-          {:quit, _tui} ->
-            :ok
-
-          {:submit, prompt, tui} ->
-            _ = Daemon.send_session(target_node, tui.active_id, prompt)
-            loop(term, tui)
-
-          {:spawn_subagent, title, prompt, tui} ->
-            parent_id = resolve_parent_conductor(tui)
-            {:ok, child_id, _pid} = Daemon.launch_subagent(target_node, parent_id, title, prompt)
-
-            tui =
-              ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
-
-            loop(term, tui)
-
-          {:spawn_conductor, title, tui} ->
-            {:ok, cond_id, _pid} =
-              Daemon.start_conductor(target_node, title: title, model: tui.model)
-
-            tui =
-              tui
-              |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
-              |> Map.put(:active_id, cond_id)
-
-            loop(term, tui)
-
-          {:cancel, tui} ->
-            _ = Daemon.cancel_session(target_node, tui.active_id)
-            loop(term, tui)
-
-          {:theme, name, tui} ->
-            loop(term, apply_theme(tui, name))
-
-          {:cont, tui} ->
-            loop(term, tui)
-        end
+        dispatch(term, target_node, handle_key(tui, key))
 
       {^reader_ref, {:signal, :winch}} ->
         term = Terminal.resize(term)
@@ -284,6 +278,70 @@ defmodule Athanor.TUI do
     end
   end
 
+  # Runs one `handle_key/2` command. Kept out of `loop/2` so the loop stays a loop (Credo's
+  # complexity budget) and the command table reads as a table.
+  defp dispatch(term, target_node, command) do
+    case command do
+      {:quit, _tui} ->
+        :ok
+
+      {:submit, prompt, tui} ->
+        _ = Daemon.send_session(target_node, tui.active_id, prompt)
+        loop(term, tui)
+
+      # Stacked prompt: same transport as `{:submit, _}` — `send_session/2` already routes through
+      # `{:enqueue_prompt, _}`, and the agent queues when busy — but the TUI bumps its own pending
+      # count immediately so the `⧗ N queued` indicator is right before the round trip lands.
+      {:enqueue, prompt, tui} ->
+        _ = Daemon.send_session(target_node, tui.active_id, prompt)
+        loop(term, optimistic_enqueue(tui, prompt))
+
+      {:cancel, tui} ->
+        _ = Daemon.cancel_session(target_node, tui.active_id)
+        loop(term, tui)
+
+      {:cont, tui} ->
+        loop(term, tui)
+
+      other ->
+        dispatch_session(term, target_node, other)
+    end
+  end
+
+  # The `{:spawn_*}`, `{:theme, _}` and `{:resume, _}` commands each rebuild the TUI state before
+  # continuing; kept in their own table so neither this nor `dispatch/3` exceeds the complexity
+  # budget.
+  defp dispatch_session(term, target_node, command) do
+    case command do
+      {:clear_queue, tui} ->
+        _ = clear_remote_queue(target_node, tui)
+        loop(term, clear_local_queue(tui))
+
+      {:spawn_subagent, title, prompt, tui} ->
+        parent_id = resolve_parent_conductor(tui)
+        {:ok, child_id, _pid} = Daemon.launch_subagent(target_node, parent_id, title, prompt)
+
+        tui = ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
+        loop(term, tui)
+
+      {:spawn_conductor, title, tui} ->
+        {:ok, cond_id, _pid} = Daemon.start_conductor(target_node, title: title, model: tui.model)
+
+        tui =
+          tui
+          |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
+          |> Map.put(:active_id, cond_id)
+
+        loop(term, tui)
+
+      {:theme, name, tui} ->
+        loop(term, apply_theme(tui, name))
+
+      {:resume, id, tui} ->
+        loop(term, handle_resume(tui, target_node, id))
+    end
+  end
+
   @doc """
   Updates the TUI state for the active session (2-arity convenience wrapper).
   """
@@ -297,18 +355,35 @@ defmodule Athanor.TUI do
   """
   @spec handle_agent_event(t(), String.t(), term()) :: t()
   def handle_agent_event(tui, session_id, {:session_started, meta}) do
-    ensure_session(tui, session_id, meta)
+    tui = ensure_session(tui, session_id, meta)
+
+    case Map.get(meta, :prompt_queue_len) do
+      len when is_integer(len) and len >= 0 ->
+        update_session(tui, session_id, fn s -> %{s | prompt_queue_len: len} end)
+
+      _ ->
+        tui
+    end
   end
 
   def handle_agent_event(tui, session_id, {:user_message, text}) do
     update_session(tui, session_id, fn s ->
-      %{s | entries: s.entries ++ [{:user, text}]}
+      %{s | entries: append(s.entries, {:user, text})}
     end)
   end
 
   def handle_agent_event(tui, session_id, {:status, status}) do
     update_session(tui, session_id, fn s ->
       %{s | status: status}
+    end)
+  end
+
+  # The agent's own report of its pending queue depth. It is authoritative — it is published by
+  # the process that owns the queue (`Athanor.Agent.notify_prompt_queue/1`) — and `next` is the
+  # one queued prompt that can be named, so it is exactly the preview the input line renders.
+  def handle_agent_event(tui, session_id, {:prompt_queue, %{len: len} = queue}) do
+    update_session(tui, session_id, fn s ->
+      %{s | prompt_queue_len: len, queue_next: Map.get(queue, :next)}
     end)
   end
 
@@ -325,7 +400,7 @@ defmodule Athanor.TUI do
 
       entries =
         if String.trim(final_text) != "" do
-          s.entries ++ [{:assistant, final_text}]
+          append(s.entries, {:assistant, final_text})
         else
           s.entries
         end
@@ -338,7 +413,7 @@ defmodule Athanor.TUI do
     update_session(tui, session_id, fn s ->
       s = flush_session_buffer(s)
       summary = format_tool_args(raw_args)
-      %{s | entries: s.entries ++ [{:tool, "⚙ #{name}(#{summary}) …"}]}
+      %{s | entries: append(s.entries, {:tool, "⚙ #{name}(#{summary}) …"})}
     end)
   end
 
@@ -359,14 +434,14 @@ defmodule Athanor.TUI do
   def handle_agent_event(tui, session_id, :cancelled) do
     update_session(tui, session_id, fn s ->
       s = flush_session_buffer(s)
-      %{s | entries: s.entries ++ [{:system, "[cancelled]"}], status: :idle}
+      %{s | entries: append(s.entries, {:system, "[cancelled]"}), status: :idle}
     end)
   end
 
   def handle_agent_event(tui, session_id, {:error, reason}) do
     update_session(tui, session_id, fn s ->
       s = flush_session_buffer(s)
-      %{s | entries: s.entries ++ [{:error, reason}], status: :error}
+      %{s | entries: append(s.entries, {:error, reason}), status: :error}
     end)
   end
 
@@ -378,9 +453,12 @@ defmodule Athanor.TUI do
   @spec handle_key(t(), binary()) ::
           {:quit, t()}
           | {:submit, String.t(), t()}
+          | {:enqueue, String.t(), t()}
+          | {:clear_queue, t()}
           | {:spawn_subagent, String.t(), String.t(), t()}
           | {:spawn_conductor, String.t(), t()}
           | {:theme, String.t() | nil, t()}
+          | {:resume, String.t() | nil, t()}
           | {:cancel, t()}
           | {:cont, t()}
   # Ctrl+C (<<3>>), Ctrl+D (<<4>>), or Ctrl+Q (<<17>>) detaches/quits TUI client
@@ -394,48 +472,21 @@ defmodule Athanor.TUI do
   end
 
   # --- Session deck navigation (focus: :sessions) ---
-  # `j` / Down move the highlight down the deck
-  def handle_key(%__MODULE__{focus: :sessions} = tui, key) when key in ["j", "\e[B"] do
-    {:cont, move_sidebar(tui, 1)}
+  # Delegated wholesale to `handle_deck_key/2` so the deck's key table stays a table (and
+  # `handle_key/2` stays within Credo's complexity budget). The clause sits exactly where the
+  # deck clauses used to, so the escaping/navigation precedence is unchanged.
+  def handle_key(%__MODULE__{focus: :sessions} = tui, data) when is_binary(data) do
+    handle_deck_key(tui, data)
   end
 
-  # `k` / Up move the highlight up the deck
-  def handle_key(%__MODULE__{focus: :sessions} = tui, key) when key in ["k", "\e[A"] do
-    {:cont, move_sidebar(tui, -1)}
-  end
-
-  # `g` / `G` jump to the top / bottom of the deck (vim-style)
-  def handle_key(%__MODULE__{focus: :sessions} = tui, "g") do
-    {:cont, set_sidebar_index(tui, 0)}
-  end
-
-  def handle_key(%__MODULE__{focus: :sessions} = tui, "G") do
-    {:cont, set_sidebar_index(tui, length(ordered_tree_entries(tui)) - 1)}
-  end
-
-  # Enter selects the highlighted session and returns focus to the input line
-  def handle_key(%__MODULE__{focus: :sessions} = tui, key) when key in ["\r", "\n"] do
-    {:cont, select_sidebar_session(tui)}
-  end
-
-  # Esc leaves the deck without changing the active session
-  def handle_key(%__MODULE__{focus: :sessions} = tui, "\e") do
-    {:cont, set_focus(tui, :input)}
-  end
-
-  # Ignore any other escape sequences while navigating the deck
-  def handle_key(%__MODULE__{focus: :sessions} = tui, "\e" <> _), do: {:cont, tui}
-
-  # Swallow all other keys while navigating the deck so they never reach the input
-  def handle_key(%__MODULE__{focus: :sessions} = tui, data) when is_binary(data),
-    do: {:cont, tui}
-
-  # Escape key cancels in-flight turn on the active session
+  # Escape key cancels the in-flight turn on the active session. With the input line empty and no
+  # turn running, it instead clears a pending prompt queue — the same "unstick me" gesture, in the
+  # only state where a bare Esc would otherwise be a no-op.
   def handle_key(tui, "\e") do
-    if active_status(tui) != :idle do
-      {:cancel, tui}
-    else
-      {:cont, tui}
+    cond do
+      active_status(tui) != :idle -> {:cancel, tui}
+      tui.input == "" and queued_len(tui) > 0 -> {:clear_queue, tui}
+      true -> {:cont, tui}
     end
   end
 
@@ -458,37 +509,7 @@ defmodule Athanor.TUI do
 
   # Enter (\r or \n)
   def handle_key(tui, key) when key in ["\r", "\n"] do
-    trimmed = String.trim(tui.input)
-
-    cond do
-      trimmed in ["/quit", "/exit", "/detach"] ->
-        {:quit, %{tui | input: ""}}
-
-      String.starts_with?(trimmed, "/theme") ->
-        rest = String.trim(String.replace_prefix(trimmed, "/theme", ""))
-        {:theme, if(rest == "", do: nil, else: rest), %{tui | input: ""}}
-
-      String.starts_with?(trimmed, "/conductor ") ->
-        title = String.trim(String.replace_prefix(trimmed, "/conductor ", ""))
-        {:spawn_conductor, if(title == "", do: "conductor", else: title), %{tui | input: ""}}
-
-      String.starts_with?(trimmed, "/spawn ") ->
-        rest = String.trim(String.replace_prefix(trimmed, "/spawn ", ""))
-
-        case String.split(rest, "::", parts: 2) do
-          [title, prompt] ->
-            {:spawn_subagent, String.trim(title), String.trim(prompt), %{tui | input: ""}}
-
-          [prompt] ->
-            {:spawn_subagent, "worker", String.trim(prompt), %{tui | input: ""}}
-        end
-
-      trimmed == "" or active_status(tui) in [:streaming, :executing_tools] ->
-        {:cont, tui}
-
-      true ->
-        {:submit, trimmed, %{tui | input: "", scroll_offset: 0}}
-    end
+    submit_or_command(tui, String.trim(tui.input))
   end
 
   # Backspace (127 or 8)
@@ -518,6 +539,187 @@ defmodule Athanor.TUI do
       {:cont, tui}
     end
   end
+
+  # The input line's `/`-command table (design §10.3: the TUI's verbs live on `/`, there is no
+  # modal prefix). Returns the command `Athanor.TUI.loop/2` acts on, so parsing stays pure and
+  # testable through `handle_key/2`.
+  #
+  # This is also where prompt stacking is decided: while the active session is busy, a non-empty
+  # prompt becomes `{:enqueue, ...}` rather than `{:submit, ...}` — same text, same cleared input,
+  # but routed to the agent's FIFO queue instead of a dropped turn (see the moduledoc).
+  defp submit_or_command(tui, trimmed) do
+    cond do
+      trimmed in ["/quit", "/exit", "/detach"] ->
+        {:quit, %{tui | input: ""}}
+
+      String.starts_with?(trimmed, "/") ->
+        slash_command(tui, trimmed)
+
+      trimmed == "" ->
+        {:cont, tui}
+
+      true ->
+        submit_or_enqueue(tui, trimmed)
+    end
+  end
+
+  # The one place the input line is reset, so "submit" and "enqueue" cannot drift apart: both
+  # clear the typed text and drop the viewport back to the newest output.
+  defp clear_input(tui), do: %{tui | input: "", scroll_offset: 0}
+
+  # -- prompt-queue view helpers -------------------------------------------------------------
+
+  @doc """
+  Depth of the active session's pending prompt queue, as last reported by the agent.
+
+  Unlike `active_status/1` this is *only* ever a display value: the agent owns the real queue,
+  and its `{:prompt_queue, _}` event is what keeps this honest (`handle_agent_event/3`).
+  """
+  @spec active_queue_len(t()) :: non_neg_integer()
+  def active_queue_len(%__MODULE__{active_id: id, sessions: sessions}) do
+    case Map.get(sessions, id) do
+      %{prompt_queue_len: len} when is_integer(len) and len >= 0 -> len
+      _ -> 0
+    end
+  end
+
+  defp queued_len(tui), do: active_queue_len(tui)
+
+  defp queued_next(%__MODULE__{active_id: id, sessions: sessions}) do
+    case Map.get(sessions, id) do
+      %{queue_next: next} -> next
+      _ -> nil
+    end
+  end
+
+  # The enqueue round trip is async (`send_session/2` publishes on the daemon's bus), so the TUI
+  # bumps its own count the moment it hands the prompt over. The agent's authoritative
+  # `{:prompt_queue, _}` then corrects it — including the case where the session had gone idle in
+  # the meantime, in which case the next event reports a depth of 0 and the indicator disappears.
+  defp optimistic_enqueue(tui, prompt) do
+    update_session(tui, tui.active_id, fn s ->
+      %{s | prompt_queue_len: s.prompt_queue_len + 1, queue_next: s.queue_next || prompt}
+    end)
+  end
+
+  # `/clear-queue` / idle-Esc: forget the stack locally and tell the agent to do the same. The
+  # remote half must be published on the *owning* node's PubSub (the agent subscribes there), so
+  # a daemon-attached client RPCs `Bus.send_command/2` on the daemon; `--local` short-circuits.
+  defp clear_remote_queue(target_node, tui) do
+    if target_node == Node.self() do
+      Agent.clear_prompt_queue(tui.active_id)
+    else
+      :erpc.call(target_node, Bus, :send_command, [tui.active_id, :clear_prompt_queue])
+    end
+  rescue
+    # A client must never die because the daemon hung up between rendering and the RPC.
+    _ -> :ok
+  end
+
+  defp clear_local_queue(tui) do
+    dropped = queued_len(tui)
+
+    tui =
+      update_session(tui, tui.active_id, fn s ->
+        %{s | prompt_queue_len: 0, queue_next: nil}
+      end)
+
+    if dropped > 0, do: add_system(tui, "Cleared #{dropped} stacked prompt(s)."), else: tui
+  end
+
+  defp slash_command(tui, trimmed) do
+    cond do
+      # `/clear-queue` drops the active session's stacked prompts without cancelling the turn.
+      # Matched as a whole line so `/clear-queuex` stays an ordinary prompt.
+      trimmed == "/clear-queue" ->
+        {:clear_queue, %{tui | input: ""}}
+
+      String.starts_with?(trimmed, "/theme") ->
+        rest = String.trim(String.replace_prefix(trimmed, "/theme", ""))
+        {:theme, if(rest == "", do: nil, else: rest), %{tui | input: ""}}
+
+      # `/resume <id>` rehydrates one persisted session (design §7.4); a bare `/resume` asks for
+      # the listing instead. `nil` is the "no argument" signal `loop/2` branches on, which is why
+      # the two spellings are matched separately rather than with a prefix test.
+      trimmed == "/resume" ->
+        resume_command(nil, tui)
+
+      String.starts_with?(trimmed, "/resume ") ->
+        resume_command(trimmed, tui)
+
+      String.starts_with?(trimmed, "/conductor ") ->
+        conductor_command(tui, trimmed)
+
+      String.starts_with?(trimmed, "/spawn ") ->
+        spawn_worker(tui, String.trim(String.replace_prefix(trimmed, "/spawn ", "")))
+
+      true ->
+        # An unknown `/` verb is still a prompt, exactly as before `/resume` was added — but while
+        # the session is busy it is a *stacked* prompt, so it goes the same way a plain prompt
+        # does.
+        submit_or_enqueue(tui, trimmed)
+    end
+  end
+
+  defp resume_command(nil, tui), do: {:resume, nil, %{tui | input: ""}}
+
+  defp resume_command(trimmed, tui) do
+    id = trimmed |> String.replace_prefix("/resume", "") |> String.trim()
+    {:resume, if(id == "", do: nil, else: id), %{tui | input: ""}}
+  end
+
+  defp conductor_command(tui, trimmed) do
+    title = String.trim(String.replace_prefix(trimmed, "/conductor ", ""))
+    {:spawn_conductor, if(title == "", do: "conductor", else: title), %{tui | input: ""}}
+  end
+
+  defp submit_or_enqueue(tui, prompt) do
+    if active_status(tui) in [:streaming, :executing_tools] do
+      {:enqueue, prompt, clear_input(tui)}
+    else
+      {:submit, prompt, clear_input(tui)}
+    end
+  end
+
+  # `/spawn <title> :: <prompt>`, or `/spawn <prompt>` for an unnamed worker.
+  defp spawn_worker(tui, rest) do
+    case String.split(rest, "::", parts: 2) do
+      [title, prompt] ->
+        {:spawn_subagent, String.trim(title), String.trim(prompt), %{tui | input: ""}}
+
+      [prompt] ->
+        {:spawn_subagent, "worker", String.trim(prompt), %{tui | input: ""}}
+    end
+  end
+
+  # --- Session deck navigation (focus: :sessions) ---
+  # The deck's key table, reached from the `focus: :sessions` clause of `handle_key/2`. It lives
+  # in its own definition group because the two `focus: :sessions`-vs-input tables rarely change
+  # together, and because splitting them keeps both within Credo's complexity budget.
+  # `j` / Down move the highlight down the deck
+  defp handle_deck_key(tui, key) when key in ["j", "\e[B"], do: {:cont, move_sidebar(tui, 1)}
+
+  # `k` / Up move the highlight up the deck
+  defp handle_deck_key(tui, key) when key in ["k", "\e[A"], do: {:cont, move_sidebar(tui, -1)}
+
+  # `g` / `G` jump to the top / bottom of the deck (vim-style)
+  defp handle_deck_key(tui, "g"), do: {:cont, set_sidebar_index(tui, 0)}
+
+  defp handle_deck_key(tui, "G"),
+    do: {:cont, set_sidebar_index(tui, length(ordered_tree_entries(tui)) - 1)}
+
+  # Enter selects the highlighted session and returns focus to the input line
+  defp handle_deck_key(tui, key) when key in ["\r", "\n"],
+    do: {:cont, select_sidebar_session(tui)}
+
+  # Esc leaves the deck without changing the active session
+  defp handle_deck_key(tui, "\e"), do: {:cont, set_focus(tui, :input)}
+
+  # Ignore any other escape sequences while navigating the deck
+  defp handle_deck_key(tui, "\e" <> _), do: {:cont, tui}
+
+  # Swallow all other keys while navigating the deck so they never reach the input
+  defp handle_deck_key(tui, _data), do: {:cont, tui}
 
   @doc """
   Renders the complete split-pane screen frame as an ANSI string.
@@ -554,10 +756,9 @@ defmodule Athanor.TUI do
     body =
       rows
       |> Enum.with_index(1)
-      |> Enum.map(fn {line, row_idx} ->
+      |> Enum.map_join("", fn {line, row_idx} ->
         Screen.escape_sequence(:cursor_move, [1, row_idx]) <> "\e[2K" <> line
       end)
-      |> Enum.join("")
 
     cursor_move = Screen.escape_sequence(:cursor_move, [cursor_col, height])
 
@@ -602,46 +803,50 @@ defmodule Athanor.TUI do
     item_lines =
       tree_entries
       |> Enum.with_index()
-      |> Enum.map(fn {{session, prefix}, idx} ->
-        selected? = session.id == tui.active_id
-        highlighted? = focused? and idx == highlight_idx
-        pointer = if highlighted?, do: "▸", else: if(selected?, do: "•", else: " ")
-        badge = status_badge(session.status)
-        role_icon = if session.role == :conductor, do: "♦ ", else: prefix
-        avail_title = max(4, sidebar_w - String.length(pointer) - String.length(role_icon) - 4)
-        short_title = String.slice(session.title, 0, avail_title)
-        raw = "#{pointer} #{role_icon}#{short_title}"
-        padded = String.pad_trailing(raw, max(1, sidebar_w - 2)) <> badge <> " "
-
-        style =
-          cond do
-            highlighted? ->
-              Style.ansi256()
-              |> Style.background(Theme.colour(theme, :selection_bg))
-              |> Style.foreground(Theme.colour(theme, :selected_fg))
-              |> Style.bold()
-
-            selected? ->
-              Style.ansi256()
-              |> Style.foreground(Theme.colour(theme, :text))
-              |> Style.bold()
-
-            session.role == :conductor ->
-              Style.ansi256()
-              |> Style.foreground(Theme.colour(theme, :text))
-              |> Style.bold()
-
-            true ->
-              Style.ansi256() |> Style.foreground(Theme.colour(theme, :muted))
-          end
-
-        Style.render_to_string(style, String.slice(padded, 0, sidebar_w))
-      end)
+      |> Enum.map(&sidebar_item_line(&1, tui, theme, sidebar_w, focused?, highlight_idx))
 
     lines = [header_line | item_lines] |> Enum.take(height)
     pad = max(0, height - length(lines))
     blank = String.duplicate(" ", sidebar_w)
     lines ++ List.duplicate(blank, pad)
+  end
+
+  defp sidebar_item_line({{session, prefix}, idx}, tui, theme, sidebar_w, focused?, highlight_idx) do
+    selected? = session.id == tui.active_id
+    highlighted? = focused? and idx == highlight_idx
+    pointer = if highlighted?, do: "▸", else: if(selected?, do: "•", else: " ")
+    badge = status_badge(session.status)
+    role_icon = if session.role == :conductor, do: "♦ ", else: prefix
+    avail_title = max(4, sidebar_w - String.length(pointer) - String.length(role_icon) - 4)
+    short_title = String.slice(session.title, 0, avail_title)
+    raw = "#{pointer} #{role_icon}#{short_title}"
+    padded = String.pad_trailing(raw, max(1, sidebar_w - 2)) <> badge <> " "
+    style = sidebar_item_style(theme, session.role, highlighted?, selected?)
+
+    Style.render_to_string(style, String.slice(padded, 0, sidebar_w))
+  end
+
+  defp sidebar_item_style(theme, _role, true, _selected?) do
+    Style.ansi256()
+    |> Style.background(Theme.colour(theme, :selection_bg))
+    |> Style.foreground(Theme.colour(theme, :selected_fg))
+    |> Style.bold()
+  end
+
+  defp sidebar_item_style(theme, _role, _highlighted?, true) do
+    Style.ansi256()
+    |> Style.foreground(Theme.colour(theme, :text))
+    |> Style.bold()
+  end
+
+  defp sidebar_item_style(theme, :conductor, _highlighted?, _selected?) do
+    Style.ansi256()
+    |> Style.foreground(Theme.colour(theme, :text))
+    |> Style.bold()
+  end
+
+  defp sidebar_item_style(theme, _role, _highlighted?, _selected?) do
+    Style.ansi256() |> Style.foreground(Theme.colour(theme, :muted))
   end
 
   defp ordered_tree_entries(tui) do
@@ -655,17 +860,18 @@ defmodule Athanor.TUI do
 
     Enum.flat_map(conductors, fn cond_session ->
       children = Enum.filter(workers, &(&1.parent_id == cond_session.id))
-      child_count = length(children)
+      [{cond_session, ""} | child_rows(children)]
+    end)
+  end
 
-      child_rows =
-        children
-        |> Enum.with_index(1)
-        |> Enum.map(fn {child, idx} ->
-          branch = if idx == child_count, do: "└─ ", else: "├─ "
-          {child, branch}
-        end)
+  # Last child gets the `└─` elbow, the rest `├─`.
+  defp child_rows(children) do
+    child_count = length(children)
 
-      [{cond_session, ""} | child_rows]
+    children
+    |> Enum.with_index(1)
+    |> Enum.map(fn {child, idx} ->
+      {child, if(idx == child_count, do: "└─ ", else: "├─ ")}
     end)
   end
 
@@ -693,7 +899,7 @@ defmodule Athanor.TUI do
     right =
       case tui.focus do
         :sessions -> "j/k or ↑/↓: move │ Enter: select │ Tab: back "
-        :input -> "Tab: deck │ ↑/↓: scroll │ /theme │ /quit "
+        :input -> "Tab: deck │ ↑/↓: scroll │ /theme │ /clear-queue │ /quit "
       end
 
     gap = max(1, width - String.length(left) - String.length(right))
@@ -709,7 +915,10 @@ defmodule Athanor.TUI do
   defp render_input_line(tui, width) do
     deck_focused? = tui.focus == :sessions
     prefix = if deck_focused?, do: "  ", else: "❯ "
-    avail = max(1, width - String.length(prefix) - 1)
+    indicator = queue_indicator(tui, width)
+    indicator_w = String.length(indicator)
+    gap = if indicator_w > 0, do: 1, else: 0
+    avail = max(1, width - String.length(prefix) - indicator_w - gap)
     input_len = String.length(tui.input)
 
     visible_input =
@@ -732,8 +941,54 @@ defmodule Athanor.TUI do
       end
 
     cursor_col = String.length(prefix) + String.length(visible_input) + 1
-    {styled_prefix <> visible_input, min(cursor_col, width)}
+
+    {styled_prefix <> visible_input <> indicator_padding(tui, width, visible_input, indicator),
+     min(cursor_col, width)}
   end
+
+  defp indicator_padding(_tui, _width, _visible_input, ""), do: ""
+
+  # The badge sits flush right, padded on *raw* lengths — the styled parts already carry ANSI
+  # escapes that `String.length/1` would count as columns. `prefix` and `gap` mirror
+  # `render_input_line/2`'s own accounting.
+  defp indicator_padding(tui, width, visible_input, indicator) do
+    used = String.length("❯ ") + String.length(visible_input) + String.length(indicator)
+    padding = String.duplicate(" ", max(1, width - used))
+
+    Style.ansi256()
+    |> Style.foreground(Theme.colour(tui.theme, :warning))
+    |> Style.bold()
+    |> Style.render_to_string(padding <> indicator)
+  end
+
+  # `⧗ N queued`, with the next prompt previewed while it fits. Empty — and therefore invisible —
+  # whenever nothing is stacked, which is the common case.
+  defp queue_indicator(tui, width) do
+    len = queued_len(tui)
+
+    if len == 0 do
+      ""
+    else
+      label = "⧗ #{len} queued"
+
+      case preview_next(queued_next(tui), width - String.length(label) - 12) do
+        nil -> label
+        preview -> label <> " │ next: " <> preview
+      end
+    end
+  end
+
+  defp preview_next(text, budget) when is_binary(text) and budget >= 8 do
+    preview = preview_line(text)
+
+    if String.length(preview) > budget do
+      String.slice(preview, 0, budget - 1) <> "…"
+    else
+      preview
+    end
+  end
+
+  defp preview_next(_text, _budget), do: nil
 
   defp render_viewport(tui, width, viewport_height) do
     session =
@@ -746,7 +1001,7 @@ defmodule Athanor.TUI do
       case session.streaming_buffer do
         nil -> session.entries
         "" -> session.entries
-        buf -> session.entries ++ [{:assistant, buf <> "▍"}]
+        buf -> append(session.entries, {:assistant, buf <> "▍"})
       end
 
     wrapped_lines =
@@ -912,8 +1167,72 @@ defmodule Athanor.TUI do
     end
   end
 
+  @doc """
+  Lists the sessions that can be resumed in the active transcript (bare `/resume`).
+
+  A read-only `Athanor.Store.list/1` directory scan rendered as plain transcript lines — no new
+  rendering path and no daemon round trip, so it still works when the id of a forgotten session
+  is what you are looking for. `opts` are forwarded to the Store (`root:` overrides
+  `~/.athanor`). Nothing is resumed here; `/resume <id>` does that (plan §6.4).
+  """
+  @spec list_resumable_sessions(t(), keyword()) :: t()
+  def list_resumable_sessions(%__MODULE__{} = tui, opts \\ []) do
+    add_system(tui, resumable_listing(Store.list(opts)))
+  end
+
+  defp resumable_listing([]) do
+    "No resumable sessions in #{Store.sessions_root()}."
+  end
+
+  defp resumable_listing(sessions) do
+    lines =
+      Enum.map(sessions, fn s ->
+        "  - #{s.id} (#{s.title || s.id}, #{s.role}) last_status=#{s.last_status} → /resume #{s.id}"
+      end)
+
+    "Resumable sessions (#{length(sessions)}) — /resume <id> to rehydrate:\n" <>
+      Enum.join(lines, "\n")
+  end
+
   defp add_system(tui, text) do
-    update_session(tui, tui.active_id, fn s -> %{s | entries: s.entries ++ [{:system, text}]} end)
+    update_session(tui, tui.active_id, fn s ->
+      %{s | entries: append(s.entries, {:system, text})}
+    end)
+  end
+
+  # One daemon round trip for "which Conductor should I show, with its history": the resume
+  # flags ride along in `opts` and `Daemon.ensure_main_conductor_and_hydrate/2` routes through
+  # `Orchestrator.resume_*` instead of creating a fresh conductor (plan §6.3, M4).
+  defp start_sessions(target_node, model, opts) do
+    resume_opts = [
+      main_id: "conductor-main",
+      model: model,
+      resume: Keyword.get(opts, :resume) == true,
+      session: Keyword.get(opts, :session)
+    ]
+
+    case Daemon.ensure_main_conductor_and_hydrate(target_node, resume_opts) do
+      {:ok, main_id, sessions} ->
+        {main_id, sessions, nil}
+
+      {:error, reason} ->
+        {:ok, main_id, sessions} =
+          Daemon.ensure_main_conductor_and_hydrate(target_node,
+            main_id: "conductor-main",
+            model: model
+          )
+
+        {main_id, sessions, reason}
+    end
+  end
+
+  defp resume_error_banner({:resume_failed, id, reason}) do
+    "Could not resume #{id} (#{inspect(reason)}) — started a fresh Conductor instead. " <>
+      "Use /resume to list what is resumable."
+  end
+
+  defp resume_error_banner(reason) do
+    "Resume failed (#{inspect(reason)}) — started a fresh Conductor instead."
   end
 
   defp mode_banner(:daemon, node) do
@@ -936,6 +1255,27 @@ defmodule Athanor.TUI do
   defp describe_daemon_error(:daemon_not_ready), do: "daemon is still starting up"
   defp describe_daemon_error(other), do: inspect(other)
 
+  # `/resume` with no id: list what is on disk. With an id: rehydrate it on the daemon and
+  # rebuild its viewport through the existing `hydrate_sessions/2` +
+  # `Daemon.messages_to_tui_entries/1` path — deliberately no new rendering (plan §6.4).
+  defp handle_resume(tui, _target_node, nil), do: list_resumable_sessions(tui)
+
+  defp handle_resume(tui, target_node, id) do
+    case Daemon.resume_session(target_node, id) do
+      {:ok, ^id, _pid} ->
+        sessions = target_node |> Daemon.fetch_full_sessions() |> Enum.filter(&(&1.id == id))
+
+        tui
+        |> ensure_session(id, %{})
+        |> Map.put(:active_id, id)
+        |> Map.put(:scroll_offset, 0)
+        |> hydrate_sessions(sessions)
+
+      {:error, reason} ->
+        add_system(tui, "Could not resume #{id}: #{inspect(reason)}")
+    end
+  end
+
   defp ensure_session(tui, session_id, meta) do
     existing =
       Map.get(tui.sessions, session_id, %{
@@ -945,7 +1285,9 @@ defmodule Athanor.TUI do
         parent_id: Map.get(meta, :parent_id),
         status: Map.get(meta, :status, :idle),
         entries: [],
-        streaming_buffer: nil
+        streaming_buffer: nil,
+        prompt_queue_len: 0,
+        queue_next: nil
       })
 
     updated = %{
@@ -959,11 +1301,17 @@ defmodule Athanor.TUI do
       if session_id in tui.session_order do
         tui.session_order
       else
-        tui.session_order ++ [session_id]
+        append(tui.session_order, session_id)
       end
 
     %{tui | sessions: Map.put(tui.sessions, session_id, updated), session_order: order}
   end
+
+  # Appends one element to a list, preserving order. `List.insert_at/3` with `-1` is documented
+  # as "always append", so this is exactly `list ++ [element]` without allocating the
+  # intermediate single-element list (`Credo.Check.Refactor.AppendSingleItem`). Transcripts are
+  # rendered in append order, so the order is load-bearing.
+  defp append(list, element), do: List.insert_at(list, -1, element)
 
   defp update_session(tui, session_id, fun) do
     tui = ensure_session(tui, session_id, %{})
@@ -976,7 +1324,7 @@ defmodule Athanor.TUI do
   defp flush_session_buffer(%{streaming_buffer: ""} = s), do: %{s | streaming_buffer: nil}
 
   defp flush_session_buffer(%{streaming_buffer: buf} = s) do
-    %{s | entries: s.entries ++ [{:assistant, buf}], streaming_buffer: nil}
+    %{s | entries: append(s.entries, {:assistant, buf}), streaming_buffer: nil}
   end
 
   defp replace_last_tool_entry(session, replacement) do
@@ -991,7 +1339,7 @@ defmodule Athanor.TUI do
   defp replace_first_tool([], replacement, acc), do: Enum.reverse([{:tool, replacement} | acc])
 
   defp replace_first_tool([{:tool, _old} | rest], replacement, acc) do
-    Enum.reverse(rest) ++ [{:tool, replacement} | acc]
+    append(Enum.reverse(rest), {:tool, replacement}) ++ acc
   end
 
   defp replace_first_tool([head | rest], replacement, acc) do

@@ -1,7 +1,8 @@
 defmodule Athanor.TUITest do
   use ExUnit.Case, async: true
 
-  alias Athanor.TUI
+  alias Athanor.{Daemon, Store, TUI}
+  alias Athanor.Store.Transcript
 
   describe "handle_key/2" do
     test "accumulates text, handles backspace, and submits on Enter" do
@@ -176,4 +177,128 @@ defmodule Athanor.TUITest do
       assert frame_done =~ "It uses Elixir 1.19."
     end
   end
+
+  # design §7.4 / plan §6.4 + M4: the `/resume` command surface.
+  describe "/resume" do
+    test "/resume <id> parses to the resume branch and bare /resume to the listing" do
+      tui = TUI.new()
+
+      typed = elem(TUI.handle_key(tui, "/resume abc"), 1)
+      assert {:resume, "abc", cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      # Surrounding whitespace is trimmed; the id itself is preserved verbatim.
+      typed = elem(TUI.handle_key(tui, "/resume   worker-1a2b  "), 1)
+      assert {:resume, "worker-1a2b", _} = TUI.handle_key(typed, "\r")
+
+      # No argument is the "list what is resumable" signal `loop/2` branches on.
+      typed = elem(TUI.handle_key(tui, "/resume"), 1)
+      assert {:resume, nil, cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      # Only the exact verb is a command: `/resumex` stays an ordinary prompt.
+      typed = elem(TUI.handle_key(tui, "/resumex"), 1)
+      assert {:submit, "/resumex", _} = TUI.handle_key(typed, "\r")
+    end
+
+    @tag :tmp_dir
+    test "bare /resume lists the resumable sessions from disk", %{tmp_dir: dir} do
+      :ok =
+        Store.ensure_session(
+          [id: "resume-listed", role: :worker, title: "Listed worker", cd: dir],
+          root: dir
+        )
+
+      tui = TUI.new(width: 100, height: 24)
+      listed = TUI.list_resumable_sessions(tui, root: dir)
+
+      assert Enum.any?(entries(listed), fn
+               {:system, msg} -> msg =~ "resume-listed" and msg =~ "/resume"
+               _ -> false
+             end)
+
+      # An empty store is a plain transcript line, never a crash or an empty screen.
+      empty = TUI.list_resumable_sessions(TUI.new(), root: Path.join(dir, "no-such-root"))
+
+      assert Enum.any?(entries(empty), fn
+               {:system, msg} -> msg =~ "No resumable sessions"
+               _ -> false
+             end)
+    end
+
+    @tag :tmp_dir
+    test "a resume hydrates the persisted transcript into a rendered frame", %{tmp_dir: dir} do
+      id = "resume-hydrated"
+
+      :ok =
+        Store.ensure_session(
+          [id: id, role: :conductor, title: "Hydrated conductor", cd: dir],
+          root: dir
+        )
+
+      records = [
+        {"user", %{"role" => "user", "content" => "Read the note"}, 1},
+        {"assistant",
+         %{
+           "role" => "assistant",
+           "content" => "",
+           "tool_calls" => [
+             %{
+               "id" => "call_read_note",
+               "type" => "function",
+               "function" => %{"name" => "read_file", "arguments" => ~s({"path":"note.txt"})}
+             }
+           ]
+         }, 2},
+        {"tool", %{"role" => "tool", "tool_call_id" => "call_read_note", "content" => "gold"}, 3},
+        {"assistant",
+         %{
+           "role" => "assistant",
+           "content" => "The note says alchemical_gold.",
+           "tool_calls" => []
+         }, 4}
+      ]
+
+      for {kind, payload, seq} <- records do
+        :ok =
+          Transcript.append(
+            Store.session_dir(id, root: dir),
+            Transcript.new_record(kind, payload, seq: seq, session_id: id)
+          )
+      end
+
+      {:ok, loaded, _meta} = Store.load_records(id, root: dir)
+      messages = Enum.flat_map(loaded, &persisted_message/1)
+
+      # This is exactly the daemon path a client takes (plan §6.4/§9.8): the loaded records are
+      # turned into TUI entries by `Daemon.messages_to_tui_entries/1` and fed to the existing
+      # `hydrate_sessions/2` — the resume command adds no rendering of its own.
+      session = %{
+        id: id,
+        title: "Hydrated conductor",
+        role: :conductor,
+        parent_id: nil,
+        status: :idle,
+        messages: messages
+      }
+
+      tui = TUI.new(width: 100, height: 30, active_id: id) |> TUI.hydrate_sessions([session])
+
+      assert tui.sessions[id].entries == Daemon.messages_to_tui_entries(messages)
+      assert tui.sessions[id].entries != []
+
+      frame = TUI.render_frame(tui)
+      assert is_binary(frame) and frame != ""
+      assert frame =~ "The note says alchemical_gold."
+      assert frame =~ "Read the note"
+    end
+  end
+
+  defp entries(tui), do: tui.sessions[tui.active_id].entries
+
+  defp persisted_message(%{"kind" => kind, "payload" => payload})
+       when kind in ["user", "assistant", "tool"],
+       do: [payload]
+
+  defp persisted_message(_record), do: []
 end

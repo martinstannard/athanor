@@ -305,13 +305,13 @@ defmodule Athanor.Markdown do
       bold = Style.bold(Style.ansi256())
       muted = style([{:fg, Theme.colour(theme, :table_cell)}])
 
-      [
-        table_border("┌", "┬", "┐", widths, border_style)
-        | table_row_lines(header, widths, aligns, bold, theme)
-      ] ++
-        [table_border("├", "┼", "┤", widths, border_style)] ++
-        Enum.flat_map(body, &table_row_lines(&1, widths, aligns, muted, theme)) ++
+      Enum.concat([
+        [table_border("┌", "┬", "┐", widths, border_style)],
+        table_row_lines(header, widths, aligns, bold, theme),
+        [table_border("├", "┼", "┤", widths, border_style)],
+        Enum.flat_map(body, &table_row_lines(&1, widths, aligns, muted, theme)),
         [table_border("└", "┴", "┘", widths, border_style)]
+      ])
     end
   end
 
@@ -513,7 +513,7 @@ defmodule Athanor.Markdown do
   end
 
   defp do_wrap([], _width, cur, done) do
-    done = if cur == [], do: done, else: [Enum.reverse(cur) | done]
+    done = flush_line(cur, done)
     done |> Enum.reverse() |> Enum.map(&trim_line/1)
   end
 
@@ -536,12 +536,15 @@ defmodule Athanor.Markdown do
         else
           # Flush the current line, then start a new one with this segment,
           # hard-splitting it if it is itself wider than the target width.
-          done = if cur == [], do: done, else: [Enum.reverse(cur) | done]
+          done = flush_line(cur, done)
           {cur, done} = push_long(seg, kind, width, done)
           do_wrap(rest, width, cur, done)
         end
     end
   end
+
+  defp flush_line([], done), do: done
+  defp flush_line(cur, done), do: [Enum.reverse(cur) | done]
 
   defp push_long(seg, kind, width, done) do
     case hard_chunks(seg, width) do

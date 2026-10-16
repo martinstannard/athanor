@@ -176,8 +176,8 @@ defmodule Athanor.Theme do
     wanted = normalize(name)
 
     key =
-      case Enum.find(themes(), &(&1.key == wanted)) do
-        nil -> Map.get(@aliases, Atom.to_string(wanted))
+      case Enum.find(themes(), &(Atom.to_string(&1.key) == wanted)) do
+        nil -> Map.get(@aliases, wanted)
         theme -> theme.key
       end
 
@@ -258,14 +258,16 @@ defmodule Athanor.Theme do
   defp encode(hex, :truecolor), do: hex_to_rgb(hex)
   defp encode(hex, :ansi256), do: hex_to_ansi256(hex)
 
-  defp normalize(name) when is_atom(name), do: name
+  # Canonical spelling of a theme name: atoms and strings are folded to the same
+  # snake_case string form (e.g. `:tokyo_night`, `"Tokyo Night"` -> `"tokyo_night"`),
+  # so lookups need no `String.to_atom/1` (which would leak atoms from user input).
+  defp normalize(name) when is_atom(name), do: Atom.to_string(name) |> normalize()
 
   defp normalize(name) when is_binary(name) do
     name
     |> String.downcase()
     |> String.replace(~r/[^a-z0-9]+/, "_")
     |> String.trim("_")
-    |> String.to_atom()
   end
 
   # -- Theme definitions -----------------------------------------------------
