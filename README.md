@@ -26,6 +26,18 @@ mix athanor
 is not already running. Manage it with `mix athanor.daemon --status` / `--stop` / `--restart`, or run
 fully in-process with `mix athanor --local`.
 
+### Distribution cookie
+
+The daemon and its clients authenticate to each other with an Erlang distribution cookie. Athanor
+**generates** one on first use and persists it at `<ATHANOR_HOME>/cookie` (`~/.athanor/cookie` by
+default) with mode `0600` — there is deliberately no hardcoded default, because a default shipped in
+a public source tree is a publicly-known shared secret.
+
+Override it with `ATHANOR_COOKIE` (or `config :athanor, cookie: ...`); move the file with
+`ATHANOR_HOME`. The value is shared state between a daemon and any client that connects to it, so
+**changing it requires restarting the daemon** — a client and daemon with different cookies simply
+cannot see each other, and the failure looks like "no daemon is running".
+
 To select a specific OpenCode Go model:
 
 ```bash

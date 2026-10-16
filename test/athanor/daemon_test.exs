@@ -3,6 +3,20 @@ defmodule Athanor.DaemonTest do
 
   alias Athanor.Daemon
 
+  @moduletag :tmp_dir
+
+  # The distribution cookie is now persisted under `Athanor.Config.home/0`, so point that at the
+  # per-test tmp dir; no test should ever write into the real `~/.athanor`.
+  setup %{tmp_dir: dir} do
+    previous = System.get_env("ATHANOR_HOME")
+    System.put_env("ATHANOR_HOME", dir)
+    on_exit(fn -> Athanor.DaemonTest.restore_env("ATHANOR_HOME", previous) end)
+    :ok
+  end
+
+  def restore_env(key, nil), do: System.delete_env(key)
+  def restore_env(key, value), do: System.put_env(key, value)
+
   test "attaches subscriber relay, relays deck events, and cleans up relay on client exit" do
     {:ok, main_id, sessions} =
       Daemon.ensure_main_conductor_and_hydrate(Node.self(), main_id: "conductor-daemon-test")

@@ -9,10 +9,15 @@ defmodule Athanor.Daemon do
   or Sub-Agents.
   """
 
-  alias Athanor.{Bus, Orchestrator}
+  alias Athanor.{Bus, Config, Orchestrator}
+
+  require Logger
 
   @default_daemon_node :"athanor_daemon@127.0.0.1"
-  @default_cookie :athanor_local_secret_cookie
+
+  # Cookie file, relative to `Athanor.Config.home/0` (`~/.athanor`, or `ATHANOR_HOME`).
+  # Generated on first use rather than hardcoded — see `cookie/0`.
+  @cookie_file "cookie"
 
   @doc """
   Returns the target daemon Erlang node name.
@@ -27,15 +32,76 @@ defmodule Athanor.Daemon do
   end
 
   @doc """
-  Returns the Erlang distribution cookie used by Athanor daemon and clients.
+  Returns the Erlang distribution cookie shared by the daemon and its clients.
+
+  Resolved from `ATHANOR_COOKIE`, then `:athanor, :cookie`, then a cookie persisted at
+  `<Config.home()>/cookie` (mode `0600`) which is **generated on first use**.
+
+  There is deliberately **no hardcoded default**. A default baked into a published source tree is
+  a publicly-known shared secret, and a distribution cookie is what authenticates node-to-node
+  access. Generated values are 256 bits from `:crypto.strong_rand_bytes/1`.
+
+  Because the value is persisted, a daemon started on its own (`mix athanor.daemon`, or a service
+  manager) and a client started later agree without coordination. If the file cannot be written, a
+  warning is logged and an ephemeral value is used — in that case only a daemon spawned *by that
+  client* will match, since the cookie is also passed on the spawned daemon's command line.
   """
   @spec cookie() :: atom()
   def cookie do
     case System.get_env("ATHANOR_COOKIE") do
-      nil -> Application.get_env(:athanor, :cookie, @default_cookie)
-      "" -> Application.get_env(:athanor, :cookie, @default_cookie)
-      val -> dynamic_atom(val)
+      val when is_binary(val) and val != "" -> dynamic_atom(val)
+      _ -> configured_cookie() || persisted_cookie()
     end
+  end
+
+  defp configured_cookie do
+    case Application.get_env(:athanor, :cookie) do
+      nil -> nil
+      "" -> nil
+      val when is_atom(val) -> val
+      val when is_binary(val) -> dynamic_atom(val)
+    end
+  end
+
+  defp persisted_cookie do
+    path = Path.join(Config.home(), @cookie_file)
+
+    case File.read(path) do
+      {:ok, contents} ->
+        case String.trim(contents) do
+          "" -> write_cookie(path)
+          value -> dynamic_atom(value)
+        end
+
+      {:error, :enoent} ->
+        write_cookie(path)
+
+      {:error, reason} ->
+        ephemeral_cookie(reason)
+    end
+  end
+
+  defp write_cookie(path) do
+    value = random_cookie()
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(path, value),
+         :ok <- File.chmod(path, 0o600) do
+      dynamic_atom(value)
+    else
+      {:error, reason} -> ephemeral_cookie(reason)
+    end
+  end
+
+  defp random_cookie, do: Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
+
+  defp ephemeral_cookie(reason) do
+    Logger.warning(
+      "Athanor.Daemon: could not persist the distribution cookie (#{inspect(reason)}); using an " <>
+        "ephemeral one. Set ATHANOR_COOKIE so a separately started daemon agrees with this client."
+    )
+
+    dynamic_atom(random_cookie())
   end
 
   @doc """
