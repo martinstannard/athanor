@@ -294,8 +294,9 @@ A pure-Elixir, non-blocking split-pane UI (`lib/athanor/tui.ex`).
 Implements a client/daemon split so an SSH session can attach to the live server
 (`lib/athanor/daemon.ex`; design §7.7).
 
-- Defaults: node `:"athanor_daemon@127.0.0.1"` (env `ATHANOR_DAEMON_NODE`), cookie
-  `:athanor_local_secret_cookie` (env `ATHANOR_COOKIE`).
+  - Defaults: node `:"athanor_daemon@127.0.0.1"` (env `ATHANOR_DAEMON_NODE`). The cookie is
+    **generated on first use** and persisted at `<ATHANOR_HOME>/cookie` with mode `0600`,
+    overridable with `ATHANOR_COOKIE` — there is no hardcoded default (see README).
 - `start_as_daemon/1` starts `epmd` and Distributed Erlang on the current VM; `connect_or_start_daemon/1`
   starts a lightweight `athanor_tui_<hex>@127.0.0.1` client node, connects to the daemon, and (unless
   `auto_start: false`) spawns a detached `elixir --name … --detached -S mix run --no-halt` daemon.
@@ -332,7 +333,7 @@ env var, then `Application.get_env(:athanor, …)`, then a module-attribute defa
 | API key | `OPENCODE_API_KEY` | `:api_key` | (falls back to the file below) |
 | OpenCode auth file | — | — | `~/.local/share/opencode/auth.json` (`"opencode-go" -> "key"`) |
 | Daemon node | `ATHANOR_DAEMON_NODE` | `:daemon_node` | `:athanor_daemon@127.0.0.1` |
-| Daemon cookie | `ATHANOR_COOKIE` | `:cookie` | `:athanor_local_secret_cookie` |
+| Daemon cookie | `ATHANOR_COOKIE` | `:cookie` | generated → `<ATHANOR_HOME>/cookie` (0600) |
 | Store root (§12) | `ATHANOR_HOME` | `:home` | `~/.athanor` |
 | Store enable (§12) | `ATHANOR_STORE` | `:store_enabled` | `true` |
 | Compaction threshold (§12) | `ATHANOR_COMPACTION_THRESHOLD` | `:compaction_threshold` | `0.8` |

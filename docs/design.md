@@ -271,8 +271,9 @@ A layered memory system so Conductors and Sub-Agents accumulate durable knowledg
 > **Implemented subset** (`lib/athanor/daemon.ex`, `lib/mix/tasks/athanor.daemon.ex`): the daemon
 > node, `mix athanor.daemon` (run / `--status` / `--stop` / `--restart`), thin TUI attach/detach,
 > multi-client mirroring via per-client relays, and full session hydration on attach. The realised
-> node name is `athanor_daemon@127.0.0.1` (env `ATHANOR_DAEMON_NODE`, cookie
-> `athanor_local_secret_cookie` / `ATHANOR_COOKIE`) — **not** `athanor@127.0.0.1` as written below.
+> node name is `athanor_daemon@127.0.0.1` (env `ATHANOR_DAEMON_NODE`); the distribution cookie is
+> generated on first use and persisted at `<ATHANOR_HOME>/cookie` (`0600`, env `ATHANOR_COOKIE`)
+> — **not** `athanor@127.0.0.1` as written below.
 > **Still planned:** systemd-user auto-start, standalone `athanor` / `athanor attach` binaries, and
 > the optional native `:ssh.daemon/2` subsystem.
 
