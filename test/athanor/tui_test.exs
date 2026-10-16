@@ -343,4 +343,99 @@ defmodule Athanor.TUITest do
        do: [payload]
 
   defp persisted_message(_record), do: []
+
+  describe "activity indicator (throbber)" do
+    test "busy?/1 reflects whether any session is working" do
+      idle = TUI.new()
+      refute TUI.busy?(idle)
+
+      streaming =
+        TUI.handle_agent_event(idle, "conductor-main", {:status, :streaming})
+
+      assert TUI.busy?(streaming)
+
+      tools =
+        TUI.handle_agent_event(idle, "conductor-main", {:status, :executing_tools})
+
+      assert TUI.busy?(tools)
+
+      # a *different* session being busy still counts
+      other = TUI.handle_agent_event(idle, "worker-1", {:status, :streaming})
+      assert TUI.busy?(other)
+    end
+
+    test "tick/1 is a no-op while idle, so an idle TUI never re-renders" do
+      # `new/1` starts dirty so the first frame is drawn; simulate "already rendered once".
+      rendered = %{TUI.new() | dirty: false}
+
+      assert TUI.tick(rendered) == rendered
+      refute TUI.tick(rendered).dirty
+    end
+
+    test "tick/1 advances the frame and marks the state dirty while busy" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event("conductor-main", {:status, :streaming})
+        |> Map.put(:dirty, false)
+
+      ticked = TUI.tick(tui)
+
+      assert ticked.tick == 1
+      assert ticked.dirty
+      assert ticked.tick != tui.tick
+    end
+
+    test "the status bar animates through distinct frames while busy" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event("conductor-main", {:status, :streaming})
+
+      frames =
+        tui
+        |> Stream.unfold(fn t -> {TUI.render_frame(t), TUI.tick(t)} end)
+        |> Enum.take(4)
+
+      assert length(Enum.uniq(frames)) == 4, "expected four distinct frames while streaming"
+
+      # and every frame carries one of the spinner glyphs, not the old static dot
+      for frame <- frames do
+        assert Enum.any?(
+                 ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+                 &String.contains?(frame, &1)
+               ),
+               "expected a spinner glyph in the frame"
+
+        refute frame =~ "● STREAMING"
+      end
+    end
+
+    test "an idle frame shows the static badge and no spinner" do
+      frame = TUI.render_frame(TUI.new(width: 100, height: 24))
+
+      assert frame =~ "○ IDLE"
+      refute frame =~ "⠋"
+      refute frame =~ "⠙"
+    end
+
+    test "a busy sub-agent is visible in the deck even when another session is active" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event(
+          "worker-9",
+          {:session_started,
+           %{id: "worker-9", title: "busy worker", role: :worker, parent_id: "conductor-main"}}
+        )
+        |> TUI.handle_agent_event("worker-9", {:status, :executing_tools})
+
+      # conductor-main is the active (idle) session, so the status bar is static...
+      assert TUI.render_frame(tui) =~ "○ IDLE"
+      # ...but the spinner still appears in the deck for the busy worker
+      assert Enum.any?(
+               ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+               &String.contains?(TUI.render_frame(tui), &1)
+             )
+
+      assert TUI.busy?(tui)
+    end
+  end
 end
