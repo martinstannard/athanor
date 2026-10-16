@@ -864,10 +864,14 @@ defmodule Athanor.Agent do
     agent_pid = self()
     cd = state.cd
     session_id = state.id
+    # The role travels with the call so `Athanor.Tools` can refuse a conductor-only tool to a
+    # worker: schema gating keeps those tools out of a worker's prompt, but a model can still name
+    # a tool it was never offered, and refusing then has to be a decision, not an accident.
+    role = state.role
 
     {pid, ref} =
       spawn_monitor(fn ->
-        tool_messages = Enum.map(tool_calls, &run_tool(&1, agent_pid, cd, session_id))
+        tool_messages = Enum.map(tool_calls, &run_tool(&1, agent_pid, cd, session_id, role))
         send(agent_pid, {:tools_result, tool_messages})
       end)
 
@@ -876,14 +880,14 @@ defmodule Athanor.Agent do
     |> arm_watchdog("tool_execution")
   end
 
-  defp run_tool(tc, agent_pid, cd, session_id) do
+  defp run_tool(tc, agent_pid, cd, session_id, role) do
     name = tc.function.name
     raw_args = tc.function.arguments
 
     send(agent_pid, {:tool_event, {:tool_start, name, raw_args}})
 
     output =
-      case Tools.execute(name, raw_args, cd: cd, session_id: session_id) do
+      case Tools.execute(name, raw_args, cd: cd, session_id: session_id, role: role) do
         {:ok, res} ->
           send(agent_pid, {:tool_event, {:tool_end, name, {:ok, res}}})
           res

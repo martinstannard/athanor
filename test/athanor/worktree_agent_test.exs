@@ -3,7 +3,7 @@ defmodule Athanor.Worktree.AgentTest do
   # these tests drive real agents through the shared Bus.
   use ExUnit.Case, async: false
 
-  alias Athanor.{Agent, Bus, Git, GitRepo, Orchestrator, Worktree}
+  alias Athanor.{Agent, Bus, Git, GitRepo, Orchestrator, Tools, Worktree}
   alias Athanor.Worktree.Server, as: WorktreeServer
 
   @moduletag :tmp_dir
@@ -165,6 +165,101 @@ defmodule Athanor.Worktree.AgentTest do
              "athanor/wt-branch\n"
 
     cleanup([parent, worker_id])
+  end
+
+  # -- the conductor tools (plan §10.5) -------------------------------------------------------
+
+  test "create_worktree / list_worktrees / remove_worktree round-trip through Tools.execute/3", %{
+    repo: repo,
+    root: root
+  } do
+    parent = start_conductor!(repo)
+    opts = [cd: repo, session_id: parent]
+
+    assert {:ok, created} = Tools.execute("create_worktree", %{}, opts)
+    assert created =~ "Worktree ready at"
+    assert created =~ "branch athanor/#{parent}"
+
+    {:ok, path} = WorktreeServer.path_for(parent)
+    assert String.starts_with?(path, root)
+
+    assert {:ok, listed} = Tools.execute("list_worktrees", %{}, opts)
+    assert listed =~ path
+    assert listed =~ "session=#{parent}"
+    # The main working tree is listed too, marked as such.
+    assert listed =~ "(main working tree)"
+
+    assert {:ok, removed} = Tools.execute("remove_worktree", %{"session_id" => parent}, opts)
+    assert removed =~ "Removed the worktree for session #{parent}"
+
+    refute File.exists?(path)
+    assert :error = WorktreeServer.path_for(parent)
+
+    assert {:ok, after_removal} = Tools.execute("list_worktrees", %{}, opts)
+    refute after_removal =~ path
+
+    cleanup([parent])
+  end
+
+  test "create_worktree reports a dirty repository with the remedy, not just a failure", %{
+    repo: repo
+  } do
+    parent = start_conductor!(repo)
+    File.write!(Path.join(repo, "user-wip.txt"), "not committed
+")
+
+    assert {:error, message} = Tools.execute("create_worktree", %{}, cd: repo, session_id: parent)
+    assert message =~ "uncommitted changes"
+    assert message =~ "user-wip.txt"
+    assert message =~ "allow_dirty: true"
+    assert :error = WorktreeServer.path_for(parent)
+
+    File.rm!(Path.join(repo, "user-wip.txt"))
+    cleanup([parent])
+  end
+
+  test "remove_worktree refuses uncommitted work unless force, and keeps the branch by default", %{
+    repo: repo
+  } do
+    parent = start_conductor!(repo)
+
+    assert {:ok, _} = Tools.execute("create_worktree", %{}, cd: repo, session_id: parent)
+    {:ok, path} = WorktreeServer.path_for(parent)
+    File.write!(Path.join(path, "wip.txt"), "wip\n")
+
+    assert {:error, message} =
+             Tools.execute("remove_worktree", %{"session_id" => parent}, cd: repo, session_id: parent)
+
+    assert message =~ "uncommitted or untracked files"
+    assert message =~ "force: true"
+    assert File.exists?(Path.join(path, "wip.txt"))
+
+    assert {:ok, _} =
+             Tools.execute(
+               "remove_worktree",
+               %{"session_id" => parent, "force" => true},
+               cd: repo,
+               session_id: parent
+             )
+
+    refute File.exists?(path)
+    # :keep is the default, so the branch (and any commit on it) survives the worktree.
+    assert match?({:ok, _}, Git.run(["rev-parse", "--verify", "refs/heads/athanor/#{parent}"], cd: repo))
+
+    cleanup([parent])
+  end
+
+  test "a worker is refused the worktree tools by name", %{repo: repo} do
+    # Schema gating keeps them out of a worker's prompt; this is the other half — a model can still
+    # name a tool it was never offered, and the refusal has to be a decision rather than an accident.
+    for tool <- ["create_worktree", "list_worktrees", "remove_worktree"] do
+      assert {:error, "Unknown tool: " <> ^tool} =
+               Tools.execute(tool, %{}, cd: repo, session_id: "some-worker", role: :worker)
+    end
+
+    # ...and a conductor is allowed.
+    assert {:ok, listed} = Tools.execute("list_worktrees", %{}, cd: repo, role: :conductor)
+    assert listed =~ repo
   end
 
   # -- helpers --------------------------------------------------------------------------------

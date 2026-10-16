@@ -179,10 +179,13 @@ Assistant output is rendered through `Athanor.Markdown`, so headings, lists, cod
 > exist. §7.7 is **partly implemented** as `Athanor.Daemon`. Each heading below is annotated
 > accordingly.
 
-### 7.1 Git Worktree Isolation (`Athanor.Worktree`) — *planned*
-- When a Conductor spawns multiple coding sub-agents in parallel, editing the same working directory causes git index and file conflicts.
-- `launch_subagent` will accept `worktree: "feature/branch-name"`, automatically running `git worktree add` into `.athanor/worktrees/<session_id>` and setting the sub-agent's `cd` to that isolated worktree.
-- Provide worktree lifecycle commands (`list_worktrees`, `cleanup_worktrees`) to prune merged or orphaned worktrees once the Conductor verifies the work.
+### 7.1 Git Worktree Isolation (`Athanor.Worktree`) — *implemented*
+- When a Conductor spawns multiple coding sub-agents in parallel, editing the same working directory causes git index and file conflicts. A worktree gives each worker its own checkout, and since `:cd` is the only isolation seam Athanor has, isolation is exactly "set the worker's `cd`".
+- `launch_subagent(…, worktree: true)` (or `worktree: "<ref>"`) creates or reuses a worktree and points the worker's `cd` at it. `create_worktree` / `list_worktrees` / `remove_worktree` are the explicit forms, **conductor-only** (a worker is neither told they exist nor allowed to call them), and `mix athanor.worktree list | cleanup [--force]` covers an operator's own tidying. A sub-agent without `worktree:` starts in its **parent's** directory rather than the daemon's, so a relative path in its file or search tools means what its conductor meant.
+- **Location:** `~/.athanor/worktrees/<repo-slug>-<sha8>/<session_id>` — outside the repository, because git permits a nested worktree but the parent's `git status` then shows it as untracked and parent-relative searches descend into it. `ATHANOR_WORKTREE_INSIDE=1` opts into `<repo>/.athanor/worktrees`, which must then be gitignored (`git check-ignore -q`) or the create path refuses.
+- **The clean-tree rule (the one that matters):** a worktree branches from committed `HEAD`, so uncommitted changes in the source repo are invisible inside it. `add/2` therefore refuses a dirty source repo and names the offending paths; `allow_dirty: true` proceeds and reports the `base_sha` it branched from. Stashing or committing on the user's behalf is not the harness's decision to make.
+- **Branches:** one per session (`athanor/<session_id>`), and an existing one is re-attached rather than re-created, so a session that is torn down and spawned again keeps its branch. Removal keeps the branch unless `branch: :delete` is asked for, which uses `git branch -d` — the *safe* delete, which refuses unmerged work. Git's `--force` is never implied.
+- All git access goes through `Athanor.Git.run/2` (no shell, bounded by `worktree_git_timeout_ms`, structured exit code), every mutation through the single `Athanor.Worktree.Server` (git's worktree metadata is shared, so parallel adds race), and that Server is supervised **before** `AgentSupervisor` so a worker can resolve its `cd` while starting. The tracked map is a cache: `init/1` rebuilds it from `git worktree list --porcelain` plus a per-repository sidecar, and git remains the authority for what exists.
 
 ### 7.2 Goal-Driven Autonomy & "Trust-but-Verify" (`Athanor.Goal`) — *planned*
 > Implementation plan: `docs/plans/7.2-goal-driven-autonomy.md` (status: not implemented).

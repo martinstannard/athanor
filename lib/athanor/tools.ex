@@ -11,6 +11,7 @@ defmodule Athanor.Tools do
 
   alias Athanor.{Bus, Orchestrator, SessionId}
   alias Athanor.Tools.{Glob, Grep}
+  alias Athanor.Tools.Worktree, as: WorktreeTools
 
   @default_bash_timeout_ms 30_000
   @default_subagent_wait_timeout_ms 120_000
@@ -205,6 +206,15 @@ defmodule Athanor.Tools do
                 "type" => "boolean",
                 "description" =>
                   "If true, block until the sub-agent completes its turn and return its output. Defaults to false (fire-and-forget; parent is notified via PubSub when done)."
+              },
+              "worktree" => %{
+                "type" => "boolean",
+                "description" =>
+                  "If true, the worker gets its own git worktree (its own checkout and branch) and works there, so parallel workers cannot fight over the same working directory. A string value means \"branch from that ref\". Refused when the repository has uncommitted changes: a worktree branches from committed HEAD, so the worker would not see them."
+              },
+              "base" => %{
+                "type" => "string",
+                "description" => "With worktree=true, the ref the worker's worktree branches from (default HEAD)."
               }
             },
             "required" => ["title", "prompt"]
@@ -258,6 +268,82 @@ defmodule Athanor.Tools do
               }
             },
             "required" => ["session_id", "message"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "create_worktree",
+          "description" =>
+            "Create an isolated git worktree (its own checkout and branch) and return its path. Use this to pin a session to a stable base, or to prepare a checkout you will hand to a sub-agent. Refuses to run when the repository has uncommitted changes, because a worktree branches from committed HEAD and a worker would not see them; pass allow_dirty=true to proceed anyway.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "session_id" => %{
+                "type" => "string",
+                "description" => "Session to assign the worktree to. Defaults to the calling session."
+              },
+              "branch" => %{
+                "type" => "boolean",
+                "description" =>
+                  "true (default) puts the worktree on its own branch; false gives it a detached HEAD, for throwaway verification work."
+              },
+              "base" => %{
+                "type" => "string",
+                "description" => "Ref to branch from (default HEAD). Use it to pin a worker to a known-good commit."
+              },
+              "allow_dirty" => %{
+                "type" => "boolean",
+                "description" =>
+                  "Proceed even though the source repository has uncommitted changes. The result names the commit it branched from."
+              }
+            },
+            "required" => []
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "list_worktrees",
+          "description" =>
+            "List every git worktree of the current repository: path, branch (or detached), and the owning session when one is known.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{}
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "remove_worktree",
+          "description" =>
+            "Remove a worktree, by session_id or path. Refuses to destroy a worktree with uncommitted files unless force=true; the branch is kept unless branch=\"delete\", which uses git's safe delete and so also refuses unmerged work.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "session_id" => %{
+                "type" => "string",
+                "description" => "Session whose worktree should be removed."
+              },
+              "path" => %{
+                "type" => "string",
+                "description" => "Path of the worktree to remove, for one no session owns."
+              },
+              "force" => %{
+                "type" => "boolean",
+                "description" => "Discard modified and untracked files inside the worktree. Defaults to false."
+              },
+              "branch" => %{
+                "type" => "string",
+                "enum" => ["keep", "delete"],
+                "description" =>
+                  "\"keep\" (default) leaves the branch; \"delete\" removes it with git branch -d, which refuses unmerged work."
+              }
+            },
+            "required" => []
           }
         }
       }
@@ -377,11 +463,8 @@ defmodule Athanor.Tools do
       Bus.subscribe("agent:#{child_id}:events")
     end
 
-    spawn_opts = [
-      id: child_id,
-      cd: cd,
-      notify_parent_on_done: not wait?
-    ]
+    spawn_opts =
+      [id: child_id, notify_parent_on_done: not wait?] |> cd_or_worktree(args, cd)
 
     case Orchestrator.launch_subagent(parent_id, title, prompt, spawn_opts) do
       {:ok, ^child_id, _pid} ->
@@ -396,8 +479,20 @@ defmodule Athanor.Tools do
 
       {:error, reason} ->
         if wait?, do: Bus.unsubscribe("agent:#{child_id}:events")
-        {:error, "Failed to launch sub-agent: #{inspect(reason)}"}
+        {:error, "Failed to launch sub-agent: #{describe_launch_error(reason)}"}
     end
+  end
+
+  def execute("create_worktree", args, opts) when is_map(args) do
+    with :ok <- conductor_only(opts, "create_worktree"), do: WorktreeTools.create(args, opts)
+  end
+
+  def execute("list_worktrees", args, opts) when is_map(args) do
+    with :ok <- conductor_only(opts, "list_worktrees"), do: WorktreeTools.list(args, opts)
+  end
+
+  def execute("remove_worktree", args, opts) when is_map(args) do
+    with :ok <- conductor_only(opts, "remove_worktree"), do: WorktreeTools.remove(args, opts)
   end
 
   def execute("list_sessions", _args, _opts) do
@@ -456,7 +551,10 @@ defmodule Athanor.Tools do
              "launch_subagent",
              "list_sessions",
              "session_output",
-             "send_session"
+             "send_session",
+             "create_worktree",
+             "list_worktrees",
+             "remove_worktree"
            ] do
     {:error, "Missing or invalid required arguments for tool #{tool_name}"}
   end
@@ -464,6 +562,38 @@ defmodule Athanor.Tools do
   def execute(unknown_tool, _args, _opts) do
     {:error, "Unknown tool: #{unknown_tool}"}
   end
+
+  # Worktree management is a conductor's job: a worker has no business making more worktrees. It is
+  # not told these tools exist (the schemas are role-gated), and it is refused by name if it asks
+  # anyway — the wording matches the catch-all below, so schema gating and dispatch agree.
+  defp conductor_only(opts, tool_name) do
+    case Keyword.get(opts, :role, :conductor) do
+      :conductor -> :ok
+      _other -> {:error, "Unknown tool: #{tool_name}"}
+    end
+  end
+
+  # An isolated worker's directory is decided by its worktree, so `:cd` must *not* travel with
+  # `:worktree` — `Orchestrator.launch_subagent/4` refuses that contradictory pair rather than
+  # silently preferring one. `worktree: "ref"` means "branch from that ref".
+  defp cd_or_worktree(spawn_opts, %{"worktree" => worktree} = args, _cd)
+       when is_binary(worktree) or worktree == true do
+    Keyword.put(spawn_opts, :worktree, worktree_settings(args, worktree))
+  end
+
+  defp cd_or_worktree(spawn_opts, _args, cd), do: Keyword.put(spawn_opts, :cd, cd)
+
+  defp worktree_settings(_args, ref) when is_binary(ref), do: [base: ref]
+  defp worktree_settings(args, _true), do: [base: args["base"] || "HEAD"]
+
+  # The dirty-source refusal is the one a model is most likely to hit, and "inspect(reason)" would
+  # not tell it what to do about it.
+  defp describe_launch_error({:dirty_worktree_source, summary}) do
+    "the repository has uncommitted changes (#{summary}), so an isolated worker would not see " <>
+      "them. Commit or stash first, then spawn the worker again."
+  end
+
+  defp describe_launch_error(reason), do: inspect(reason)
 
   defp edit_content(content, path, full_path, old_str, new_str) do
     parts = String.split(content, old_str)

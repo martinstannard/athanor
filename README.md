@@ -79,6 +79,7 @@ client can pick a different theme from a local one while both watch the same dae
 - **`Athanor.TUI`** — Terminal user interface powered by `Termite`.
 - **`Athanor.Theme`** — Semantic colour roles and the built-in theme palettes.
 - **`Athanor.Markdown`** — Terminal Markdown renderer used by the TUI (theme-aware).
+- **`Athanor.Worktree`** / **`Athanor.Worktree.Server`** — Git worktree isolation: `launch_subagent(…, worktree: true)` gives a sub-agent its own checkout and `cd`, and the Server serialises every mutation. See §7.1 of `docs/design.md` for the location, branch and clean-tree rules.
 - **`Athanor.Daemon`** — Persistent BEAM node plus attach/detach bridge for remote clients.
 
 See `docs/architecture.md` for the full supervision tree and message flow.

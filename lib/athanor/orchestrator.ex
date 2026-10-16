@@ -80,7 +80,12 @@ defmodule Athanor.Orchestrator do
   # conductor never mentioned (the trap a live session fell into, `docs/handover.md`).
   defp with_cd(opts) do
     case {Keyword.fetch(opts, :cd), Keyword.get(opts, :worktree, false)} do
-      {{:ok, _cd}, _worktree} ->
+      # Both is a contradiction, not a precedence puzzle: the worktree decides the directory, and
+      # silently honouring one of them would hide that the caller meant the other.
+      {{:ok, _cd}, setting} when setting not in [false, nil] ->
+        {:error, {:conflicting_cd, :worktree_and_cd}}
+
+      {{:ok, _cd}, _no_worktree} ->
         {:ok, Keyword.delete(opts, :worktree)}
 
       {:error, setting} when setting in [false, nil] ->
@@ -112,6 +117,8 @@ defmodule Athanor.Orchestrator do
   end
 
   defp normalize_worktree_settings(true), do: []
+  # `worktree: "some-ref"` reads as "branch this worker from that ref".
+  defp normalize_worktree_settings(ref) when is_binary(ref), do: [base: ref]
   defp normalize_worktree_settings(settings) when is_list(settings), do: settings
 
   # The parent's `cd` is the repository the work is actually in — the daemon's own working directory

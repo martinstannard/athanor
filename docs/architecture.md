@@ -23,6 +23,7 @@ supervision tree (`lib/athanor/application.ex`):
 Athanor.Supervisor (:one_for_one)
 ├── Athanor.AgentRegistry    (Registry, keys: :unique)     # session id -> Agent pid + metadata
 ├── Athanor.PubSub           (Registry, keys: :duplicate)  # topic -> [subscriber pid] (backs Athanor.Bus)
+├── Athanor.Worktree.Server  (GenServer, :permanent)       # session id -> worktree; serialises git (§7.1)
 ├── Athanor.AgentSupervisor  (DynamicSupervisor, :one_for_one)
 │     ├── Athanor.Agent "conductor-main"  (role: :conductor, parent_id: nil)
 │     │     ├── Athanor.Agent "worker-3-a1b2"  (role: :worker, parent_id: "conductor-main")
@@ -38,6 +39,10 @@ Athanor.Supervisor (:one_for_one)
   `false` (used by unit tests).
 - `:temporary` means a session is *not* restarted if it crashes — a crashed worker is gone, not
   respawned.
+- `Athanor.Worktree.Server` is `:permanent` and is placed **before** `Athanor.AgentSupervisor`, so a
+  sub-agent can resolve the worktree that will become its `cd` while it starts. It is the only writer
+  of `session_id → worktree`; `git worktree add` mutates shared state, so parallel creates would race
+  (§7.1).
 - `Athanor.Store.Recorder` is `:permanent` (persistence must come back if it dies) and is placed
   **last** so every other child can publish before it subscribes. It consumes `"deck:events"` and is
   the only process that writes the sessions tree (§12).
@@ -53,6 +58,9 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 | `Athanor.Agent` | `GenServer` | The recursive agent loop and per-session state machine — used for both Conductors and Workers. |
 | `Athanor.Orchestrator` | module | The only writer of agent child specs: spawn / lookup / list / read / prompt / cancel sessions. |
 | `Athanor.Bus` | module | PubSub helpers over `Athanor.PubSub`: `subscribe/1`, `unsubscribe/1`, `broadcast/2`, `publish_event/3`, `send_command/2`. |
+| `Athanor.Git` | module | The only place Athanor shells out to git: no shell, bounded by `Config.worktree_git_timeout_ms/0`, structured exit code, and `GIT_DIR`/`GIT_INDEX_FILE` cleared so `cd:` decides the repository (§7.1). |
+| `Athanor.Worktree` | struct + module | Worktree isolation: read side (`repository?/1`, `clean?/1`, `list/1`, `root_for/2`) plus `add/2`/`remove/2` with the clean-tree, branch and safe-delete rules (§7.1). |
+| `Athanor.Worktree.Server` | `GenServer` | Serialises every worktree mutation, tracks `session_id → worktree` (rebuilt from git + a sidecar on restart), and publishes `worktree_*` events on `deck:events` (§7.1). |
 | `Athanor.Tools` | module | LLM tool JSON Schemas (`schemas/1`) and the local execution engine (`execute/3`). |
 | `Athanor.LLM` | module | Stateless OpenCode Go (`opencode-go`) SSE streaming client. |
 | `Athanor.TUI` | struct + pure funcs | `Termite` split-pane "agent-deck"-style terminal UI. |

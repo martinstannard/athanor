@@ -23,9 +23,22 @@ defmodule Athanor.ToolsTest do
       assert "list_sessions" in names
       assert "session_output" in names
       assert "send_session" in names
+      assert "create_worktree" in names
+      assert "list_worktrees" in names
+      assert "remove_worktree" in names
       # workspace tools are still present for conductors
       assert "glob" in names
       assert "grep" in names
+    end
+
+    test "worktree management is not advertised to a worker" do
+      names =
+        Tools.schemas(role: :worker)
+        |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
+
+      refute "create_worktree" in names
+      refute "list_worktrees" in names
+      refute "remove_worktree" in names
     end
   end
 
