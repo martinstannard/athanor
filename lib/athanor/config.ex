@@ -8,6 +8,12 @@ defmodule Athanor.Config do
   @default_theme :default
   @default_search_max_results 200
   @default_search_max_file_bytes 1_048_576
+  @default_home "~/.athanor"
+  @default_store_enabled true
+  @default_recorder_max_open_fds 64
+  @default_compaction_threshold 0.8
+  @default_context_limit_tokens 128_000
+  @default_compaction_keep_fraction 0.4
   @default_search_ignores [
     ".git",
     "_build",
@@ -172,6 +178,137 @@ defmodule Athanor.Config do
       nil -> nil
       "" -> nil
       val -> val
+    end
+  end
+
+  # -- Store (§7.4 / plan §8) ----------------------------------------------------
+
+  @doc """
+  Returns the Store root directory (design §7.4).
+
+  Resolved from `ATHANOR_HOME`, then `:athanor, :home`, then `~/.athanor`, and always
+  `Path.expand/1`ed. Every Store entry point also accepts a per-call `root:` option, which
+  wins over this value (that is how tests avoid touching a real user's home directory).
+  """
+  @spec home() :: String.t()
+  def home do
+    raw =
+      System.get_env("ATHANOR_HOME") ||
+        Application.get_env(:athanor, :home, @default_home)
+
+    Path.expand(raw)
+  end
+
+  @doc """
+  Whether session persistence is enabled (default `true`).
+
+  `ATHANOR_STORE=0` (or `"false"`) disables persistence entirely, as does
+  `config :athanor, store_enabled: false`.
+  """
+  @spec store_enabled?() :: boolean()
+  def store_enabled? do
+    case System.get_env("ATHANOR_STORE") do
+      nil ->
+        Application.get_env(:athanor, :store_enabled, @default_store_enabled) != false
+
+      value ->
+        normalised = value |> String.trim() |> String.downcase()
+        normalised not in ["0", "false", "no", "off"]
+    end
+  end
+
+  @doc """
+  Maximum number of transcript append handles `Athanor.Store.Recorder` keeps open at once
+  (default `#{@default_recorder_max_open_fds}`).
+
+  Each handle is one open `transcript.jsonl` file descriptor; a long-lived node writing many
+  concurrent sessions would otherwise grow past the process's fd limit. When the cap is
+  reached the Recorder closes its least-recently-used handle, and the session's next record
+  reopens it lazily (appending still lands at EOF, so ordering is preserved).
+
+  Overridable via `ATHANOR_RECORDER_MAX_OPEN_FDS` or `:athanor, :recorder_max_open_fds`.
+  Non-positive or unparseable values fall back to the default.
+  """
+  @spec recorder_max_open_fds() :: pos_integer()
+  def recorder_max_open_fds do
+    positive_int(
+      "ATHANOR_RECORDER_MAX_OPEN_FDS",
+      :recorder_max_open_fds,
+      @default_recorder_max_open_fds
+    )
+  end
+
+  @doc """
+  Fraction of the context window at which compaction is triggered (default
+  `#{@default_compaction_threshold}`).
+
+  Overridable via `ATHANOR_COMPACTION_THRESHOLD` or `:athanor, :compaction_threshold`.
+  Values outside `0.0..1.0` fall back to the default.
+  """
+  @spec compaction_threshold() :: float()
+  def compaction_threshold do
+    ratio("ATHANOR_COMPACTION_THRESHOLD", :compaction_threshold, @default_compaction_threshold)
+  end
+
+  @doc """
+  Model context window in tokens (default `#{@default_context_limit_tokens}`).
+
+  Overridable via `ATHANOR_CONTEXT_LIMIT_TOKENS` or `:athanor, :context_limit_tokens`. The
+  default is an estimate pending a real per-model limit (plan OQ4).
+  """
+  @spec context_limit_tokens() :: pos_integer()
+  def context_limit_tokens do
+    positive_int(
+      "ATHANOR_CONTEXT_LIMIT_TOKENS",
+      :context_limit_tokens,
+      @default_context_limit_tokens
+    )
+  end
+
+  @doc """
+  Fraction of the context window kept as recent turns after compaction (default
+  `#{@default_compaction_keep_fraction}`).
+
+  Overridable via `ATHANOR_COMPACTION_KEEP_FRACTION` or `:athanor, :compaction_keep_fraction`.
+  """
+  @spec compaction_keep_fraction() :: float()
+  def compaction_keep_fraction do
+    ratio(
+      "ATHANOR_COMPACTION_KEEP_FRACTION",
+      :compaction_keep_fraction,
+      @default_compaction_keep_fraction
+    )
+  end
+
+  @doc """
+  How aggressively transcript appends are synced to disk:
+
+    * `:per_record` (default) — `:file.datasync/1` after every record
+    * `:batched` — the writer may defer `datasync` until a batch boundary
+
+  Resolved from `ATHANOR_TRANSCRIPT_SYNC`, then `:athanor, :transcript_sync`. Unknown values
+  fall back to `:per_record`, which is the crash-safe default (plan §5.2).
+  """
+  @spec transcript_sync() :: :per_record | :batched
+  def transcript_sync do
+    raw =
+      System.get_env("ATHANOR_TRANSCRIPT_SYNC") ||
+        Application.get_env(:athanor, :transcript_sync, :per_record)
+
+    case to_string(raw) |> String.trim() |> String.downcase() do
+      "batched" -> :batched
+      _other -> :per_record
+    end
+  end
+
+  # Shared float parser for the ratio-shaped Store settings; rejects NaN-ish and
+  # out-of-range input rather than propagating a nonsense threshold into compaction.
+  defp ratio(env, key, default) do
+    raw = System.get_env(env) || Application.get_env(:athanor, key, default)
+
+    case Float.parse(to_string(raw)) do
+      {value, _rest} when value > 0.0 and value <= 1.0 -> value
+      _other -> default
     end
   end
 end
