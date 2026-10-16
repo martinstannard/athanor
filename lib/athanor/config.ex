@@ -28,6 +28,11 @@ defmodule Athanor.Config do
   @default_log_max_bytes 5_000_000
   @default_rpc_timeout_ms 15_000
   @default_turn_timeout_ms 900_000
+  @default_worktree_root "~/.athanor/worktrees"
+  @default_worktree_inside_repo false
+  @default_worktree_allow_dirty false
+  @default_worktree_git_timeout_ms 30_000
+  @default_worktree_branch_prefix "athanor/"
 
   @doc """
   Returns the OpenCode Go base URL.
@@ -388,5 +393,86 @@ defmodule Athanor.Config do
   @spec turn_timeout_ms() :: pos_integer()
   def turn_timeout_ms do
     positive_int("ATHANOR_TURN_TIMEOUT_MS", :turn_timeout_ms, @default_turn_timeout_ms)
+  end
+
+  @doc """
+  Root directory for sub-agent git worktrees (default `#{@default_worktree_root}`).
+
+  `Athanor.Worktree.root_for/2` places each session at
+  `<worktree_root>/<repo-slug>-<repo-hash>/<session_id>`. Always `Path.expand/1`ed so a literal
+  `~` can never reach the filesystem. Overridable via `ATHANOR_WORKTREE_ROOT` or
+  `:athanor, :worktree_root`.
+  """
+  @spec worktree_root() :: String.t()
+  def worktree_root do
+    (System.get_env("ATHANOR_WORKTREE_ROOT") ||
+       Application.get_env(:athanor, :worktree_root, @default_worktree_root))
+    |> Path.expand()
+  end
+
+  @doc """
+  Whether session worktrees live inside the repository (`<repo>/.athanor/worktrees/<session_id>`)
+  instead of under `worktree_root/0` (default `#{@default_worktree_inside_repo}`).
+
+  Git permits a nested worktree, but the parent's `git status` then shows it as untracked and
+  parent-relative searches walk into it, so the create path requires this location to be
+  gitignored. Overridable via `ATHANOR_WORKTREE_INSIDE` or `:athanor, :worktree_inside_repo`.
+  """
+  @spec worktree_inside_repo?() :: boolean()
+  def worktree_inside_repo? do
+    boolean_env("ATHANOR_WORKTREE_INSIDE", :worktree_inside_repo, @default_worktree_inside_repo)
+  end
+
+  @doc """
+  Whether a worktree may be created from a repository with uncommitted changes
+  (default `#{@default_worktree_allow_dirty}`).
+
+  A worktree branches from committed `HEAD`, so a dirty source repo means the worker silently
+  cannot see the user's in-flight edits — refused by default. Overridable via
+  `ATHANOR_WORKTREE_ALLOW_DIRTY` or `:athanor, :worktree_allow_dirty`.
+  """
+  @spec worktree_allow_dirty?() :: boolean()
+  def worktree_allow_dirty? do
+    boolean_env(
+      "ATHANOR_WORKTREE_ALLOW_DIRTY",
+      :worktree_allow_dirty,
+      @default_worktree_allow_dirty
+    )
+  end
+
+  @doc """
+  Timeout, in milliseconds, for every `git` invocation made by `Athanor.Git`
+  (default `#{@default_worktree_git_timeout_ms}`).
+
+  Overridable via `ATHANOR_WORKTREE_GIT_TIMEOUT_MS` or `:athanor, :worktree_git_timeout_ms`.
+  """
+  @spec worktree_git_timeout_ms() :: pos_integer()
+  def worktree_git_timeout_ms do
+    positive_int(
+      "ATHANOR_WORKTREE_GIT_TIMEOUT_MS",
+      :worktree_git_timeout_ms,
+      @default_worktree_git_timeout_ms
+    )
+  end
+
+  @doc """
+  Prefix for the branch a session's worktree is created on (default `"#{@default_worktree_branch_prefix}"`).
+
+  Unique per session on purpose: `git worktree add -b` fails if the branch exists, and a branch
+  already checked out elsewhere cannot be checked out again. Overridable via
+  `ATHANOR_WORKTREE_BRANCH_PREFIX` or `:athanor, :worktree_branch_prefix`.
+  """
+  @spec worktree_branch_prefix() :: String.t()
+  def worktree_branch_prefix do
+    System.get_env("ATHANOR_WORKTREE_BRANCH_PREFIX") ||
+      Application.get_env(:athanor, :worktree_branch_prefix, @default_worktree_branch_prefix)
+  end
+
+  defp boolean_env(env, key, default) do
+    case System.get_env(env) || Application.get_env(:athanor, key, default) do
+      value when is_boolean(value) -> value
+      value when is_binary(value) -> String.downcase(value) in ["1", "true", "yes", "on"]
+      _ -> default
+    end
   end
 end
