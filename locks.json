@@ -1,6 +1,13 @@
 {
   "version": 1,
-  "locks": {},
+  "locks": {
+    "31": {
+      "agent_id": "conductor-main",
+      "branch": "feat/clear-context",
+      "claimed_at": "2026-10-16T12:58:04.810071765Z",
+      "signed_by": "conductor-main"
+    }
+  },
   "settings": {
     "stale_lock_timeout_minutes": 60
   }
