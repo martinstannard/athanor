@@ -13,3 +13,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
 
 ### Changed
+- Document chainlink's single-session-per-database model and its multi-agent workarounds (#32)
