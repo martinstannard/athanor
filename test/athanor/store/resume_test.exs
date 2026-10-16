@@ -328,6 +328,55 @@ defmodule Athanor.Store.ResumeTest do
     cleanup([id])
   end
 
+  # -- /clear marker (design §7.4, issue #31) -----------------------------------
+
+  test "a clear marker drops every message before it on resume", %{tmp_dir: dir} do
+    id = "resume-clear"
+
+    assert :ok =
+             Store.ensure_session(
+               [id: id, role: :conductor, title: "Cleared", cd: dir],
+               root: dir
+             )
+
+    sdir = Store.session_dir(id, root: dir)
+
+    # An append-only transcript: the pre-clear turns stay on disk, the marker records the reset,
+    # and the post-clear turns follow it.
+    records = [
+      {"user", %{"role" => "user", "content" => "old question"}, 1},
+      {"assistant", %{"role" => "assistant", "content" => "old answer", "tool_calls" => []}, 2},
+      {"clear", %{"event" => "clear", "ts" => "2026-01-01T00:00:00Z"}, 3},
+      {"user", %{"role" => "user", "content" => "new question"}, 4},
+      {"assistant", %{"role" => "assistant", "content" => "new answer", "tool_calls" => []}, 5}
+    ]
+
+    for {kind, payload, seq} <- records do
+      assert :ok =
+               Transcript.append(
+                 sdir,
+                 Transcript.new_record(kind, payload, seq: seq, session_id: id)
+               )
+    end
+
+    assert {:ok, ^id, pid} = Orchestrator.resume_session(id, root: dir)
+
+    messages = Agent.get_state(pid).messages
+
+    # C13: the system message is re-derived; only the post-clear turns are replayed.
+    assert Enum.map(messages, &message_role/1) == ["system", "user", "assistant"]
+
+    assert canonical(Enum.drop(messages, 1)) ==
+             canonical([
+               %{"role" => "user", "content" => "new question"},
+               %{"role" => "assistant", "content" => "new answer", "tool_calls" => []}
+             ])
+
+    refute Enum.any?(messages, &(Map.get(&1, "content") == "old answer"))
+
+    cleanup([id])
+  end
+
   # -- helpers ------------------------------------------------------------------
 
   defp message_role(msg), do: Map.get(msg, :role) || Map.get(msg, "role")

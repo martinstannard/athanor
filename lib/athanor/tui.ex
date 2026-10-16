@@ -11,6 +11,9 @@ defmodule Athanor.TUI do
   - All events and commands flow through `Athanor.Bus` PubSub (`"deck:events"` and `"agent:<id>:inbox"`).
   - `/resume <id>` rehydrates a persisted session (design §7.4) and restores its viewport via
     `hydrate_sessions/2`; a bare `/resume` lists what can be resumed.
+  - `/clear` resets the **active** session's conversation context in place — no daemon restart and
+    no new session. The agent's working set returns to its system message and the local viewport
+    transcript is emptied, so the cleared context is never rendered as if it still existed.
   - Stacked prompts: `Enter` on non-empty input while the active session is `:streaming` or
     `:executing_tools` **enqueues** the prompt instead of dropping it (see "Prompt stacking").
 
@@ -31,6 +34,11 @@ defmodule Athanor.TUI do
   could go stale and make Esc a silent no-op — see `docs/wedge-findings.md`), and a cancel stops
   the turn *and* clears the queue (`Athanor.Agent`'s documented choice: cancel means *stop*, not
   "start the next stacked prompt the moment this one dies").
+
+  `/clear` is the heavier sibling: it drops the queue **and** wipes the conversation context, so it
+  is consistent with the same "stop, don't resume the stack" rule (the agent stops any in-flight
+  turn and drops the pending prompts as part of the reset). `/clear-queue` remains the narrow
+  "forget the stack but let the current turn finish" verb.
 
   ## Responsiveness
 
@@ -53,6 +61,11 @@ defmodule Athanor.TUI do
   # only re-renders while something is busy, so an idle TUI costs nothing extra.
   @spinner_frames ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
   @tick_ms 120
+
+  # The single line left in a session's viewport after `/clear` replaces its transcript. Shared by
+  # the issuing client (which clears immediately on dispatch) and every attached client (which
+  # clears on the agent's `{:context_cleared, _}` event), so clearing twice is idempotent.
+  @clear_notice "[context cleared — this session's transcript was reset]"
 
   defstruct [
     :agent,
@@ -127,7 +140,7 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear-queue to drop stacked prompts. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear to reset the active session's context, /clear-queue to drop stacked prompts. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
       streaming_buffer: nil,
       prompt_queue_len: 0,
@@ -405,6 +418,12 @@ defmodule Athanor.TUI do
         tui = rpc_note(tui, Daemon.cancel_session(target_node, tui.active_id), "cancel")
         loop(term, tui)
 
+      # `/clear`: reset the ACTIVE session's context on the agent, then (on success) drop the
+      # local viewport transcript too — a server-side context that is gone must not keep
+      # rendering, or the user sees stale history that no longer exists. See `clear_context/2`.
+      {:clear_context, tui} ->
+        loop(term, clear_context(target_node, tui))
+
       {:cont, tui} ->
         loop(term, tui)
 
@@ -519,6 +538,14 @@ defmodule Athanor.TUI do
     end)
   end
 
+  # The agent reset this session's context (`/clear`). Handled for *every* session id, not just
+  # the active one: a client other than the one that typed `/clear` still has the stale transcript
+  # on screen and must drop it too (§10.6 multi-client input). Clearing twice is idempotent
+  # because `cleared_view/1` replaces the entries rather than appending.
+  def handle_agent_event(tui, session_id, {:context_cleared, _cleared}) do
+    update_session(tui, session_id, &cleared_view/1)
+  end
+
   def handle_agent_event(tui, session_id, {:text_delta, chunk}) do
     update_session(tui, session_id, fn s ->
       current = s.streaming_buffer || ""
@@ -587,6 +614,7 @@ defmodule Athanor.TUI do
           | {:submit, String.t(), t()}
           | {:enqueue, String.t(), t()}
           | {:clear_queue, t()}
+          | {:clear_context, t()}
           | {:spawn_subagent, String.t(), String.t(), t()}
           | {:spawn_conductor, String.t(), t()}
           | {:theme, String.t() | nil, t()}
@@ -764,13 +792,55 @@ defmodule Athanor.TUI do
     if dropped > 0, do: add_system(tui, "Cleared #{dropped} stacked prompt(s)."), else: tui
   end
 
+  @doc """
+  Empties the active session's local viewport transcript — the client half of `/clear`
+  (issue #31).
+
+  Called by `dispatch/3` after a *successful* `Athanor.Daemon.clear_context/2`, and shared with
+  the agent's own `{:context_cleared, _}` event through `cleared_view/1`, so the issuing client
+  and every attached peer converge on the same view. Public and pure because it is easy to assert
+  without a terminal.
+  """
+  @spec clear_local_context(t()) :: t()
+  def clear_local_context(tui) do
+    update_session(tui, tui.active_id, &cleared_view/1)
+  end
+
+  # `/clear`: ask the daemon to reset the ACTIVE session's context, and drop the local viewport
+  # transcript **only when that succeeds**. A failed (unreachable or wedged) daemon must not leave
+  # the user looking at an empty viewport for a context that is still live server-side; the
+  # failure is reported through `rpc_note/3` instead. Bounded like every other RPC
+  # (`Athanor.Daemon.rpc/4`), never a bare `:erpc.call/4`.
+  defp clear_context(target_node, tui) do
+    case Daemon.clear_context(target_node, tui.active_id) do
+      :ok -> clear_local_context(tui)
+      other -> rpc_note(tui, other, "clear context")
+    end
+  end
+
+  # The single definition of "this session's view has been cleared": the transcript entries are
+  # *replaced* by one notice (so this client's `/clear` and the agent's `{:context_cleared, _}`
+  # event are idempotent), any half-streamed buffer is dropped, and the queue indicator is
+  # reset because the agent drops the queue as part of the clear.
+  defp cleared_view(session) do
+    %{
+      session
+      | entries: [{:system, @clear_notice}],
+        streaming_buffer: nil,
+        prompt_queue_len: 0,
+        queue_next: nil
+    }
+  end
+
+  # The whole-line "clear" verbs are matched as their own function heads: `/clear` discards the
+  # active session's **whole conversation context** in place, `/clear-queue` only forgets the
+  # *stacked prompts*. Both are exact matches, so `/clearx` / `/clear-queuex` stay ordinary
+  # prompts, and neither belongs in the argument-parsing `cond` below.
+  defp slash_command(tui, "/clear"), do: {:clear_context, %{tui | input: ""}}
+  defp slash_command(tui, "/clear-queue"), do: {:clear_queue, %{tui | input: ""}}
+
   defp slash_command(tui, trimmed) do
     cond do
-      # `/clear-queue` drops the active session's stacked prompts without cancelling the turn.
-      # Matched as a whole line so `/clear-queuex` stays an ordinary prompt.
-      trimmed == "/clear-queue" ->
-        {:clear_queue, %{tui | input: ""}}
-
       String.starts_with?(trimmed, "/theme") ->
         rest = String.trim(String.replace_prefix(trimmed, "/theme", ""))
         {:theme, if(rest == "", do: nil, else: rest), %{tui | input: ""}}
@@ -1048,7 +1118,7 @@ defmodule Athanor.TUI do
     right =
       case tui.focus do
         :sessions -> "j/k or ↑/↓: move │ Enter: select │ Tab: back "
-        :input -> "Tab: deck │ ↑/↓: scroll │ /theme │ /clear-queue │ /quit "
+        :input -> "Tab: deck │ ↑/↓: scroll │ /theme │ /clear │ /quit "
       end
 
     gap = max(1, width - String.length(left) - String.length(right))

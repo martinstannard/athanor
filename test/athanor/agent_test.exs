@@ -454,6 +454,157 @@ defmodule Athanor.AgentTest do
     end
   end
 
+  # --- issue #31: /clear resets the active session's context -------------------------------
+
+  describe "clear_context/1 (issue #31)" do
+    setup do
+      # "deck:events" is a :duplicate Registry key: subscribe exactly once per test.
+      Bus.subscribe("deck:events")
+      :ok
+    end
+
+    test "resets messages to just the system message, turn_count to 0 and clears the latch",
+         %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: tool_loop_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
+      assert_receive {:agent_event, {:turn_complete, "done"}}
+
+      before = Agent.get_state(agent)
+      # system + user + assistant(tool_calls) + tool + assistant
+      assert length(before.messages) == 5
+      assert before.turn_count == 1
+
+      # Force the compaction latch on so "clear resets it" is a real transition, not a no-op.
+      :sys.replace_state(agent, fn s -> %{s | compacted?: true} end)
+      assert :sys.get_state(agent).compacted? == true
+
+      assert :ok = Agent.clear_context(agent)
+
+      assert_receive {:agent_event, {:context_cleared, %{}}}
+
+      state = Agent.get_state(agent)
+      assert [%{role: "system", content: content}] = state.messages
+      assert is_binary(content) and content != ""
+      assert state.turn_count == 0
+      assert :sys.get_state(agent).compacted? == false
+      assert state.status == :idle
+    end
+
+    test "the rebuilt system message is the one derived at init", %{tmp_dir: tmp_dir} do
+      {:ok, agent} = Agent.start_link(cd: tmp_dir, system_prompt: "You are a test prompt.")
+
+      assert :ok = Agent.clear_context(agent)
+
+      assert [%{role: "system", content: "You are a test prompt."}] =
+               Agent.get_state(agent).messages
+    end
+
+    test "works via cast", %{tmp_dir: tmp_dir} do
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: final_answer_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "hello")
+      assert_receive {:agent_event, {:turn_complete, "final answer"}}
+      assert length(Agent.get_state(agent).messages) == 3
+
+      GenServer.cast(agent, :clear_context)
+
+      assert_receive {:agent_event, {:context_cleared, %{}}}
+      assert [%{role: "system"}] = Agent.get_state(agent).messages
+    end
+
+    test "works via a bus command routed by id", %{tmp_dir: tmp_dir} do
+      id = "clear-bus-#{System.unique_integer([:positive])}"
+
+      {:ok, agent} =
+        Agent.start_link(id: id, subscriber: self(), cd: tmp_dir, llm_fn: final_answer_llm_fn())
+
+      assert :ok = Agent.prompt(agent, "hello")
+      assert_receive {:agent_event, {:turn_complete, "final answer"}}
+
+      # The id arity routes over `Bus.send_command/2` (the agent subscribes in `init/1`).
+      assert :ok = Agent.clear_context(id)
+
+      assert_receive {:agent_event, {:context_cleared, %{}}}
+      assert [%{role: "system"}] = Agent.get_state(agent).messages
+    end
+
+    test "drops a pending prompt queue (consistent with Esc/cancel)", %{tmp_dir: tmp_dir} do
+      # A turn that never returns keeps the session busy, so the follow-ups stack.
+      holding_llm = fn _messages, _tools, _agent_pid ->
+        receive do
+          :release -> {:ok, %{role: "assistant", content: "released", tool_calls: []}}
+        end
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: holding_llm)
+
+      assert :ok = Agent.prompt(agent, "first")
+      assert_receive {:agent_event, {:status, :streaming}}
+
+      assert :ok = Agent.enqueue_prompt(agent, "stacked-1")
+      assert :ok = Agent.enqueue_prompt(agent, "stacked-2")
+      assert_receive {:agent_event, {:prompt_queue, %{len: 2}}}
+
+      assert :ok = Agent.clear_context(agent)
+      assert_receive {:agent_event, {:context_cleared, %{}}}
+
+      # Both the in-flight turn and the stack are gone: the context is genuinely reset, not just
+      # emptied and immediately re-filled by a queued prompt.
+      assert Agent.get_state(agent).prompt_queue_len == 0
+      assert Agent.get_state(agent).status == :idle
+    end
+
+    test "clearing an idle session leaves an empty context and publishes anyway", %{
+      tmp_dir: tmp_dir
+    } do
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir)
+
+      assert [%{role: "system"}] = Agent.get_state(agent).messages
+
+      assert :ok = Agent.clear_context(agent)
+      assert_receive {:agent_event, {:context_cleared, %{}}}
+
+      state = Agent.get_state(agent)
+      assert [%{role: "system"}] = state.messages
+      assert state.turn_count == 0
+      assert state.status == :idle
+    end
+
+    # Regression for a latent bug this feature exercised: `notify_prompt_queue/1` used to *return*
+    # the value of `Athanor.Bus.publish_event/3` (the bare atom `:ok`), and two callers used it in
+    # tail position as the new process state — so dropping a non-empty queue replaced the whole
+    # GenServer state with `:ok` and the next message crashed the agent.
+    test "dropping a non-empty queue never replaces the agent state (queue-drop regression)", %{
+      tmp_dir: tmp_dir
+    } do
+      holding_llm = fn _messages, _tools, _agent_pid ->
+        receive do
+          :release -> {:ok, %{role: "assistant", content: "released", tool_calls: []}}
+        end
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: holding_llm)
+
+      assert :ok = Agent.prompt(agent, "first")
+      assert_receive {:agent_event, {:status, :streaming}}
+
+      assert :ok = Agent.enqueue_prompt(agent, "stacked")
+      assert_receive {:agent_event, {:prompt_queue, %{len: 1}}}
+
+      # The pure pre-existing path: drop the queue and keep using the session.
+      assert :ok = Agent.clear_prompt_queue(agent)
+
+      state = Agent.get_state(agent)
+      assert state.prompt_queue_len == 0
+      assert state.id == "conductor-main"
+      assert is_list(state.messages)
+      assert state.status == :streaming
+    end
+  end
+
   # --- §5.4 compaction trigger (M5) -------------------------------------------------------
 
   describe "post-turn compaction trigger (§5.4)" do

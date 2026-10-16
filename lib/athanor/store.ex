@@ -47,9 +47,10 @@ defmodule Athanor.Store do
           | :event
           | :compaction
           | :resume
+          | :clear
           | :checkpoint
 
-  @kinds ~w(user assistant tool status event compaction resume checkpoint)
+  @kinds ~w(user assistant tool status event compaction resume clear checkpoint)
 
   # -- paths --------------------------------------------------------------------
 

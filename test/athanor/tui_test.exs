@@ -344,6 +344,76 @@ defmodule Athanor.TUITest do
 
   defp persisted_message(_record), do: []
 
+  # design §7.4 + issue #31: the `/clear` command surface.
+  describe "/clear" do
+    test "/clear parses to {:clear_context, tui} and clears the input line" do
+      tui = TUI.new()
+
+      typed = elem(TUI.handle_key(tui, "/clear"), 1)
+      assert {:clear_context, cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      # `/clear-queue` is a different verb, and a longer verb is still an ordinary prompt.
+      typed = elem(TUI.handle_key(TUI.new(), "/clear-queue"), 1)
+      assert {:clear_queue, _} = TUI.handle_key(typed, "\r")
+
+      typed = elem(TUI.handle_key(TUI.new(), "/clearx"), 1)
+      assert {:submit, "/clearx", _} = TUI.handle_key(typed, "\r")
+    end
+
+    test "clears the active session's local transcript and leaves other sessions untouched" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started,
+           %{id: "worker-1", title: "w", role: :worker, parent_id: "conductor-main"}}
+        )
+        |> TUI.handle_agent_event({:user_message, "hello conductor"})
+        |> TUI.handle_agent_event("worker-1", {:user_message, "hello worker"})
+
+      assert Enum.any?(tui.sessions["conductor-main"].entries, &match?({:user, _}, &1))
+      worker_entries = tui.sessions["worker-1"].entries
+      assert Enum.any?(worker_entries, &match?({:user, _}, &1))
+
+      # This is exactly what `dispatch/3` runs for `{:clear_context, tui}` once the RPC succeeds.
+      cleared = TUI.clear_local_context(tui)
+
+      # The active session's prior transcript is gone, replaced by a single notice.
+      refute Enum.any?(cleared.sessions["conductor-main"].entries, &match?({:user, _}, &1))
+
+      assert Enum.any?(cleared.sessions["conductor-main"].entries, fn
+               {:system, msg} -> msg =~ "context cleared"
+               _ -> false
+             end)
+
+      # A peer session is not the active one, so nothing about it changes.
+      assert cleared.sessions["worker-1"].entries == worker_entries
+    end
+
+    test "the agent's {:context_cleared, _} event empties that session's view idempotently" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started,
+           %{id: "worker-1", title: "w", role: :worker, parent_id: "conductor-main"}}
+        )
+        |> TUI.handle_agent_event({:user_message, "hello conductor"})
+        |> TUI.handle_agent_event("worker-1", {:user_message, "hello worker"})
+
+      cleared = TUI.handle_agent_event(tui, "worker-1", {:context_cleared, %{}})
+
+      # The event names the session it applies to: conductor-main is *not* cleared.
+      assert Enum.any?(cleared.sessions["conductor-main"].entries, &match?({:user, _}, &1))
+      refute Enum.any?(cleared.sessions["worker-1"].entries, &match?({:user, _}, &1))
+
+      # Applying it again is a no-op (the view is replaced, never appended to) — the client that
+      # typed `/clear` both clears locally and receives this event.
+      assert TUI.handle_agent_event(cleared, "worker-1", {:context_cleared, %{}}) == cleared
+    end
+  end
+
   describe "activity indicator (throbber)" do
     test "busy?/1 reflects whether any session is working" do
       idle = TUI.new()

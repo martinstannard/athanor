@@ -222,6 +222,29 @@ defmodule Athanor.Orchestrator do
   end
 
   @doc """
+  Resets the conversation context of a session **in place**: its working `messages` go back to the
+  bare system message, `turn_count` to `0`, and the compaction latch is cleared (design §7.4's
+  session history, §10.6 multi-client input). This is the `/clear` verb.
+
+  Routed like `cancel_session/1`: the live agent is looked up first, so an unknown id reports
+  `{:error, :not_found}` instead of a command vanishing into an inbox nobody is subscribed to. The
+  reset happens on the owning agent — which also stops any in-flight turn and drops the pending
+  prompt queue (see `Athanor.Agent`'s moduledoc) — and is published as `{:context_cleared, %{}}`
+  so every attached client repaints.
+  """
+  @spec clear_context(String.t()) :: :ok | {:error, :not_found}
+  def clear_context(id) when is_binary(id) do
+    case lookup(id) do
+      {:ok, _pid} ->
+        Bus.send_command(id, :clear_context)
+        :ok
+
+      :error ->
+        {:error, :not_found}
+    end
+  end
+
+  @doc """
   Removes (kills) a running session: `terminate_child/2` on the process, **keeping** the
   on-disk transcript by default (design §10.3 verb table, §10.9 T5).
 
@@ -513,13 +536,19 @@ defmodule Athanor.Orchestrator do
   # records in `seq` order, mapped back to their message maps. `system` records are dropped —
   # `Athanor.Agent.init/1` re-derives one (C13), so a resume never grafts a stale prompt onto
   # the history and never ends up with two.
+  #
+  # A `clear` marker (a user `/clear`) resets the accumulator: the transcript is append-only, so
+  # the messages before the marker are still on disk, and without honouring it a resume would
+  # silently resurrect the context the user cleared. Records after the marker replay normally, so
+  # a clear-then-continue session resumes with exactly the post-clear turns.
   defp rehydrate_messages(id, root) do
     case Store.load_records(id, root: root) do
       {:ok, records, _meta} ->
         messages =
           records
           |> Enum.sort_by(&record_seq/1)
-          |> Enum.flat_map(&persisted_message/1)
+          |> Enum.reduce([], &apply_record/2)
+          |> Enum.reverse()
 
         {:ok, messages}
 
@@ -528,11 +557,15 @@ defmodule Athanor.Orchestrator do
     end
   end
 
-  defp persisted_message(%{"kind" => kind, "payload" => %{} = payload})
-       when kind in ["user", "assistant", "tool"],
-       do: [payload]
+  # Accumulates newest-first (`Enum.reverse/1` above restores order); a `clear` marker throws away
+  # everything collected so far, so only the records that follow it survive.
+  defp apply_record(%{"kind" => "clear"}, _acc), do: []
 
-  defp persisted_message(_record), do: []
+  defp apply_record(%{"kind" => kind, "payload" => %{} = payload}, acc)
+       when kind in ["user", "assistant", "tool"],
+       do: [payload | acc]
+
+  defp apply_record(_record, acc), do: acc
 
   defp record_seq(%{"seq" => seq}) when is_integer(seq), do: seq
   defp record_seq(_record), do: 0

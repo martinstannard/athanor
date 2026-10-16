@@ -269,6 +269,40 @@ defmodule Athanor.Store.RecorderTest do
     end
   end
 
+  describe "clear markers (design §7.4, /clear)" do
+    test "{:context_cleared, _} appends a kind \"clear\" record and nothing else", %{tmp_dir: dir} do
+      pid = start_recorder!(dir)
+      publish_started()
+      Bus.publish_message(@id, nil, %{role: "user", content: "before the clear"})
+
+      Bus.publish_event(@id, nil, {:context_cleared, %{}})
+
+      assert %{records: 2} = session_stats(pid, @id)
+
+      {records, %{truncated: 0}} = records(@id, dir)
+      assert Enum.map(records, & &1["kind"]) == ["user", "clear"]
+
+      marker = List.last(records)
+      assert marker["payload"]["event"] == "clear"
+      assert {:ok, _dt, _offset} = DateTime.from_iso8601(marker["payload"]["ts"])
+
+      # Like the resume marker: an audit record only — no handoff rewrite, no compaction bump.
+      refute File.exists?(Store.handoff_path(@id, root: dir))
+      assert {:ok, meta} = Store.read_meta(@id, root: dir)
+      assert meta["compaction"] == nil
+    end
+
+    test "a clear marker for a path-unsafe session id writes nothing", %{tmp_dir: dir} do
+      pid = start_recorder!(dir)
+
+      Bus.publish_event("../escape", nil, {:context_cleared, %{}})
+
+      assert Recorder.stats(pid).sessions == %{}
+      refute File.exists?(Path.join(dir, "escape"))
+      refute File.exists?(Path.expand(Path.join(dir, "../escape")))
+    end
+  end
+
   describe "compaction persistence (plan §4.3, §5.4)" do
     test "{:compaction, %{summary, kept, dropped}} appends a marker, rewrites HANDOFF.md and bumps meta",
          %{tmp_dir: dir} do
