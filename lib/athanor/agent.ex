@@ -723,36 +723,37 @@ defmodule Athanor.Agent do
     %{role: "tool", tool_call_id: tc.id, content: output}
   end
 
+  # A worker asserts its own completion with the `===ATHANOR_DONE===` sentinel, and only that
+  # assertion wakes the parent. Waking on *every* completed turn made a conductor hear from a
+  # long-running worker once per turn, and — once §7.2's goal verification lands — would let an
+  # unfinished task look finished, because "a turn ended" is not "the work is done"
+  # (design §8 OQ1, issue #12).
+  #
+  # Deliberately not logged: a multi-turn worker legitimately finishes many turns before it
+  # asserts completion, so a warning per suppressed wakeup would be routine noise — and
+  # `Athanor.Log.event/2` is reserved for "a hang was avoided". The sentinel obligation lives in
+  # the worker's system prompt.
   defp maybe_publish_child_done(
          %{parent_id: parent_id, notify_parent_on_done: true} = state,
          content
        )
        when is_binary(parent_id) do
-    {done_status, summary} =
-      case parse_done_sentinel(content || "") do
-        {:ok, %{status: st, summary: sum}} ->
-          {st, sum}
+    case parse_done_sentinel(content || "") do
+      {:ok, %{status: status, summary: summary}} ->
+        notify(state, {
+          :child_done,
+          %{
+            child_id: state.id,
+            title: state.title,
+            status: status,
+            summary: summary,
+            output: content
+          }
+        })
 
-        :none ->
-          first_line =
-            (content || "")
-            |> String.trim()
-            |> String.split("\n")
-            |> List.first("Turn completed")
-            |> String.slice(0, 120)
-
-          {"ok", first_line}
-      end
-
-    done_event = %{
-      child_id: state.id,
-      title: state.title,
-      status: done_status,
-      summary: summary,
-      output: content
-    }
-
-    notify(state, {:child_done, done_event})
+      :none ->
+        :ok
+    end
   end
 
   defp maybe_publish_child_done(_state, _content), do: :ok
