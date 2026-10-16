@@ -110,6 +110,15 @@ defmodule Athanor.GoalManager do
     end
   end
 
+  @doc """
+  Asks for verification *now*, rather than waiting for the next tick.
+
+  The only route to closure a caller can reach, and it still goes through the Verifier: a caller can
+  say "check now", never "it is done" (C7).
+  """
+  @spec verify_now(String.t()) :: :ok | {:error, :not_found}
+  def verify_now(goal_id), do: with_manager(goal_id, fn pid -> GenServer.call(pid, :verify_now) end)
+
   @doc "Every live goal, newest first, as `status/1` snapshots."
   @spec list_goals() :: [map()]
   def list_goals do
@@ -154,6 +163,10 @@ defmodule Athanor.GoalManager do
     end
   rescue
     ArgumentError -> {:error, :not_found}
+  catch
+    # A goal that just closed or was cancelled is stopped, and its keys are released a moment
+    # before the process exits: a caller racing that edge deserves "not found", not an exit.
+    :exit, _reason -> {:error, :not_found}
   end
 
   defp manager!(goal_id) do
@@ -211,6 +224,8 @@ defmodule Athanor.GoalManager do
   @impl GenServer
   def handle_call(:status, _from, state), do: {:reply, {:ok, snapshot(state)}, state}
 
+  def handle_call(:verify_now, _from, state), do: {:reply, :ok, verify_unless_busy(state)}
+
   def handle_call(:cancel, _from, state) do
     state = state |> cancel_timer() |> terminate_goal(:cancelled)
     publish(state, {:goal_cancelled, snapshot(state)})
@@ -247,7 +262,14 @@ defmodule Athanor.GoalManager do
 
   def handle_info({:verifier_result, pid, result}, %{verifier_task: {pid, ref}} = state) do
     Process.demonitor(ref, [:flush])
-    {:noreply, record_result(state, result)}
+    state = record_result(state, result)
+
+    # The one place a goal can close, holding the one thing that permits it (§5.6, C7).
+    if Result.verified?(state.last_verifier_result) do
+      close(state, state.last_verifier_result)
+    else
+      {:noreply, state}
+    end
   end
 
   # A verifier that died without answering is `:inconclusive`, not evidence against the worker
@@ -370,6 +392,44 @@ defmodule Athanor.GoalManager do
 
   defp refresh_progress(state) do
     %{state | goal: %{state.goal | last_progress_at: Goal.now_ms()}}
+  end
+
+  # -- closure (§5.6) ------------------------------------------------------------------------
+
+  # Internal by construction (C7): the only caller is the verified-result handler above, which is
+  # the only code path holding a `:verified` result. A public `close/2` would contradict "only the
+  # GoalManager closes a goal" the moment somebody called it with a claim.
+  #
+  # Closing is also what wakes the conductor — through `{:child_done, report}` in the *identical*
+  # shape `Athanor.Agent.maybe_publish_child_done/2` emits, so the conductor's existing handler does
+  # the work and a goal-attached worker needs no new conductor code (§4.3).
+  defp close(state, result) do
+    goal = %{
+      state.goal
+      | status: :closed,
+        closed_at: DateTime.utc_now(),
+        close_evidence: result.evidence
+    }
+
+    state = state |> cancel_timer() |> Map.put(:goal, goal) |> release_keys()
+    publish(state, {:goal_verified, goal, result})
+    publish_child_done(state, "ok", result.evidence)
+
+    # A finished goal needs no manager: stop so the worker's keys are free and its subscription
+    # does not outlive the goal. `terminate/2` sees a terminal goal and stays quiet about it.
+    {:stop, :normal, state}
+  end
+
+  defp publish_child_done(state, status, summary) do
+    report = %{
+      child_id: state.goal.worker_id,
+      title: state.goal.title || state.goal.worker_id,
+      status: status,
+      summary: summary,
+      output: summary
+    }
+
+    Bus.publish_event(state.goal.worker_id, state.goal.parent_id, {:child_done, report})
   end
 
   # -- lifecycle -----------------------------------------------------------------------------

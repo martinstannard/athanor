@@ -3,7 +3,7 @@ defmodule Athanor.GoalManagerTest do
   # on the shared Bus topics.
   use ExUnit.Case, async: false
 
-  alias Athanor.{Bus, GoalManager}
+  alias Athanor.{Bus, Goal, GoalManager}
   alias Athanor.Goal.Receipt
   alias Athanor.Verifier.Result
 
@@ -60,7 +60,7 @@ defmodule Athanor.GoalManagerTest do
         start_goal!(
           verifier_fn: fn _goal, _opts ->
             send(test_pid, :checked)
-            {:ok, %Result{mode: :shell, verdict: :verified, evidence: "all good"}}
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1"}}
           end
         )
 
@@ -68,10 +68,11 @@ defmodule Athanor.GoalManagerTest do
       assert_receive :checked, 1_000
 
       snapshot = await(goal_id, &(&1.last_verifier_result != nil))
-      assert snapshot.last_verifier_result.verdict == :verified
+      assert snapshot.last_verifier_result.verdict == :contradicted
       assert snapshot.verify_attempts == 1
 
-      # M3 owns closure: recording a verdict and acting on it are deliberately separate steps.
+      # Recording a verdict and *acting* on it are separate steps: a contradicted goal stays open
+      # (closure, and what a verified result does instead, are covered by the closure block).
       assert snapshot.status == :active
     end
 
@@ -322,6 +323,101 @@ defmodule Athanor.GoalManagerTest do
     end
   end
 
+  describe "closure (only on a verified result)" do
+    test "a verified result closes the goal, releases its keys and wakes the conductor" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :verified, evidence: "marker.txt exists"}}
+          end
+        )
+
+      Bus.subscribe("goal:#{goal_id}:events")
+      Bus.subscribe("conductor:#{parent_id}:children")
+
+      assert :ok = GoalManager.verify_now(goal_id)
+
+      assert_receive {:goal_event, ^goal_id,
+                      {:goal_verified, %Goal{status: :closed, close_evidence: "marker.txt exists"},
+                       %Result{verdict: :verified}}},
+                     1_000
+
+      # The conductor is woken by the *identical* `{:child_done, report}` shape the agent emits for
+      # an ordinary worker, so its existing handler does the work (§4.3).
+      assert_receive {:agent_event, ^worker_id, {:child_done, report}}, 1_000
+      assert report.child_id == worker_id
+      assert report.status == "ok"
+      assert report.summary =~ "marker.txt exists"
+
+      # Terminal, and finished: keys released so the worker can be given another goal (C5).
+      assert :error = GoalManager.for_worker(worker_id)
+      assert {:error, :not_found} = GoalManager.status(goal_id)
+      refute Process.alive?(pid)
+    end
+
+    test "a contradicted result never closes a goal" do
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: not done"}}
+          end
+        )
+
+      Bus.subscribe("goal:#{goal_id}:events")
+
+      assert :ok = GoalManager.verify_now(goal_id)
+
+      assert %{status: :active, last_verifier_result: %Result{verdict: :contradicted}} =
+               await(goal_id, &(&1.last_verifier_result != nil))
+
+      refute_received {:goal_event, ^goal_id, {:goal_verified, _, _}}
+      assert {:ok, ^goal_id} = GoalManager.for_worker(worker_id)
+      assert Process.alive?(pid)
+    end
+
+    test "an inconclusive result never closes a goal" do
+      %{goal_id: goal_id, worker_id: worker_id} =
+        start_goal!(verifier_fn: fn _goal, _opts -> {:ok, %Result{mode: :shell, verdict: :inconclusive}} end)
+
+      Bus.subscribe("goal:#{goal_id}:events")
+
+      assert :ok = GoalManager.verify_now(goal_id)
+
+      assert %{last_verifier_result: %Result{verdict: :inconclusive}} =
+               await(goal_id, &(&1.last_verifier_result != nil))
+
+      refute_received {:goal_event, ^goal_id, {:goal_verified, _, _}}
+      assert {:ok, ^goal_id} = GoalManager.for_worker(worker_id)
+    end
+
+    test "a worker's claim is verified, and the verdict is what decides" do
+      # The trust-but-verify invariant, seen from the manager: the worker says it is done, a check
+      # runs because of that, and the check says no — so the goal stays open.
+      %{goal_id: goal_id, worker_id: worker_id} =
+        start_goal!(
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: still not done"}}
+          end
+        )
+
+      Bus.subscribe("goal:#{goal_id}:events")
+      Bus.publish_event(worker_id, nil, {:goal_candidate_done, %{status: "ok", summary: "I did it"}})
+
+      assert %{last_verifier_result: %Result{verdict: :contradicted}} =
+               await(goal_id, &(&1.last_verifier_result != nil))
+
+      refute_received {:goal_event, ^goal_id, {:goal_verified, _, _}}
+      assert {:ok, ^goal_id} = GoalManager.for_worker(worker_id)
+    end
+
+    test "verify_now/1 is honest about an unknown goal" do
+      assert {:error, :not_found} = GoalManager.verify_now("goal-nobody")
+    end
+  end
+
   # -- helpers --------------------------------------------------------------------------------
 
   # Starts a goal with test-friendly timings and an injected verifier. The 20 ms figures are real
@@ -338,7 +434,8 @@ defmodule Athanor.GoalManagerTest do
       verifier: {:shell, "true"},
       verify_interval_ms: 10_000,
       stall_after_ms: Keyword.get(opts, :stall_after_ms, 20),
-      max_nudges: 2
+      max_nudges: 2,
+      parent_id: Keyword.get(opts, :parent_id)
     ]
 
     manager_opts = [
