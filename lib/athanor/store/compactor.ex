@@ -138,7 +138,7 @@ defmodule Athanor.Store.Compactor do
   Whether a set `:compacted?` latch still suppresses the trigger for `estimate`.
 
   `true` while `estimate >= hysteresis_threshold/1`; once the estimate drops below it the caller
-  may clear its latch. A readability helper for the Agent's post-turn check — `should_compact?/2`
+  may clear its latch. A readability helper for the Agent's pre-flight check — `should_compact?/2`
   already applies the same rule internally.
   """
   @spec latched?(non_neg_integer(), keyword()) :: boolean()
@@ -309,17 +309,28 @@ defmodule Athanor.Store.Compactor do
       {messages, ""}
     else
       text = summary_text(dropped, opts)
-      summary_message = %{role: "assistant", content: @summary_prefix <> text}
+      summary_msg = summary_message(text)
 
       new_messages =
         case system_of(messages) do
-          nil -> [summary_message | kept]
-          system -> [system, summary_message | kept]
+          nil -> [summary_msg | kept]
+          system -> [system, summary_msg | kept]
         end
 
       {new_messages, text}
     end
   end
+
+  @doc """
+  The assistant message `compact/2` inserts in place of the dropped prefix.
+
+  Public because the resume path must reproduce a compacted working set *exactly*: `compact/2`
+  records only the summary text in the transcript's `kind: "compaction"` marker, so
+  `Athanor.Orchestrator` rebuilds the message around it through this function rather than
+  duplicating the `#{@summary_prefix}` prefix (§7.4, #28).
+  """
+  @spec summary_message(String.t()) :: message()
+  def summary_message(text) when is_binary(text), do: %{role: "assistant", content: @summary_prefix <> text}
 
   @doc """
   The summary text for `prefix` without compacting anything.

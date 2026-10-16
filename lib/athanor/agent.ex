@@ -14,19 +14,26 @@ defmodule Athanor.Agent do
 
   ## Compaction (design §7.4, plan §5.4)
 
-  The Agent owns `state.messages`, so it also owns the compaction *trigger*: at the end of every
-  turn — and **only** at that boundary, in the terminal `tool_calls: []` branch of
-  `{:llm_result, _}` — it asks `Athanor.Store.Compactor.should_compact?/2` whether the working set
-  is over budget. If it is, `Athanor.Store.Compactor.compact/2` folds the older turns into a
-  single deterministic summary message, the working set shrinks, and a
-  `{:compaction, %{summary: _, kept: _, dropped: _}}` event is published so
-  `Athanor.Store.Recorder` can rewrite `HANDOFF.md` and log the marker. The transcript on disk is
-  never truncated — only the in-memory working set shrinks.
+  The Agent owns `state.messages`, so it also owns the compaction *trigger*: **before every
+  request it sends** — in `start_llm_turn/1`, on the way to the transport — it asks
+  `Athanor.Store.Compactor.should_compact?/2` whether the working set is over budget. If it is,
+  `Athanor.Store.Compactor.compact/2` folds the older turns into a single deterministic summary
+  message, the working set shrinks, and a `{:compaction, %{summary: _, kept: _, dropped: _}}` event
+  is published so `Athanor.Store.Recorder` can rewrite `HANDOFF.md` and log the marker. The
+  transcript on disk is never truncated — only the in-memory working set shrinks.
 
-  Never mid-stream and never mid-tool-loop: an `assistant(tool_calls)` message and its `tool`
-  results are still arriving there, and the C5 pairing invariant is exactly what must not be
-  split. The compaction latch (`:compacted?`, supplied to the Compactor by this process) provides
-  the hysteresis the policy documents, so a session near the boundary does not thrash.
+  Pre-flight, not post-turn (#28): a request that is too large *fails*, and a trigger that only
+  ran after a successful turn could therefore never fire on the history that needed it — an
+  over-budget session was permanently wedged, and resuming it replayed the full transcript and
+  undid whatever compaction had happened. Trimming before the send repairs such a session on its
+  next prompt. It is also single-flight by construction: the check runs synchronously in this
+  process, and `start_llm_turn/1` is only ever reached with `current_task: nil`.
+
+  Compaction never splits an `assistant(tool_calls)` message from its `tool` results: the cut
+  snaps back to a `user` boundary (`Compactor.cut_index/2`), and a continued tool loop is only
+  reachable once every result of the previous group has been recorded. The compaction latch
+  (`:compacted?`, supplied to the Compactor by this process) provides the hysteresis the policy
+  documents, so a session near the boundary does not thrash.
 
   `:compaction_opts` (an init option) is the injection seam for tests and per-session overrides:
   any `Athanor.Store.Compactor` option (`:context_limit_tokens`, `:compaction_threshold`,
@@ -399,7 +406,7 @@ defmodule Athanor.Agent do
         state = set_status(state, :idle)
         notify(state, {:turn_complete, assistant_msg.content})
         maybe_publish_child_done(state, assistant_msg.content)
-        {:noreply, drain_prompt_queue(maybe_compact(state))}
+        {:noreply, drain_prompt_queue(state)}
 
       tool_calls when is_list(tool_calls) ->
         {:noreply, start_tool_execution(state, tool_calls)}
@@ -572,11 +579,20 @@ defmodule Athanor.Agent do
 
   # -- compaction (design §7.4, plan §5.4) -----------------------------------------
 
-  # The post-turn compaction check. Called from exactly ONE place: the terminal
-  # `tool_calls == []` branch of `{:llm_result, _}`, after the status has gone `:idle` and
-  # `{:turn_complete, _}` has been published — i.e. only at a turn boundary, never mid-stream
-  # and never mid-tool-loop (where an `assistant(tool_calls)` message is still awaiting its
-  # `tool` results and cutting would break the C5 pairing invariant).
+  # The pre-flight compaction check (#28). Called from exactly ONE place: `start_llm_turn/1`,
+  # immediately before the request is handed to the transport.
+  #
+  # It used to run *after* a successful turn instead, which made an over-budget session permanent:
+  # the request that was too big failed, the failure path did not compact, and the only code that
+  # would have compacted was reachable only from the success path that the oversized request could
+  # never reach. A restart+resume made it worse, because rehydration replayed the whole transcript
+  # and so undid any compaction that had happened. Checking here means the working set is trimmed
+  # *before* it is sent, so an over-budget session — including a resumed one, and one sitting in
+  # `:error` — is repaired by the next prompt with no manual intervention.
+  #
+  # Single-flight by construction: this runs synchronously in the agent process, and
+  # `start_llm_turn/1` is only reached with `current_task: nil` (every caller clears it first), so
+  # a compaction can never overlap a request already in flight.
   #
   # A no-op unless the working set is genuinely over budget: `should_compact?/2` owns the
   # threshold + hysteresis policy, and `compact/2` owns the C5-safe cut. `compact/2` signalling
@@ -719,8 +735,15 @@ defmodule Athanor.Agent do
   # The single notification point for every queue mutation: the depth (what the TUI renders) plus
   # a preview of the next prompt. `snapshot_meta/1` carries the depth across the wire as well,
   # so a client that missed an event can still recover the count from `{:session_started, meta}`.
+  #
+  # Returns `state`, and deliberately not the value of `notify/2`: three callers use this as their
+  # return value (`do_enqueue_prompt/2` while busy, `do_clear_prompt_queue/1`, and through it
+  # `do_cancel/1`), so returning `notify/2`'s `:ok` would set the GenServer's state to the atom
+  # `:ok`. Every later message then fails to match its handler and the session is silently dead
+  # for its caller — the same "wedged with nothing in the log" shape as #28.
   defp notify_prompt_queue(state) do
     notify(state, {:prompt_queue, %{len: prompt_queue_len(state), next: next_queued(state)}})
+    state
   end
 
   defp next_queued(state) do
@@ -733,7 +756,9 @@ defmodule Athanor.Agent do
   defp prompt_queue_len(state), do: :queue.len(state.prompt_queue)
 
   defp start_llm_turn(state) do
-    state = set_status(state, :streaming)
+    # Pre-flight (#28): trim the working set *before* it goes out, never after a turn that a
+    # too-large request could not complete. See `maybe_compact/1`.
+    state = state |> maybe_compact() |> set_status(:streaming)
     agent_pid = self()
     messages = state.messages
     tools = Tools.schemas(role: state.role)

@@ -451,9 +451,46 @@ defmodule Athanor.AgentTest do
     end
   end
 
-  # --- §5.4 compaction trigger (M5) -------------------------------------------------------
+  # --- prompt stacking (FIFO queue) -----------------------------------------------
 
-  describe "post-turn compaction trigger (§5.4)" do
+  describe "stacking a prompt while a turn is in flight" do
+    test "does not replace the agent's state with the queue notification's return value", %{
+      tmp_dir: tmp_dir
+    } do
+      # Regression (docs/wedge-findings.md #7): `notify_prompt_queue/1` ended on `notify/2`, whose
+      # value is `Bus.publish_event/3`'s `:ok` — and while the agent is busy,
+      # `do_enqueue_prompt/2` returns that call's result straight into `{:noreply, state}`. The
+      # GenServer's state became the atom `:ok`, every later message fell through to the catch-all
+      # handler, and the session went silent with nothing in the log. Nothing tested stacking.
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: test_driven_llm_fn(self()))
+
+      assert :ok = Agent.prompt(agent, "first")
+      assert_receive {:llm_messages, first_task, _first}
+
+      assert :ok = Agent.enqueue_prompt(agent, "second")
+      assert_receive {:agent_event, {:prompt_queue, %{len: 1, next: "second"}}}
+
+      # The agent is still itself: the state is the agent struct, not `:ok`.
+      assert %Agent{} = :sys.get_state(agent)
+
+      send(first_task, {:reply, {:ok, %{role: "assistant", content: "first answer", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "first answer"}}
+
+      # ...and the stacked prompt still becomes its own turn, with its own user message.
+      assert_receive {:llm_messages, second_task, second}
+      assert List.last(second).content == "second"
+
+      send(second_task, {:reply, {:ok, %{role: "assistant", content: "second answer", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "second answer"}}
+
+      assert Agent.get_state(agent).status == :idle
+    end
+  end
+
+  # --- §5.4 compaction trigger (M5, #28) -------------------------------------------------
+
+  describe "pre-flight compaction trigger (§5.4, #28)" do
     setup do
       # "deck:events" is a :duplicate Registry key: subscribe exactly once per test and drain
       # anything a sibling async test left behind before asserting.
@@ -461,7 +498,7 @@ defmodule Athanor.AgentTest do
       :ok
     end
 
-    test "compacts a large history at the turn boundary and publishes the pinned event",
+    test "compacts an over-budget history before the request is sent, and publishes the pinned event",
          %{tmp_dir: tmp_dir} do
       # A deliberately small window so the seeded history is unambiguously over budget.
       limit = Tokens.estimate_messages(big_turns(4))
@@ -472,7 +509,7 @@ defmodule Athanor.AgentTest do
           subscriber: self(),
           cd: tmp_dir,
           messages: big_turns(4),
-          llm_fn: final_answer_llm_fn(),
+          llm_fn: recording_llm_fn(self()),
           compaction_opts: opts
         )
 
@@ -481,26 +518,33 @@ defmodule Athanor.AgentTest do
       assert Compactor.should_compact?(before, opts)
 
       assert :ok = Agent.prompt(agent, "follow-up question")
-      assert_receive {:agent_event, {:turn_complete, "final answer"}}
 
-      state = Agent.get_state(agent)
-
-      # (a) the working set shrank and now carries the Compactor's summary message
-      assert length(state.messages) < length(before)
-      assert [%{role: "system"} | [summary_msg | _recent]] = state.messages
+      # (a) the transport was handed the *compacted* set — `[system, summary, kept...]` — which is
+      # the whole point of pre-flight: the trimming happened on the way out, not after a turn the
+      # oversized request could never have completed (#28).
+      assert_receive {:llm_messages, _task, sent}
+      assert [%{role: "system"}, summary_msg | _recent] = sent
       assert summary_msg.role == "assistant"
       assert summary_msg.content =~ "[CONTEXT COMPACTED]"
       assert summary_msg.content =~ "Completed steps"
+      assert length(sent) < length(before) + 1
 
-      # (b) the pinned {:compaction, %{summary:, kept:, dropped:}} event rides "deck:events"
+      assert_receive {:agent_event, {:turn_complete, "final answer"}}
+
+      # (b) the pinned {:compaction, %{summary:, kept:, dropped:}} event rides "deck:events" and
+      # describes exactly the set that was sent.
       assert_receive {:agent_event, {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
-
       assert is_binary(summary) and summary =~ "Handoff for"
-      assert kept == length(state.messages)
-      assert dropped == length(before) + 2 - kept
+      assert kept == length(sent)
+      # Everything the agent held at the moment it compacted: the seed plus the user prompt that
+      # opened the turn. The answer is produced *after* the send, so it is not counted.
+      assert kept + dropped == length(before) + 1
       assert dropped > 0
 
-      # (c) the C5 pairing invariant still holds on the new list (Compactor guarantees it)
+      state = Agent.get_state(agent)
+
+      # (c) the working set shrank, and the C5 pairing invariant still holds on the new list
+      assert length(state.messages) < length(before)
       assert Compactor.pairing_ok?(state.messages)
 
       # the system message is still first and unique
@@ -521,21 +565,23 @@ defmodule Athanor.AgentTest do
           subscriber: self(),
           cd: tmp_dir,
           messages: history,
-          llm_fn: final_answer_llm_fn(),
+          llm_fn: recording_llm_fn(self()),
           compaction_opts: opts
         )
 
       assert :ok = Agent.prompt(agent, "follow-up question")
 
       assert_receive {:agent_event, {:compaction, %{summary: summary, kept: kept, dropped: dropped}}}
-
+      assert_receive {:llm_messages, _task, sent}
       assert_receive {:agent_event, {:turn_complete, _}}
 
-      # Everything in the working set at the turn boundary: the system message, the seed and
-      # the user prompt — the turn boundary is the *only* place compaction can fire.
-      state = Agent.get_state(agent)
-      assert kept + dropped == length(history) + 3
-      assert Enum.at(state.messages, 1).content == "[CONTEXT COMPACTED] " <> summary
+      # Everything in the working set at the moment of the send: the system message, the seed and
+      # the user prompt — the request that carries them is what is compacted.
+      assert kept + dropped == length(history) + 2
+      assert Enum.at(sent, 1).content == "[CONTEXT COMPACTED] " <> summary
+
+      # The answer lands after the send, so the live set ends one message longer than `kept`.
+      assert length(Agent.get_state(agent).messages) == kept + 1
     end
 
     test "does NOT compact below the threshold", %{tmp_dir: tmp_dir} do
@@ -564,10 +610,13 @@ defmodule Athanor.AgentTest do
       refute_received {:agent_event, {:compaction, _}}
     end
 
-    test "never compacts mid-tool-loop (only at the terminal turn boundary)", %{tmp_dir: tmp_dir} do
+    test "compaction never splits a tool-call group, and does not thrash the tool loop",
+         %{tmp_dir: tmp_dir} do
       File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
 
-      # Same tiny window: if the trigger ran mid-loop the tool-call/result pair would be at risk.
+      # Same tiny window: were the cut to land inside a group, the *next* request would be
+      # rejected for an unanswered `tool_call_id`, so a compaction that fires on the way into a
+      # tool loop is exactly the case worth pinning down.
       history = big_turns(4)
       limit = Tokens.estimate_messages(history)
       opts = compaction_opts(limit)
@@ -583,8 +632,6 @@ defmodule Athanor.AgentTest do
 
       assert :ok = Agent.prompt(agent, "What is inside secret.txt?")
 
-      # The intermediate assistant(tool_calls) + tool result are observed *before* any
-      # compaction — i.e. the tool loop ran to completion uncompacted.
       assert_receive {:message, _id, %{role: "assistant", tool_calls: [_]}}
       assert_receive {:message, _id, %{role: "tool"}}
       assert_receive {:agent_event, {:tool_end, "read_file", {:ok, "alchemical_gold"}}}
@@ -592,7 +639,7 @@ defmodule Athanor.AgentTest do
 
       state = Agent.get_state(agent)
 
-      # The full tool pair survived the loop...
+      # The group this turn produced is intact, and so is every older pair the cut chose to keep.
       kept_pairs =
         state.messages
         |> Enum.filter(&match?(%{role: "assistant", tool_calls: [_]}, &1))
@@ -600,12 +647,95 @@ defmodule Athanor.AgentTest do
 
       assert "call_1" in kept_pairs
       assert Compactor.pairing_ok?(state.messages)
-
-      # ...and the compaction event (if any) fired only after the terminal turn.
-      assert_receive {:agent_event, {:compaction, %{kept: kept, dropped: dropped}}}
-      assert kept == length(state.messages)
-      assert dropped > 0
       assert hd(state.messages).role == "system"
+
+      # Exactly one compaction for the whole turn: the pre-flight check fired on the way out, and
+      # the continuation request (after the tool result came back) did not compact again — the
+      # latch holds, so a tool loop cannot thrash.
+      assert_receive {:agent_event, {:compaction, %{kept: kept, dropped: dropped}}}
+      assert kept + dropped == length(history) + 2
+      assert dropped > 0
+      refute_received {:agent_event, {:compaction, _}}
+    end
+
+    test "an over-budget session in :error compacts its next request and recovers (#28)",
+         %{tmp_dir: tmp_dir} do
+      # The wedge from the issue: a session whose history is over budget goes to `:error` and stays
+      # there, because the only code that compacted was reachable from a successful turn.
+      history = big_turns(4)
+      limit = Tokens.estimate_messages(history)
+      opts = compaction_opts(limit)
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          cd: tmp_dir,
+          messages: history,
+          llm_fn: test_driven_llm_fn(self()),
+          compaction_opts: opts
+        )
+
+      assert :ok = Agent.prompt(agent, "first attempt")
+
+      # The failing request was already trimmed on the way out...
+      assert_receive {:llm_messages, first_task, first}
+      assert Enum.at(first, 1).content =~ "[CONTEXT COMPACTED]"
+
+      # ...then fails for its own reason (an oversized body, in the real incident).
+      send(first_task, {:reply, {:error, "the request body was too large"}})
+      assert_receive {:agent_event, {:error, _reason}}
+      assert Agent.get_state(agent).status == :error
+
+      # Not wedged: the next prompt is sent over a compacted working set and completes.
+      assert :ok = Agent.prompt(agent, "second attempt")
+
+      assert_receive {:llm_messages, second_task, second}
+      assert Enum.at(second, 1).content =~ "[CONTEXT COMPACTED]"
+      assert length(second) < length(history) + 3
+
+      send(second_task, {:reply, {:ok, %{role: "assistant", content: "final answer", tool_calls: []}}})
+
+      assert_receive {:agent_event, {:turn_complete, "final answer"}}
+      assert Agent.get_state(agent).status == :idle
+    end
+
+    test "does not compact while a request is in flight, and does not thrash the next turn",
+         %{tmp_dir: tmp_dir} do
+      history = big_turns(4)
+      limit = Tokens.estimate_messages(history)
+      opts = compaction_opts(limit)
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          cd: tmp_dir,
+          messages: history,
+          llm_fn: test_driven_llm_fn(self()),
+          compaction_opts: opts
+        )
+
+      assert :ok = Agent.prompt(agent, "first")
+
+      assert_receive {:agent_event, {:compaction, %{dropped: dropped}}}
+      assert dropped > 0
+      assert_receive {:llm_messages, first_task, _first}
+
+      # A prompt arriving mid-request is queued, and no compaction happens behind the request that
+      # is already in flight (compaction is single-flight: it runs in the agent process, before
+      # the send, and `start_llm_turn/1` is only reached with no task outstanding).
+      assert :ok = Agent.enqueue_prompt(agent, "second")
+      refute_received {:agent_event, {:compaction, _}}
+
+      send(first_task, {:reply, {:ok, %{role: "assistant", content: "first answer", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "first answer"}}
+
+      # The queued prompt now runs — one more send, still no second compaction: the set is
+      # comfortably under the threshold after the first trim, so nothing thrashes.
+      assert_receive {:llm_messages, second_task, _second}
+      refute_received {:agent_event, {:compaction, _}}
+
+      send(second_task, {:reply, {:ok, %{role: "assistant", content: "second answer", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "second answer"}}
     end
   end
 
@@ -653,6 +783,27 @@ defmodule Athanor.AgentTest do
   defp final_answer_llm_fn do
     fn _messages, _tools, _agent_pid ->
       {:ok, %{role: "assistant", content: "final answer", tool_calls: []}}
+    end
+  end
+
+  # Answers like `final_answer_llm_fn/0`, and also reports the exact message list it was handed —
+  # the only way to assert what actually went *out*, which is what pre-flight compaction is about.
+  defp recording_llm_fn(test_pid) do
+    fn messages, _tools, _agent_pid ->
+      send(test_pid, {:llm_messages, self(), messages})
+      {:ok, %{role: "assistant", content: "final answer", tool_calls: []}}
+    end
+  end
+
+  # A provider the test drives: it reports what it was handed and then blocks until the test tells
+  # it how to answer, so a request can be held in flight (or failed) deterministically.
+  defp test_driven_llm_fn(test_pid) do
+    fn messages, _tools, _agent_pid ->
+      send(test_pid, {:llm_messages, self(), messages})
+
+      receive do
+        {:reply, result} -> result
+      end
     end
   end
 

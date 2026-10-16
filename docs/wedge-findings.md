@@ -81,3 +81,19 @@ other way a session can look wedged. The `turn_timeout_ms` watchdog and the exis
 `max_turns` bound now cover both: the first catches a task that never returns, the second
 a loop that keeps returning.
 
+## Later find (2026-10-16, while implementing #28)
+
+7. **Stacking a prompt on a busy agent replaced the agent's state with `:ok`.**
+   `Athanor.Agent.notify_prompt_queue/1` ended on `notify/2`, which returns
+   `Athanor.Bus.publish_event/3`'s `:ok`, and three callers use it as their return value
+   (`do_enqueue_prompt/2` while the agent is busy, `do_clear_prompt_queue/1`, and `do_cancel/1`
+   through it). So `{:noreply, ...}` / `{:reply, :ok, ...}` handed `:ok` back as the GenServer
+   *state*. Every subsequent message then failed to match its handler and fell through to
+   `handle_info(_msg, state)` — the session stopped reacting with nothing in the log, the same
+   "wedged, no evidence" shape as the rest of this document. It is reachable from the TUI and from
+   `Orchestrator.send_session/2`, both of which stack prompts over PubSub rather than by reply.
+   No test covered prompt stacking at all.
+
+   Fixed by returning the state explicitly from `notify_prompt_queue/1`; the regression test
+   stacks a prompt onto a busy agent and requires the turn to complete afterwards.
+   (Same family as #1–#6: a value that is not the state reaching the state slot.)

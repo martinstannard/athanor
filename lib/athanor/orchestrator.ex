@@ -7,7 +7,7 @@ defmodule Athanor.Orchestrator do
   require Logger
 
   alias Athanor.{Agent, Bus, SessionId, Store}
-  alias Athanor.Store.Session
+  alias Athanor.Store.{Compactor, Session}
 
   # Generated-id collisions are already vanishingly unlikely; this bounds a retry loop
   # rather than silently starting an unreachable, unregistered agent.
@@ -509,24 +509,59 @@ defmodule Athanor.Orchestrator do
     end
   end
 
-  # §5.3 step 3: the restored working set is exactly the persisted `user`/`assistant`/`tool`
-  # records in `seq` order, mapped back to their message maps. `system` records are dropped —
-  # `Athanor.Agent.init/1` re-derives one (C13), so a resume never grafts a stale prompt onto
-  # the history and never ends up with two.
+  # §5.3 step 3, with #28's correction: the restored working set is the persisted
+  # `user`/`assistant`/`tool` records in `seq` order — but only those **after** the session's last
+  # `kind: "compaction"` marker. Replaying the whole log (as this used to) silently undid any
+  # compaction the session had performed, which is how a resumed session came back over budget and
+  # wedged: the transcript is append-only by design and keeps every record as the audit trail, so
+  # the marker has to decide where the *live* set starts. `system` records are dropped —
+  # `Athanor.Agent.init/1` re-derives one (C13), so a resume never grafts a stale prompt onto the
+  # history and never ends up with two.
   defp rehydrate_messages(id, root) do
     case Store.load_records(id, root: root) do
       {:ok, records, _meta} ->
-        messages =
-          records
-          |> Enum.sort_by(&record_seq/1)
-          |> Enum.flat_map(&persisted_message/1)
-
-        {:ok, messages}
+        {:ok, records |> Enum.sort_by(&record_seq/1) |> live_messages()}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp live_messages(records) do
+    case last_compaction(records) do
+      nil ->
+        Enum.flat_map(records, &persisted_message/1)
+
+      {summary, after_marker} ->
+        kept = Enum.flat_map(after_marker, &persisted_message/1)
+
+        # The marker records the summary *text*; the message that carries it is the Compactor's,
+        # so the rebuilt set is the one the compaction actually produced.
+        if summary == "", do: kept, else: [Compactor.summary_message(summary) | kept]
+    end
+  end
+
+  # The session's last compaction marker and the records that followed it. Everything before the
+  # marker was folded into that summary, so it is already represented in the live set.
+  defp last_compaction(records) do
+    records
+    |> Enum.with_index()
+    |> Enum.reverse()
+    |> Enum.find(fn {record, _index} -> match?(%{"kind" => "compaction"}, record) end)
+    |> case do
+      nil -> nil
+      {record, index} -> {compaction_summary(record), Enum.drop(records, index + 1)}
+    end
+  end
+
+  defp compaction_summary(%{"payload" => %{} = payload}) do
+    case Map.get(payload, "summary") do
+      summary when is_binary(summary) -> summary
+      _other -> ""
+    end
+  end
+
+  defp compaction_summary(_record), do: ""
 
   defp persisted_message(%{"kind" => kind, "payload" => %{} = payload})
        when kind in ["user", "assistant", "tool"],

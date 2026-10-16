@@ -218,11 +218,12 @@ Event-driven OTP GenServers ("doorbells, not messengers") that listen for extern
 > interrupted turn is **never re-run** (a `{:resume, from}` marker is recorded instead). Surfaces:
 > `mix athanor --resume` / `--session <id>`, `mix athanor.daemon --resume` / `--session <id>`,
 > `Daemon.resume_all/2` + `Daemon.resume_session/2` (`:erpc`), TUI `/resume <id>` (bare `/resume`
-> lists what is resumable). Compaction: the Agent's post-turn trigger → `Athanor.Store.Compactor`
-> (C5 user-boundary cut + hysteresis, deterministic summary) → `{:compaction, %{summary, kept,
-> dropped}}` → Recorder rewrites `HANDOFF.md` from `meta.json` + the on-disk transcript, appends a
-> `kind: "compaction"` marker and bumps `meta.json#compaction` — the transcript is **never**
-> truncated.
+> lists what is resumable). Compaction: the Agent's **pre-flight** trigger (immediately before a
+> request is sent, #28) → `Athanor.Store.Compactor` (C5 user-boundary cut + hysteresis,
+> deterministic summary) → `{:compaction, %{summary, kept, dropped}}` → Recorder rewrites
+> `HANDOFF.md` from `meta.json` + the on-disk transcript, appends a `kind: "compaction"` marker and
+> bumps `meta.json#compaction`. The transcript is **never** truncated, and a resume rebuilds the
+> live working set from that marker rather than replaying the log.
 > **Deferred:** transcript rotation (multi-file parts), provider-`usage`-based token accounting
 > (`Athanor.LLM` still discards the `usage` frame; `Athanor.Store.Tokens` is a ~4-bytes-per-token
 > heuristic), live migration of a session between nodes, and LLM-generated `HANDOFF.md` summaries.
@@ -242,6 +243,7 @@ To ensure Athanor can restart cleanly without losing in-progress work or re-lear
   - On startup, `Athanor.Orchestrator` can rehydrate Conductors and their child Sub-Agent tree from `~/.athanor/sessions/`, restoring both the TUI viewport and the `Athanor.Agent` message history.
 - **Context Compaction**:
   - When a long-running Conductor approaches its token limit, Athanor compacts older `transcript.jsonl` turns into `HANDOFF.md` while keeping recent turns intact.
+  - The check runs **before** a request goes out, never after it returns (#28): a request that is too large *fails*, so a post-turn trigger could never fire on the history that needed it. A session already over budget — including one just resumed, and one sitting in `:error` — is therefore trimmed by its next prompt instead of staying permanently wedged. Resuming rebuilds the live set from the transcript's last `kind: "compaction"` marker rather than replaying the whole log.
 
 ### 7.5 Hierarchical Memory System (`Athanor.Memory`) — *planned*
 > Implementation plan: `docs/plans/7.5-hierarchical-memory.md` (status: proposed, not implemented).

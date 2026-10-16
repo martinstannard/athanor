@@ -38,9 +38,9 @@ defmodule Athanor.Store.Recorder do
        `Athanor.Store.write_meta/2` (atomic, §5.4).
 
   The **transcript is never truncated**: only `HANDOFF.md` and the agent's in-memory working set
-  shrink (design §7.4). A compaction is a rare, deliberate, turn-boundary event, so unlike the
-  status churn of §5.1 it is written through immediately rather than debounced — what matters
-  here is that each of the three writes is atomic, not that they are batched.
+  shrink (design §7.4). A compaction is a rare, deliberate event — the Agent performs it on the way
+  into a request (#28) — so unlike the status churn of §5.1 it is written through immediately rather
+  than debounced; what matters here is that each of the three writes is atomic, not batched.
 
   `{:resume, %{from: v}}` is the C12 counterpart: neutralising a session's in-flight state on
   resume leaves a `kind: "resume"` marker behind (with no `HANDOFF.md`/`meta.json` effect), so a

@@ -286,6 +286,92 @@ defmodule Athanor.Store.ResumeTest do
     cleanup([id])
   end
 
+  # -- #28: resuming a compacted session ----------------------------------------
+
+  test "resume rebuilds the working set from the last compaction marker, not the whole log", %{
+    tmp_dir: dir
+  } do
+    # The wedge from #28: the transcript is append-only and keeps every record as the audit trail,
+    # so replaying all of it on resume silently undid the compaction the session had performed —
+    # the session came back over budget and could never send again.
+    id = "resume-compacted"
+    summary = "Handoff for resume-compacted.\nGoal: old task\nCompleted steps (1): …"
+
+    assert :ok = Store.ensure_session([id: id, role: :conductor, title: "Compacted", cd: dir], root: dir)
+
+    records = [
+      {"user", %{"role" => "user", "content" => "old task"}, 1},
+      {"assistant",
+       %{
+         "role" => "assistant",
+         "content" => "",
+         "tool_calls" => [
+           %{
+             "id" => "call_old",
+             "type" => "function",
+             "function" => %{"name" => "bash", "arguments" => ~s({"command":"true"})}
+           }
+         ]
+       }, 2},
+      {"tool", %{"role" => "tool", "tool_call_id" => "call_old", "content" => "ok"}, 3},
+      {"assistant", %{"role" => "assistant", "content" => "old answer", "tool_calls" => []}, 4},
+      # The marker the Recorder writes when the Agent compacted: everything above it is already
+      # folded into `summary`.
+      {"compaction", %{"summary" => summary, "kept" => 2, "dropped" => 4}, 5},
+      {"user", %{"role" => "user", "content" => "after compaction"}, 6},
+      {"assistant", %{"role" => "assistant", "content" => "new answer", "tool_calls" => []}, 7}
+    ]
+
+    sdir = Store.session_dir(id, root: dir)
+
+    for {kind, payload, seq} <- records do
+      assert :ok =
+               Transcript.append(sdir, Transcript.new_record(kind, payload, seq: seq, session_id: id))
+    end
+
+    assert {:ok, ^id, pid} = Orchestrator.resume_session(id, root: dir)
+    messages = Agent.get_state(pid).messages
+
+    # System message, the Compactor's summary message, then only what came after the marker.
+    assert Enum.map(messages, &message_role/1) == ["system", "assistant", "user", "assistant"]
+    assert Enum.at(messages, 1).content == "[CONTEXT COMPACTED] " <> summary
+    assert canonical(Enum.drop(messages, 2)) == canonical(Enum.map(Enum.take(records, -2), &elem(&1, 1)))
+
+    # The pre-marker history is genuinely gone from the live set (it survives only in the
+    # transcript, which is exactly what "the log is the audit trail, not the live set" means).
+    refute Enum.any?(messages, &(&1 |> canonical_one() |> Map.get("content") == "old task"))
+
+    cleanup([id])
+  end
+
+  test "resume of a session whose last record is its compaction marker yields the summary alone", %{
+    tmp_dir: dir
+  } do
+    id = "resume-compacted-tail"
+
+    assert :ok =
+             Store.ensure_session([id: id, role: :conductor, title: "Tail", cd: dir], root: dir)
+
+    sdir = Store.session_dir(id, root: dir)
+
+    for {kind, payload, seq} <- [
+          {"user", %{"role" => "user", "content" => "only task"}, 1},
+          {"assistant", %{"role" => "assistant", "content" => "only answer", "tool_calls" => []}, 2},
+          {"compaction", %{"summary" => "Handoff for resume-compacted-tail.", "kept" => 1, "dropped" => 1}, 3}
+        ] do
+      assert :ok =
+               Transcript.append(sdir, Transcript.new_record(kind, payload, seq: seq, session_id: id))
+    end
+
+    assert {:ok, ^id, pid} = Orchestrator.resume_session(id, root: dir)
+    messages = Agent.get_state(pid).messages
+
+    assert Enum.map(messages, &message_role/1) == ["system", "assistant"]
+    assert Enum.at(messages, 1).content == "[CONTEXT COMPACTED] Handoff for resume-compacted-tail."
+
+    cleanup([id])
+  end
+
   test "resume_session/2 returns an error for an unknown id", %{tmp_dir: dir} do
     assert {:error, :not_found} = Orchestrator.resume_session("no-such-session", root: dir)
   end
@@ -331,6 +417,8 @@ defmodule Athanor.Store.ResumeTest do
   # -- helpers ------------------------------------------------------------------
 
   defp message_role(msg), do: Map.get(msg, :role) || Map.get(msg, "role")
+
+  defp canonical_one(message), do: message |> JSON.encode!() |> JSON.decode!()
 
   # One canonical (string-keyed) form for both atom-keyed live messages and string-keyed
   # rehydrated ones, so `==` compares values, order and tool-call structure exactly.
