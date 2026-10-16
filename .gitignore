@@ -1,6 +1,10 @@
 # The directory Mix will write compiled artifacts to.
 /_build/
 
+# Per-session isolated build dirs (MIX_BUILD_PATH=_build.<name>) used to keep
+# concurrent agent sessions from fighting over one _build.
+/_build.*/
+
 # If you run "mix test --cover", coverage assets end up here.
 /cover/
 

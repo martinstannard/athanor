@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# Athanor pre-commit hook — runs the full "regular checks" gate.
+#
+# This hook is NOT enabled by default. To enable it for this clone:
+#
+#     git config core.hooksPath .githooks
+#
+# To bypass it for a single commit:
+#
+#     git commit --no-verify
+#
+set -euo pipefail
+
+if ! command -v mix >/dev/null 2>&1; then
+  echo "pre-commit: 'mix' not found on PATH — is Elixir installed?" >&2
+  exit 1
+fi
+
+echo "pre-commit: running 'mix check' (format, compile --warnings-as-errors, credo --strict, test)..."
+echo
+
+if ! mix check; then
+  cat >&2 <<'EOF'
+
+────────────────────────────────────────────────────────────────────────
+pre-commit: 'mix check' FAILED — commit aborted.
+
+Fix the issues above and re-run, or bypass this hook once with:
+
+    git commit --no-verify
+
+(This hook is optional; see the "Quality & regular checks" section of
+AGENTS.md.)
+────────────────────────────────────────────────────────────────────────
+EOF
+  exit 1
+fi
+
+echo
+echo "pre-commit: all checks passed."

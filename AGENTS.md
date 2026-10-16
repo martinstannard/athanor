@@ -27,3 +27,24 @@
   - Use Elixir 1.18+ built-in `JSON` module instead of adding external JSON libraries unless required by a dependency.
   - Use pattern matching and tagged tuples (`{:ok, result}` / `{:error, reason}`).
   - Add `@moduledoc` and `@doc` to public modules and functions, plus typespecs (`@spec`) on core boundaries.
+
+## Quality & regular checks
+
+The "three gates" (`mix format --check-formatted`, `mix compile --warnings-as-errors`,
+`mix test`) are wrapped by aliases defined in `mix.exs`:
+
+- **`mix check`** — the full gate, in order:
+  `format --check-formatted` → `compile --warnings-as-errors` → `credo --strict` → `test`.
+- **`mix check.fast`** — the same minus `test`, for quick iteration while coding.
+
+`credo --strict` is part of the gate: it fails on any issue (exit status 30). Config lives in
+`.credo.exs`; checks disabled there each carry a written justification.
+
+**Pre-commit hook** (created at `.githooks/pre-commit`, **not enabled by default**): it runs
+`mix check` and aborts the commit on failure. Enable it for your clone with:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Bypass a single commit with `git commit --no-verify`.
