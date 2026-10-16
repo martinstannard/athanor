@@ -410,6 +410,174 @@ defmodule Athanor.TUITest do
     end
   end
 
+  # Issue #34: pasting multi-line text into the prompt.
+  describe "multi-line input and pasting (#34)" do
+    test "a pasted block keeps its newlines instead of being flattened" do
+      # The old behaviour was `String.replace("\n", " ")`: a block collapsed to one line. A paste
+      # with no bracketed-paste markers still arrives as ordinary text, so it must be preserved.
+      tui = TUI.new(width: 80, height: 24)
+
+      assert {:cont, tui} = TUI.handle_key(tui, "line one\nline two\nline three")
+
+      assert tui.input == "line one\nline two\nline three"
+      assert length(String.split(tui.input, "\n")) == 3
+    end
+
+    test "a typed Enter still submits, and a pasted block never does" do
+      # `\r` is what a raw-mode terminal sends for Return, so it keeps submitting.
+      typed = %{TUI.new() | input: "one\ntwo"}
+      assert {:submit, "one\ntwo", _} = TUI.handle_key(typed, "\r")
+
+      # A bracketed paste ending in a newline must NOT fire a turn: the body is inserted
+      # atomically and the interior newline is text.
+      tui = TUI.new()
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[200~alpha\nbeta\n\e[201~")
+
+      assert tui.input == "alpha\nbeta\n"
+      assert tui.paste_buffer == nil
+    end
+
+    test "Ctrl+J inserts a newline rather than submitting" do
+      tui = %{TUI.new() | input: "first"}
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\n")
+
+      assert tui.input == "first\n"
+    end
+
+    test "backspace deletes one character across a line boundary" do
+      tui = %{TUI.new() | input: "ab\ncd"}
+
+      # Four deletes remove d, c, the newline (rejoining the lines), then b.
+      tui = delete(tui, 4)
+
+      assert tui.input == "a"
+    end
+
+    test "a paste split across chunks is reassembled atomically" do
+      # The OTP-28 default adapter (`Termite.Terminal.Shell`) delivers a paste as many small
+      # `{:data, _}` chunks — a 20 KB paste arrived as ~20 000 of them in the spike — so the body
+      # must be buffered across calls, not inserted per chunk.
+      tui = TUI.new()
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[200~foo")
+      assert tui.input == "", "an incomplete paste must not be visible yet"
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\nbar")
+      assert tui.input == ""
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[201~")
+      assert tui.input == "foo\nbar"
+    end
+
+    test "a paste terminator split across chunks still completes the paste" do
+      # `suffix_ok=false` in the spike: the `\e[201~` itself can be delivered in pieces.
+      tui = TUI.new()
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[200~hello\e[20")
+      assert tui.input == ""
+
+      assert {:cont, tui} = TUI.handle_key(tui, "1~")
+      assert tui.input == "hello"
+    end
+
+    test "keys after a paste are replayed as ordinary input" do
+      # A terminal can coalesce the paste and the next keystroke into one read; the trailing bytes
+      # must not be swallowed.
+      tui = TUI.new()
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[200~pasted\e[201~tail")
+
+      assert tui.input == "pastedtail"
+    end
+
+    test "an Enter after a paste still submits" do
+      tui = TUI.new()
+
+      {:cont, tui} = TUI.handle_key(tui, "\e[200~body\e[201~")
+
+      assert {:submit, "body", _} = TUI.handle_key(tui, "\r")
+    end
+
+    test "a `q` inside a paste is text, not a deck key" do
+      # While a paste is in flight its bytes are literal text; the deck's key table must not see
+      # them even when the deck has focus.
+      tui = %{TUI.new() | focus: :sessions}
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[200~quit\nq\e[201~")
+
+      assert tui.input == "quit\nq"
+      assert tui.focus == :sessions
+    end
+
+    test "CRLF and lone CR in a paste are folded to LF" do
+      tui = TUI.new()
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[200~a\r\nb\rc\e[201~")
+
+      assert tui.input == "a\nb\nc"
+    end
+
+    test "an oversized paste is capped and the truncation is visible" do
+      tui = TUI.new()
+      body = String.duplicate("x", 200_000)
+
+      assert {:cont, tui} = TUI.handle_key(tui, "\e[200~" <> body <> "\e[201~")
+
+      assert String.contains?(tui.input, "[prompt truncated")
+      assert byte_size(tui.input) < 200_000
+    end
+
+    test "the input box grows with the input and then caps, showing the tail" do
+      # Three logical lines all fit in the box.
+      tui = %{TUI.new(width: 80, height: 24) | input: "a\nb\nc"}
+      frame = TUI.render_frame(tui)
+
+      for line <- ["a", "b", "c"], do: assert(frame =~ line)
+      assert drawn_rows(frame) == 24
+
+      # A tall paste caps the box: the earliest lines scroll off (with a `⋮` marker) and the tail
+      # — where the cursor always is — stays visible.
+      tall = %{tui | input: Enum.map_join(1..20, "\n", &"line #{&1}")}
+      tall_frame = TUI.render_frame(tall)
+
+      assert tall_frame =~ "line 20"
+      assert tall_frame =~ "⋮"
+      refute tall_frame =~ "line 1\n"
+      assert drawn_rows(tall_frame) == 24
+    end
+
+    test "a multi-line prompt round-trips through submit unchanged apart from the trim" do
+      tui = %{TUI.new() | input: "  first line\nsecond line  "}
+
+      # `submit_or_command/2` trims the whole prompt, exactly as it did for a single line; the
+      # interior newline survives (only leading/trailing whitespace is cut).
+      assert {:submit, "first line\nsecond line", _} = TUI.handle_key(tui, "\r")
+    end
+
+    test "a frame is always exactly `height` rows tall, however tall the input" do
+      # A huge paste must push the transcript up, never the status bar / input box off the screen.
+      for lines <- [1, 3, 6, 20, 200] do
+        tui = %{TUI.new(width: 80, height: 24) | input: Enum.map_join(1..lines, "\n", &"line #{&1}")}
+
+        assert drawn_rows(TUI.render_frame(tui)) == 24,
+               "frame with #{lines} input lines was not 24 rows"
+      end
+    end
+  end
+
+  # The number of screen rows `render_frame/1` draws. It positions each row with a CSI cursor-move
+  # followed by an erase-line (`\e[<row>;1H\e[2K`) rather than emitting literal newlines, so rows
+  # are counted by that escape — splitting the frame on `"\n"` would count zero.
+  defp drawn_rows(frame), do: length(:binary.matches(frame, "\e[2K"))
+
+  defp delete(tui, 0), do: tui
+
+  defp delete(tui, n) do
+    {:cont, tui} = TUI.handle_key(tui, <<127>>)
+    delete(tui, n - 1)
+  end
+
   describe "activity indicator (throbber)" do
     test "busy?/1 reflects whether any session is working" do
       idle = TUI.new()

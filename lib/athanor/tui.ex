@@ -16,6 +16,42 @@ defmodule Athanor.TUI do
     transcript is emptied, so the cleared context is never rendered as if it still existed.
   - Stacked prompts: `Enter` on non-empty input while the active session is `:streaming` or
     `:executing_tools` **enqueues** the prompt instead of dropping it (see "Prompt stacking").
+  - Multi-line input: a pasted block keeps its newlines, the input box grows to a few rows and
+    then scrolls, and `Ctrl+J` types a newline (see "Multi-line input and pasting").
+
+  ## Multi-line input and pasting
+
+  The input buffer is a newline-aware `String` (issue #34) and the input box renders one row per
+  line, so a pasted block is no longer flattened into one space-joined line. Three rules make
+  that safe:
+
+    * **A paste never submits.** When the TUI starts it turns on bracketed paste (DECSET 2004), so
+      the terminal wraps a paste in `\\e[200~ … \\e[201~` and `handle_key/2` inserts the body
+      **atomically** — an interior `\\r`/`\\n` byte is text, not a key press. Bracketed paste is
+      the only way to tell "the terminal pasted a block" from "the human typed fast", which is
+      exactly what the old flatten-and-append behaviour could not do (a paste ending in a newline
+      fired a turn). Verified against the OTP-28 default adapter
+      (`Termite.Terminal.Shell`): its reader only ever *appends* to a CSI it is assembling before
+      flushing it behind `@escape_timeout` (`shell.ex`), so the markers arrive whole and the body
+      arrives as ordinary `{:data, _}` chunks that `paste_buffer` reassembles. Without the
+      markers (an adapter or terminal that does not honour DECSET 2004) the fallback is still
+      correct: newlines are *preserved* rather than flattened, CR and CRLF are folded to LF, and
+      only a bare `\\r` — which every raw-mode terminal sends for the Return key and never for
+      pasted text — submits.
+    * **`Enter` submits; `Ctrl+J` inserts a newline.** `\\r` is what a raw-mode terminal sends for
+      Return, so it keeps its old meaning. `\\n` on its own is not produced by Return; it is
+      Ctrl+J, which readline binds to "newline" (C-j newline, C-m accept-line), so that is the
+      newline-insertion key. Shift+Enter and Alt+Enter are deliberately *not* used: Alt+Enter
+      arrives as `ESC` then `CR` through the Shell adapter, which would be indistinguishable from
+      "cancel, then submit", and Shift+Enter reports a modifier only under the kitty or
+      `modifyOtherKeys` protocols, neither of which Termite enables.
+    * **The box caps and scrolls.** The box takes one row per input line, at most `@max_input_rows`
+      of them, showing the **last** rows (the cursor is always at the end — this TUI only appends)
+      with a `⋮` marker while earlier rows are off the top. `render_frame/1` gives the viewport
+      back exactly the rows the box takes, so a frame is always exactly `height` rows: a huge
+      paste pushes the transcript up instead of pushing the status bar off the screen. The buffer
+      itself is capped at `@max_input_bytes` with a visible marker in the prompt, so the cap can
+      never be silently mistaken for "the paste came through fine".
 
   ## Prompt stacking
 
@@ -67,6 +103,33 @@ defmodule Athanor.TUI do
   # clears on the agent's `{:context_cleared, _}` event), so clearing twice is idempotent.
   @clear_notice "[context cleared — this session's transcript was reset]"
 
+  # Bracketed paste (DECSET 2004). Enabled for this client's lifetime and turned off before the
+  # terminal is handed back, so a paste into the prompt arrives wrapped in these markers and can
+  # be inserted atomically — the only way to tell "the terminal pasted a block" from "the human
+  # typed fast" (issue #34). Termite does not enable this itself; the moduledoc explains why the
+  # OTP-28 default adapter (`Termite.Terminal.Shell`) is safe for it.
+  @bracketed_paste_on "\e[?2004h"
+  @bracketed_paste_off "\e[?2004l"
+  @paste_start "\e[200~"
+  @paste_end "\e[201~"
+
+  # Input-box geometry. The box grows to this many rows and then scrolls (showing the tail, where
+  # the cursor is). The viewport gives back exactly the rows the box takes, so `render_frame/1`
+  # is always exactly `height` rows and a large paste cannot push the status bar off the screen.
+  @max_input_rows 6
+  @min_input_rows 1
+
+  # The width of the prompt gutter, i.e. how much of each row the `❯ ` / `⋮ ` / blank prefix
+  # takes. Constant, so the cursor column needs no measuring of styled strings. Declared here,
+  # above its first use in `input_box/3`, because a module attribute must be set before it is read.
+  @input_gutter 2
+
+  # A pasted block longer than this is truncated, with `@truncated_marker` appended to the prompt
+  # so the loss is visible. This is a memory/latency guard, not a UI preference: every frame
+  # splits the buffer on newlines, and the whole buffer is later sent to the agent byte for byte.
+  @max_input_bytes 100_000
+  @truncated_marker "\n[prompt truncated at #{@max_input_bytes} bytes]"
+
   defstruct [
     :agent,
     :daemon_node,
@@ -78,6 +141,7 @@ defmodule Athanor.TUI do
     sessions: %{},
     session_order: [],
     input: "",
+    paste_buffer: nil,
     scroll_offset: 0,
     focus: :input,
     sidebar_index: 0,
@@ -106,6 +170,15 @@ defmodule Athanor.TUI do
 
   @type focus :: :input | :sessions
 
+  @typedoc """
+  A bracketed paste in flight: the body bytes received so far, and whether the size cap was hit.
+
+  `nil` means "not inside a paste". The body is held here rather than appended to `input` as it
+  arrives so that only a *complete* paste is ever inserted: that is what makes the paste atomic,
+  and it is why an interior newline can never reach the `Enter` clause.
+  """
+  @type paste_buffer :: %{body: binary(), truncated: boolean()} | nil
+
   @type t :: %__MODULE__{
           agent: GenServer.server() | nil,
           daemon_node: node() | nil,
@@ -117,6 +190,7 @@ defmodule Athanor.TUI do
           sessions: %{String.t() => session_view()},
           session_order: [String.t()],
           input: String.t(),
+          paste_buffer: paste_buffer(),
           scroll_offset: non_neg_integer(),
           focus: focus(),
           sidebar_index: non_neg_integer()
@@ -254,6 +328,11 @@ defmodule Athanor.TUI do
     term =
       Terminal.start()
       |> Screen.alt_screen()
+      # DECSET 2004: ask the terminal to wrap pastes in `\e[200~ … \e[201~`, so a block pasted into
+      # the prompt is distinguishable from typed keys and cannot submit (issue #34). It is a
+      # per-client mode, turned off in the `after` below before the terminal is handed back — a
+      # mode left on would corrupt the *next* program's paste handling.
+      |> Screen.write(@bracketed_paste_on)
       |> Screen.clear_screen()
 
     tui =
@@ -281,6 +360,9 @@ defmodule Athanor.TUI do
 
       term
       |> Screen.show_cursor()
+      # Turn bracketed paste back off *before* leaving the alternate screen, so the mode is off by
+      # the time anything else regains the terminal.
+      |> Screen.write(@bracketed_paste_off)
       |> Screen.exit_alt_screen()
       |> Terminal.stop()
     end
@@ -631,6 +713,24 @@ defmodule Athanor.TUI do
     {:cont, set_focus(tui, if(tui.focus == :input, do: :sessions, else: :input))}
   end
 
+  # --- Paste and multi-line input (issue #34) ---------------------------------------------
+  # Body of a paste in flight: accumulate until the `\e[201~` terminator arrives, then insert the
+  # whole block at once. Both paste clauses sit *before* the deck and generic-escape handling,
+  # because while a paste is being received its bytes are literal text — a `\r` inside a pasted
+  # code block is a line break, not "Enter", and a `q` is a letter, not a deck key. The
+  # terminal/adapter may split a paste across any number of `{:data, _}` chunks, so the partial
+  # block lives in `paste_buffer`, never in the visible input.
+  def handle_key(%__MODULE__{paste_buffer: %{} = buffer} = tui, data) when is_binary(data) do
+    receive_paste(tui, buffer, data)
+  end
+
+  # Paste start (`\e[200~`): everything up to `\e[201~` is body. The remainder of the same chunk
+  # may already carry body bytes (or the terminator), so it is consumed too.
+  def handle_key(tui, @paste_start <> rest) do
+    buffer = %{body: "", truncated: false}
+    receive_paste(%{tui | paste_buffer: buffer}, buffer, rest)
+  end
+
   # --- Session deck navigation (focus: :sessions) ---
   # Delegated wholesale to `handle_deck_key/2` so the deck's key table stays a table (and
   # `handle_key/2` stays within Credo's complexity budget). The clause sits exactly where the
@@ -667,36 +767,130 @@ defmodule Athanor.TUI do
   # Ignore other escape sequences
   def handle_key(tui, "\e" <> _), do: {:cont, tui}
 
-  # Enter (\r or \n)
-  def handle_key(tui, key) when key in ["\r", "\n"] do
+  # Enter submits: `\r` is what every raw-mode terminal sends for the Return key, and it keeps its
+  # old meaning. `\n` on its own is *not* Return — it is Ctrl+J — so it is the newline key below.
+  def handle_key(tui, "\r") do
     submit_or_command(tui, String.trim(tui.input))
   end
 
-  # Backspace (127 or 8)
+  # Ctrl+J inserts a literal newline (readline semantics: C-m accept-line, C-j newline), which is
+  # how a newline is typed now that `\r` submits — see the moduledoc for why Ctrl+J and not
+  # Shift+Enter or Alt+Enter. A pasted `\n` never reaches this clause: it is part of a block and is
+  # inserted by `finish_paste/3`.
+  def handle_key(tui, "\n") do
+    {:cont, insert_input(tui, "\n")}
+  end
+
+  # Backspace (127 or 8) deletes one character, which may be the newline ending a line. It counts
+  # graphemes (`String.slice/3`), so a multi-byte character is removed whole, and deleting the
+  # newline rejoins the two lines — there is nothing else to do, because the buffer is one string.
   def handle_key(tui, key) when key in [<<127>>, <<8>>] do
     len = String.length(tui.input)
 
-    updated =
-      if len > 0 do
-        String.slice(tui.input, 0, len - 1)
-      else
-        ""
-      end
+    updated = if len > 0, do: String.slice(tui.input, 0, len - 1), else: ""
 
     {:cont, %{tui | input: updated}}
   end
 
-  # Printable UTF-8 text
+  # Printable UTF-8 text — including any newlines that arrive *without* bracketed-paste markers
+  # (a terminal or adapter that does not honour DECSET 2004). Newlines are preserved verbatim,
+  # which is the whole point of issue #34, and only `\r` is folded to `\n` (such terminals usually
+  # send CRLF for a pasted newline, and a stray `\r` in the prompt would be invisible garbage).
   def handle_key(tui, data) when is_binary(data) do
     if String.valid?(data) do
-      clean =
-        data
-        |> String.replace("\r", " ")
-        |> String.replace("\n", " ")
-
-      {:cont, %{tui | input: tui.input <> clean}}
+      {:cont, insert_input(tui, normalise_newlines(data))}
     else
       {:cont, tui}
+    end
+  end
+
+  # Fold CRLF and lone CR onto LF, so the buffer holds one kind of newline however the terminal
+  # framed the paste. CRLF first, or the `\r` pass would split the pair into two newlines.
+  defp normalise_newlines(data) do
+    data
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
+  end
+
+  # Append text to the input. This TUI has no cursor movement inside the buffer (every key appends
+  # or backspaces), so "insert" is always "insert at the end".
+  defp insert_input(%__MODULE__{input: input} = tui, text), do: %{tui | input: input <> text}
+
+  # Receives one `{:data, _}` chunk while a bracketed paste is in flight: appends it to the
+  # buffer, or, if it carries the `\e[201~` terminator, completes the paste. Anything *after* the
+  # terminator is left over — a terminal can coalesce the paste and the next keystroke into one
+  # read — so `finish_paste/3` replays it through `handle_key/2` rather than dropping it.
+  #
+  # The terminator is searched for in `body <> data`, not in `data` alone: the OTP-28 default
+  # adapter can deliver the marker itself in pieces (the spike caught `\e[201~` arriving as `\e[20`
+  # then `1~`), so a marker split across two reads must still complete the paste. Searching the
+  # concatenation is what makes that work — the previous chunk's partial marker is still in `body`.
+  defp receive_paste(%__MODULE__{} = tui, buffer, data) do
+    combined = buffer.body <> data
+
+    case :binary.match(combined, @paste_end) do
+      :nomatch ->
+        {:cont, %{tui | paste_buffer: cap_paste_buffer(buffer, combined)}}
+
+      {start, length} ->
+        body = binary_part(combined, 0, start)
+        rest = binary_part(combined, start + length, byte_size(combined) - start - length)
+        finish_paste(tui, %{buffer | body: body}, rest)
+    end
+  end
+
+  # Cap the *in-flight* buffer too, not just the inserted text: a `\e[200~` whose terminator never
+  # arrives would otherwise grow this binary without bound. `truncated` records that the cap was
+  # hit, so `finish_paste/3` can still mark the prompt visibly. Once truncated the body is left
+  # alone — otherwise every further chunk would keep growing it and the cap would mean nothing.
+  defp cap_paste_buffer(%{truncated: true} = buffer, _combined), do: buffer
+
+  defp cap_paste_buffer(%{body: _body} = buffer, combined) do
+    if byte_size(combined) > @max_input_bytes do
+      %{buffer | body: trim_to_bytes(combined, @max_input_bytes), truncated: true}
+    else
+      %{buffer | body: combined}
+    end
+  end
+
+  # Insert the completed paste as literal text, then replay any bytes that followed the
+  # terminator as ordinary keys. The paste itself is *never* submitted — inserting it always
+  # yields `{:cont, _}` — which is issue #34's hard requirement: a block pasted into the prompt
+  # must not fire a turn, even when it ends in a newline. Only a genuine key *after* the paste can
+  # still do that.
+  defp finish_paste(%__MODULE__{} = tui, buffer, rest) do
+    tui = %{tui | paste_buffer: nil} |> insert_input(normalise_newlines(buffer.body))
+    tui = if buffer.truncated, do: insert_input(tui, @truncated_marker), else: tui
+    tui = truncate_input(tui)
+
+    case rest do
+      "" -> {:cont, tui}
+      _ -> handle_key(tui, rest)
+    end
+  end
+
+  # Keep the rendered buffer and the submitted prompt in agreement, and keep the one-string buffer
+  # from growing without bound: past `@max_input_bytes` the tail is dropped and the truncation is
+  # written into the prompt itself, so it can never be mistaken for a complete paste.
+  defp truncate_input(%__MODULE__{input: input} = tui) do
+    if byte_size(input) <= @max_input_bytes do
+      tui
+    else
+      %{tui | input: trim_to_bytes(input, @max_input_bytes) <> @truncated_marker}
+    end
+  end
+
+  # Cut a binary to at most `limit` bytes without splitting a UTF-8 codepoint: `:unicode` reports
+  # the incomplete tail as `{:incomplete, valid_prefix, _}`, so the prefix is what is kept.
+  defp trim_to_bytes(binary, limit) do
+    if byte_size(binary) <= limit do
+      binary
+    else
+      case :unicode.characters_to_binary(binary_part(binary, 0, limit)) do
+        converted when is_binary(converted) -> converted
+        {:error, valid, _rest} -> valid
+        {:incomplete, valid, _rest} -> valid
+      end
     end
   end
 
@@ -935,7 +1129,12 @@ defmodule Athanor.TUI do
   def render_frame(%__MODULE__{width: width, height: height} = tui) do
     width = max(width, 40)
     height = max(height, 8)
-    viewport_height = height - 3
+
+    # The input box grows with the input and takes its rows *out of* the viewport, so the frame is
+    # always exactly `height` rows no matter how much was pasted. This is what keeps a huge paste
+    # from pushing the status bar and the input box off the bottom of the screen.
+    {input_lines, input_rows, cursor_col} = input_box(tui, width, height)
+    viewport_height = max(1, height - 2 - input_rows)
 
     sidebar_w = min(26, max(18, div(width, 4)))
     main_w = max(20, width - sidebar_w - 1)
@@ -956,9 +1155,8 @@ defmodule Athanor.TUI do
       end)
 
     status_bar = render_status_bar(tui, width)
-    {input_line, cursor_col} = render_input_line(tui, width)
 
-    rows = [header | middle_rows] ++ [status_bar, input_line]
+    rows = [header | middle_rows] ++ [status_bar | input_lines]
 
     body =
       rows
@@ -967,6 +1165,8 @@ defmodule Athanor.TUI do
         Screen.escape_sequence(:cursor_move, [1, row_idx]) <> "\e[2K" <> line
       end)
 
+    # The cursor sits in the box's last row: the buffer's end is always where it is, so the box
+    # only ever scrolls in one direction and the cursor's row is the box's last one.
     cursor_move = Screen.escape_sequence(:cursor_move, [cursor_col, height])
 
     Screen.escape_sequence(:cursor_hide, []) <>
@@ -1131,46 +1331,98 @@ defmodule Athanor.TUI do
     |> Style.render_to_string(padded)
   end
 
-  defp render_input_line(tui, width) do
-    deck_focused? = tui.focus == :sessions
-    prefix = if deck_focused?, do: "  ", else: "❯ "
+  # -- input box (issue #34) ----------------------------------------------------------------
+  #
+  # The box renders one row per logical line of the buffer, wrapping a long line rather than
+  # scrolling it horizontally (a pasted block is mostly long lines and newlines), and shows only
+  # the last `input_row_cap/1` rows. "Show the tail" is both the simplest and the correct scroll
+  # for an append-only field: the cursor is always at the end of the buffer, so the rows the user
+  # cares about are always the last ones.
+
+  # How many rows the box may take. Bounded by `@max_input_rows` so a huge paste cannot eat the
+  # whole screen, and by `height - 3` so a header, a status bar and at least one viewport row
+  # always survive.
+  defp input_row_cap(height), do: min(@max_input_rows, max(@min_input_rows, height - 3))
+
+  # Every display row the buffer needs, in order, before the cap is applied. An empty logical line
+  # is one (empty) row, so a buffer ending in `\n` correctly leaves the cursor on a fresh line.
+  defp input_display_rows(tui, avail) do
+    tui.input
+    |> String.split("\n")
+    |> Enum.flat_map(fn
+      "" -> [""]
+      line -> chunk_string(line, avail)
+    end)
+  end
+
+  # Renders the box: the styled rows to place after the status bar, plus the cursor's position
+  # within the box (1-based row and column). The column is clamped to the frame, exactly as the
+  # old single-line renderer did, so a line that fills its row keeps the cursor at the right edge.
+  defp input_box(tui, width, height) do
     indicator = queue_indicator(tui, width)
     indicator_w = String.length(indicator)
     gap = if indicator_w > 0, do: 1, else: 0
-    avail = max(1, width - String.length(prefix) - indicator_w - gap)
-    input_len = String.length(tui.input)
+    # The indicator's columns are reserved from *every* row's wrap width, not just the row it is
+    # drawn on, so the wrap and the badge can never overlap.
+    avail = max(1, width - @input_gutter - indicator_w - gap)
 
-    visible_input =
-      if input_len > avail do
-        String.slice(tui.input, input_len - avail, avail)
-      else
-        tui.input
-      end
+    display = input_display_rows(tui, avail)
+    visible = Enum.take(display, -input_row_cap(height))
+    scrolled? = length(display) > length(visible)
+    last = length(visible)
 
-    styled_prefix =
-      if deck_focused? do
-        Style.ansi256()
-        |> Style.foreground(Theme.colour(tui.theme, :muted))
-        |> Style.render_to_string(prefix)
-      else
-        Style.ansi256()
-        |> Style.foreground(Theme.colour(tui.theme, :accent))
-        |> Style.bold()
-        |> Style.render_to_string(prefix)
-      end
+    lines =
+      visible
+      |> Enum.with_index(1)
+      |> Enum.map(fn {content, idx} ->
+        gutter = input_gutter(tui, idx, scrolled?)
+        row = style_input_gutter(tui, gutter) <> content
 
-    cursor_col = String.length(prefix) + String.length(visible_input) + 1
+        # The badge rides the box's first row, so it does not jump rows as the cursor moves.
+        if idx == 1 and indicator_w > 0 do
+          row <> input_indicator_padding(tui, width, gutter, content, indicator)
+        else
+          row
+        end
+      end)
 
-    {styled_prefix <> visible_input <> indicator_padding(tui, width, visible_input, indicator), min(cursor_col, width)}
+    cursor_content = visible |> List.last("") |> String.length()
+    cursor_col = min(@input_gutter + cursor_content + 1, width)
+
+    {lines, last, cursor_col}
   end
 
-  defp indicator_padding(_tui, _width, _visible_input, ""), do: ""
+  # The gutter each row starts with. Row 1 carries the prompt arrow, or `⋮` once earlier rows have
+  # scrolled off the top — the arrow would otherwise point at a line that is no longer on screen,
+  # so the marker takes its place. Continuation rows and the deck-focused box are blank, exactly
+  # as the single-line renderer was.
+  defp input_gutter(%__MODULE__{focus: :sessions}, 1, false), do: "  "
+  defp input_gutter(%__MODULE__{}, 1, false), do: "❯ "
+  defp input_gutter(%__MODULE__{}, 1, true), do: "⋮ "
+  defp input_gutter(%__MODULE__{}, _idx, _scrolled?), do: "  "
 
-  # The badge sits flush right, padded on *raw* lengths — the styled parts already carry ANSI
-  # escapes that `String.length/1` would count as columns. `prefix` and `gap` mirror
-  # `render_input_line/2`'s own accounting.
-  defp indicator_padding(tui, width, visible_input, indicator) do
-    used = String.length("❯ ") + String.length(visible_input) + String.length(indicator)
+  defp style_input_gutter(tui, gutter) do
+    colour =
+      case {tui.focus, gutter} do
+        {:sessions, _} -> :muted
+        {_, "❯ "} -> :accent
+        _ -> :muted
+      end
+
+    style =
+      if tui.focus == :input and gutter == "❯ " do
+        Style.ansi256() |> Style.foreground(Theme.colour(tui.theme, colour)) |> Style.bold()
+      else
+        Style.ansi256() |> Style.foreground(Theme.colour(tui.theme, colour))
+      end
+
+    Style.render_to_string(style, gutter)
+  end
+
+  # `⧗ N queued`, flush right on the box's first row. Padded on *raw* lengths — the styled gutter
+  # already carries ANSI escapes that `String.length/1` would count as columns.
+  defp input_indicator_padding(tui, width, gutter, content, indicator) do
+    used = String.length(gutter) + String.length(content) + String.length(indicator)
     padding = String.duplicate(" ", max(1, width - used))
 
     Style.ansi256()
