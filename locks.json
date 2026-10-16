@@ -1,6 +1,13 @@
 {
   "version": 1,
-  "locks": {},
+  "locks": {
+    "34": {
+      "agent_id": "conductor-main",
+      "branch": "feat/paste-blocks",
+      "claimed_at": "2026-10-16T13:27:03.687898448Z",
+      "signed_by": "conductor-main"
+    }
+  },
   "settings": {
     "stale_lock_timeout_minutes": 60
   }
