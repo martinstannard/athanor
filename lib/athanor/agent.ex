@@ -59,6 +59,28 @@ defmodule Athanor.Agent do
   indistinguishable from not cancelling at all — and, because `drain_prompt_queue/1` runs only at a
   turn boundary, a retained queue would otherwise sit stranded until some later turn finished.
   `clear_prompt_queue/1` drops the pending queue on its own, leaving the in-flight turn alone.
+
+  ## Context reset (`:clear_context`)
+
+  `/clear` in the TUI (and `clear_context/1` here) wipes a session's conversation context **in
+  place** — no daemon restart, no new session. It resets `state.messages` to exactly the system
+  message, `turn_count` to `0` and the compaction latch `compacted?` to `false`, and publishes
+  `{:context_cleared, %{}}` so every attached client repaints and drops its stale viewport
+  (design §10.6 multi-client input).
+
+  **It is a "stop the line" gesture too.** A turn that is in flight when `/clear` arrives is part
+  of the context being discarded, so it is killed first (the same `kill_current_task/1` that
+  `cancel/1` uses). Leaving it running would let its `{:llm_result, _}` append an assistant
+  message onto the freshly cleared list — a stray turn with no prompt behind it. For the same
+  reason the pending prompt queue is dropped: a stacked prompt must not start a turn against a
+  context the user just cleared. This is deliberately consistent with `cancel/1`'s "stop, don't
+  resume the stack" semantics.
+
+  The system message is **rebuilt** from the prompt captured at init rather than copied from
+  `hd(state.messages)`. `Athanor.Store.Compactor` never drops or replaces index 0 today
+  (`cut_index/2` never cuts below the system message and `compact/2` re-prepends it verbatim), but
+  rebuilding keeps `/clear` independent of that invariant and re-derives exactly one trimmed
+  system message (corrections C3/C13).
   """
 
   use GenServer
@@ -97,6 +119,7 @@ defmodule Athanor.Agent do
     :parent_id,
     :subscriber,
     :session_id,
+    :system_prompt,
     :model,
     :cd,
     :llm_fn,
@@ -168,6 +191,24 @@ defmodule Athanor.Agent do
 
   def clear_prompt_queue(agent) do
     GenServer.call(agent, :clear_prompt_queue)
+  end
+
+  @doc """
+  Resets the session's conversation context in place: `messages` back to just the system message,
+  `turn_count` to `0`, and the compaction latch cleared.
+
+  Accepts a session id (routed over the agent's PubSub inbox, like the other bus commands) or a
+  PID/registered name (`GenServer.call/3`). A turn in flight is stopped and the pending prompt
+  queue is dropped as part of the reset (see the moduledoc), so this is "start this session over",
+  not a pure data wipe. Returns `:ok` and publishes `{:context_cleared, %{}}`.
+  """
+  @spec clear_context(GenServer.server() | String.t()) :: :ok
+  def clear_context(agent_id) when is_binary(agent_id) do
+    Bus.send_command(agent_id, :clear_context)
+  end
+
+  def clear_context(agent) do
+    GenServer.call(agent, :clear_context)
   end
 
   @doc """
@@ -266,6 +307,7 @@ defmodule Athanor.Agent do
         parent_id: parent_id,
         subscriber: Keyword.get(opts, :subscriber),
         session_id: session_id,
+        system_prompt: system_prompt,
         model: model,
         cd: cd,
         max_turns: max_turns,
@@ -325,6 +367,10 @@ defmodule Athanor.Agent do
     {:reply, :ok, do_clear_prompt_queue(state)}
   end
 
+  def handle_call(:clear_context, _from, state) do
+    {:reply, :ok, do_clear_context(state)}
+  end
+
   def handle_call({:subscribe, pid}, _from, state) do
     {:reply, :ok, %{state | subscriber: pid}}
   end
@@ -359,6 +405,11 @@ defmodule Athanor.Agent do
   end
 
   @impl GenServer
+  def handle_cast(:clear_context, state) do
+    {:noreply, do_clear_context(state)}
+  end
+
+  @impl GenServer
   # PubSub commands arriving on "agent:<id>:inbox"
   def handle_info({:bus_command, {:prompt, text}}, state) do
     {:noreply, do_enqueue_prompt(state, text)}
@@ -370,6 +421,10 @@ defmodule Athanor.Agent do
 
   def handle_info({:bus_command, :clear_prompt_queue}, state) do
     {:noreply, do_clear_prompt_queue(state)}
+  end
+
+  def handle_info({:bus_command, :clear_context}, state) do
+    {:noreply, do_clear_context(state)}
   end
 
   def handle_info({:bus_command, :cancel}, state) do
@@ -707,6 +762,36 @@ defmodule Athanor.Agent do
     else
       notify_prompt_queue(%{state | prompt_queue: :queue.new()})
     end
+  end
+
+  # `/clear`: discard the whole conversation context in place (moduledoc). It reuses the cancel
+  # machinery — kill the in-flight turn and drop the queue — because a half-cleared context (an
+  # in-flight turn that lands *after* the wipe, or a stacked prompt that starts against it) is
+  # exactly what the user asked to be rid of. `{:context_cleared, %{}}` is published last, so
+  # every attached client repaints against the already-reset state.
+  #
+  # `do_clear_prompt_queue/1` here, not `do_cancel/1`: the tool-call group of a killed turn is
+  # irrelevant, because `reset_context/1` is about to throw the whole message list away.
+  defp do_clear_context(state) do
+    state =
+      state
+      |> kill_current_task()
+      |> reset_context()
+      |> do_clear_prompt_queue()
+      |> set_status(:idle)
+
+    notify(state, {:context_cleared, %{}})
+    state
+  end
+
+  # The system message is re-derived through `initial_messages/2` (the one place it is built,
+  # C3/C13) from the prompt captured at init, rather than copied from `hd(state.messages)`: the
+  # Compactor preserves index 0 today, but rebuilding keeps `/clear` independent of that
+  # invariant (see the moduledoc).
+  defp reset_context(state) do
+    messages = initial_messages(state.system_prompt, nil)
+
+    %{state | messages: messages, turn_count: 0, compacted?: false}
   end
 
   defp begin_user_turn(state, text) do

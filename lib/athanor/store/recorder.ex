@@ -20,6 +20,7 @@ defmodule Athanor.Store.Recorder do
   | `{:agent_event, id, {:child_done, report}}` | `kind: "event"` audit |
   | `{:agent_event, id, {:compaction, %{summary: _, kept: _, dropped: _}}}` | `kind: "compaction"` marker + atomic `HANDOFF.md` rewrite + `meta.json#compaction` bump (§5.4) |
   | `{:agent_event, id, {:resume, %{from: v}}}` | `kind: "resume"` marker (C12) |
+  | `{:agent_event, id, {:context_cleared, _}}` | `kind: "clear"` marker (a user `/clear`; a later resume drops the messages before it) |
   | `{:text_delta, _}`, `{:tool_start, _}`, `{:tool_end, _}`, `{:user_message, _}`, `{:turn_complete, _}` | dropped (C2/C13) |
   | anything else | dropped |
 
@@ -45,6 +46,12 @@ defmodule Athanor.Store.Recorder do
   `{:resume, %{from: v}}` is the C12 counterpart: neutralising a session's in-flight state on
   resume leaves a `kind: "resume"` marker behind (with no `HANDOFF.md`/`meta.json` effect), so a
   later reader can see that a run was stitched to a previous one.
+
+  `{:context_cleared, _}` is the `/clear` counterpart: a `kind: "clear"` marker records that the
+  user reset the session's conversation context. Like the resume marker it changes no file beyond
+  the transcript, but it is **load-bearing on read**: because the transcript is append-only the
+  messages before the marker stay on disk as history, and `Athanor.Orchestrator` drops them when
+  it replays the transcript for a resume, so a cleared context is never silently resurrected.
 
   ## Crash safety (plan §5.2)
 
@@ -377,6 +384,16 @@ defmodule Athanor.Store.Recorder do
   # where one run ended and the next began. A resume changes no file beyond the transcript.
   defp consume({:agent_event, id, {:resume, %{} = resume}}, state) when is_binary(id) do
     record(state, id, "resume", %{"from" => field(resume, :from)})
+  end
+
+  # `/clear` (design §7.4, §10.6): a marker recording that the user reset the session's context.
+  # An append-only transcript cannot delete the messages before it, so the marker is what a resume
+  # replays against — `Athanor.Orchestrator.rehydrate_messages/2` drops everything ahead of it,
+  # otherwise a later `/resume` would resurrect exactly the context the user cleared. No
+  # `HANDOFF.md`/`meta.json` effect, matching the resume marker.
+  defp consume({:agent_event, id, {:context_cleared, _cleared}}, state) when is_binary(id) do
+    ts = DateTime.to_iso8601(DateTime.utc_now())
+    record(state, id, "clear", %{"event" => "clear", "ts" => ts})
   end
 
   # Our own debounce timer.

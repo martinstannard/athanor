@@ -124,7 +124,7 @@ defmodule Athanor.Daemon do
   # Bump @handshake whenever the daemon/TUI RPC or readiness surface changes. A running
   # daemon from an older build then reports as *incompatible* instead of being probed with
   # functions it does not have (which would look like "still booting" forever).
-  @handshake 2
+  @handshake 3
   @build_marker "athanor-0.1.0-h#{@handshake}"
 
   @doc """
@@ -585,6 +585,20 @@ defmodule Athanor.Daemon do
   @spec cancel_session(node(), String.t()) :: :ok | {:error, term()}
   def cancel_session(target_node, session_id) do
     rpc(target_node, Orchestrator, :cancel_session, [session_id])
+  end
+
+  @doc """
+  Resets one session's conversation context in place on `target_node` (design §7.4, §10.6).
+
+  Thin bounded `rpc/4` wrapper over `Athanor.Orchestrator.clear_context/1` — the `/clear` verb. The
+  agent's working `messages` go back to the bare system message, `turn_count` to `0`, any in-flight
+  turn stops and the pending prompt queue is dropped; the reset is published so every attached
+  client repaints. Returns `:ok`, or `{:error, :not_found}` for an unknown session (surfaced, like
+  the other wrappers, as `{:error, :rpc_timeout | :rpc_failed}` when the daemon is unreachable).
+  """
+  @spec clear_context(node(), String.t()) :: :ok | {:error, term()}
+  def clear_context(target_node, session_id) do
+    rpc(target_node, Orchestrator, :clear_context, [session_id])
   end
 
   @spec launch_subagent(node(), String.t(), String.t(), String.t(), keyword()) ::

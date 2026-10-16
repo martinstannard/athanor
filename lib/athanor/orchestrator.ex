@@ -222,6 +222,29 @@ defmodule Athanor.Orchestrator do
   end
 
   @doc """
+  Resets the conversation context of a session **in place**: its working `messages` go back to the
+  bare system message, `turn_count` to `0`, and the compaction latch is cleared (design §7.4's
+  session history, §10.6 multi-client input). This is the `/clear` verb.
+
+  Routed like `cancel_session/1`: the live agent is looked up first, so an unknown id reports
+  `{:error, :not_found}` instead of a command vanishing into an inbox nobody is subscribed to. The
+  reset happens on the owning agent — which also stops any in-flight turn and drops the pending
+  prompt queue (see `Athanor.Agent`'s moduledoc) — and is published as `{:context_cleared, %{}}`
+  so every attached client repaints.
+  """
+  @spec clear_context(String.t()) :: :ok | {:error, :not_found}
+  def clear_context(id) when is_binary(id) do
+    case lookup(id) do
+      {:ok, _pid} ->
+        Bus.send_command(id, :clear_context)
+        :ok
+
+      :error ->
+        {:error, :not_found}
+    end
+  end
+
+  @doc """
   Removes (kills) a running session: `terminate_child/2` on the process, **keeping** the
   on-disk transcript by default (design §10.3 verb table, §10.9 T5).
 
@@ -509,14 +532,22 @@ defmodule Athanor.Orchestrator do
     end
   end
 
-  # §5.3 step 3, with #28's correction: the restored working set is the persisted
-  # `user`/`assistant`/`tool` records in `seq` order — but only those **after** the session's last
-  # `kind: "compaction"` marker. Replaying the whole log (as this used to) silently undid any
-  # compaction the session had performed, which is how a resumed session came back over budget and
-  # wedged: the transcript is append-only by design and keeps every record as the audit trail, so
-  # the marker has to decide where the *live* set starts. `system` records are dropped —
-  # `Athanor.Agent.init/1` re-derives one (C13), so a resume never grafts a stale prompt onto the
-  # history and never ends up with two.
+  # §5.3 step 3, with #28's correction and #31's clear markers: the restored working set is the
+  # persisted `user`/`assistant`/`tool` records in `seq` order — but only those **after** the
+  # session's last reset marker. There are two such markers:
+  #
+  #   * `kind: "compaction"` — everything before it was folded into a summary, so the live set is
+  #     `[summary_message | records-after]` (the marker carries the summary *text*; the message
+  #     that carries it is the Compactor's).
+  #   * `kind: "clear"` — a user `/clear` discarded the context, so the live set is just the
+  #     records after it.
+  #
+  # Replaying the whole log (as this used to) silently undid any compaction the session had
+  # performed, which is how a resumed session came back over budget and wedged; and without
+  # honouring `clear` a resume would resurrect context the user explicitly cleared. A later reset
+  # subsumes everything before it, so only the most recent marker matters. `system` records are
+  # dropped — `Athanor.Agent.init/1` re-derives one (C13), so a resume never grafts a stale prompt
+  # onto the history and never ends up with two.
   defp rehydrate_messages(id, root) do
     case Store.load_records(id, root: root) do
       {:ok, records, _meta} ->
@@ -528,11 +559,14 @@ defmodule Athanor.Orchestrator do
   end
 
   defp live_messages(records) do
-    case last_compaction(records) do
+    case last_reset(records) do
       nil ->
         Enum.flat_map(records, &persisted_message/1)
 
-      {summary, after_marker} ->
+      {:clear, after_marker} ->
+        Enum.flat_map(after_marker, &persisted_message/1)
+
+      {:compaction, summary, after_marker} ->
         kept = Enum.flat_map(after_marker, &persisted_message/1)
 
         # The marker records the summary *text*; the message that carries it is the Compactor's,
@@ -541,16 +575,20 @@ defmodule Athanor.Orchestrator do
     end
   end
 
-  # The session's last compaction marker and the records that followed it. Everything before the
-  # marker was folded into that summary, so it is already represented in the live set.
-  defp last_compaction(records) do
+  # The session's last reset marker (`compaction` or `clear`) and the records that followed it.
+  # Everything before the marker is either folded into the compaction summary or discarded by the
+  # clear, so it is already represented in the live set.
+  defp last_reset(records) do
     records
     |> Enum.with_index()
     |> Enum.reverse()
-    |> Enum.find(fn {record, _index} -> match?(%{"kind" => "compaction"}, record) end)
+    |> Enum.find(fn {record, _index} ->
+      match?(%{"kind" => kind} when kind in ["compaction", "clear"], record)
+    end)
     |> case do
       nil -> nil
-      {record, index} -> {compaction_summary(record), Enum.drop(records, index + 1)}
+      {%{"kind" => "clear"}, index} -> {:clear, Enum.drop(records, index + 1)}
+      {record, index} -> {:compaction, compaction_summary(record), Enum.drop(records, index + 1)}
     end
   end
 
@@ -566,8 +604,6 @@ defmodule Athanor.Orchestrator do
   defp persisted_message(%{"kind" => kind, "payload" => %{} = payload})
        when kind in ["user", "assistant", "tool"],
        do: [payload]
-
-  defp persisted_message(_record), do: []
 
   defp record_seq(%{"seq" => seq}) when is_integer(seq), do: seq
   defp record_seq(_record), do: 0

@@ -304,7 +304,45 @@ defmodule Athanor.OrchestratorTest do
     end
   end
 
+  describe "clear_context/1 (issue #31)" do
+    test "resets a live session's context and returns :ok", %{tmp_dir: tmp_dir} do
+      id = "clear-live-#{System.unique_integer([:positive])}"
+      {:ok, ^id, pid} = Orchestrator.spawn_session(id: id, cd: tmp_dir, llm_fn: running_llm())
+
+      assert :ok = Orchestrator.send_session(id, "remember this")
+
+      assert await(fn ->
+               Agent.get_state(pid).messages |> Enum.map(& &1.role) ==
+                 ["system", "user", "assistant"]
+             end)
+
+      assert :ok = Orchestrator.clear_context(id)
+
+      assert await(fn -> match?([%{role: "system"}], Agent.get_state(pid).messages) end)
+
+      assert Agent.get_state(pid).turn_count == 0
+      cleanup([id])
+    end
+
+    test "returns {:error, :not_found} for an unknown id" do
+      assert {:error, :not_found} = Orchestrator.clear_context("clear-no-such-session")
+    end
+  end
+
   defp session_ids, do: Enum.map(Orchestrator.list_sessions(), & &1.id)
+
+  defp await(fun), do: await(fun, 200)
+
+  defp await(_fun, 0), do: flunk("condition never held")
+
+  defp await(fun, attempts) do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      await(fun, attempts - 1)
+    end
+  end
 
   defp await_status(id, status), do: await_status(id, status, 100)
 

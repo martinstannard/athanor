@@ -14,8 +14,8 @@ defmodule Athanor.Store.Transcript do
     * `"session_id"` — the Athanor session id, redundant with the directory but makes a record
       self-describing if files are ever concatenated
     * `"kind"` — one of `"user"`, `"assistant"`, `"tool"`, `"status"`, `"event"`,
-      `"compaction"`, `"resume"`, `"checkpoint"` (unknown kinds are tolerated on read for
-      forward compatibility)
+      `"compaction"`, `"resume"`, `"clear"`, `"checkpoint"` (unknown kinds are tolerated on read
+      for forward compatibility)
     * `"payload"` — for `user`/`assistant`/`tool` the **exact** message map; otherwise a small
       audit map
 

@@ -705,7 +705,8 @@ defmodule Athanor.StoreTest do
 
   describe "kinds/0" do
     test "lists exactly the documented record kinds" do
-      assert Store.kinds() == ~w(user assistant tool status event compaction resume checkpoint)
+      assert Store.kinds() ==
+               ~w(user assistant tool status event compaction resume clear checkpoint)
     end
   end
 

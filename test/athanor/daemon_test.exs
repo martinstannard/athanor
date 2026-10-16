@@ -97,6 +97,7 @@ defmodule Athanor.DaemonTest do
     for result <- [
           Daemon.send_session(dead, "any", "hi"),
           Daemon.cancel_session(dead, "any"),
+          Daemon.clear_context(dead, "any"),
           Daemon.launch_subagent(dead, "any", "t", "p"),
           Daemon.start_conductor(dead, title: "t")
         ] do
@@ -327,6 +328,12 @@ defmodule Athanor.DaemonTest do
       missing = "daemon-test-missing-#{System.unique_integer([:positive])}"
 
       assert {:error, :not_found} = Daemon.resume_session(Node.self(), missing)
+    end
+
+    test "clear_context/2 forwards to Orchestrator.clear_context/1" do
+      missing = "daemon-clear-missing-#{System.unique_integer([:positive])}"
+
+      assert {:error, :not_found} = Daemon.clear_context(Node.self(), missing)
     end
 
     @tag :tmp_dir
