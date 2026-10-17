@@ -268,7 +268,9 @@ To ensure Athanor can restart cleanly without losing in-progress work or re-lear
 > `system_prompt_section/1`, `remember/2`, `recall/2`, `forget/2`, `distill/2`, `bullet_id/1`),
 > `Athanor.Memory.{Entry,Store,Redact,Merge,Injector,Retrieval,Transcripts}`. Layout: `<workspace>/.athanor/`
 > (project tier, `<workspace>` found by ascending for `.athanor/`/`.git/`, following a linked
-> worktree's `.git` pointer back to the main repo) and `~/.athanor/memory/` (global tier). Each
+> worktree's `.git` pointer back to the main repo) and `~/.athanor/memory/` (global tier). A repo's
+> `/.athanor/` is **gitignored** as per-checkout runtime state (see the plan's OQ8); a curated,
+> shared fact can still be committed with `git add -f .athanor/MEMORY.md`. Each
 > tier holds a curated `MEMORY.md` (auto-injected) and an append-only `learnings.jsonl` (recall
 > only). Injection is one block appended in `Athanor.Agent`'s `compose_system_prompt/3`, after the
 > role prompt and the project context; the global tier is header-only unless

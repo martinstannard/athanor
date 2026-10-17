@@ -29,13 +29,16 @@ athanor-*.tar
 # Local agent tooling, not part of the project:
 #   /.claude/    — Claude Code hooks, settings and local MCP servers
 #   /.chainlink/ — Chainlink issue tracker state (issues.db is a local SQLite database)
+#   /.athanor/   — §7.5 memory for whoever runs the harness in this checkout (MEMORY.md plus the
+#                  append-only learnings.jsonl). Runtime state, not project content: it is written
+#                  by the harness, not reviewed by a human, and a committed MEMORY.md silently
+#                  changes every session's system prompt — and every test that asserts on one.
+#                  A curated, genuinely shared fact can still be committed with
+#                  `git add -f .athanor/MEMORY.md`.
 # Force-add with `git add -f <path>` if you specifically want them shared.
 /.claude/
 /.chainlink/
+/.athanor/
 
 # Local handover notes: deliberately kept out of git (machine paths, PIDs, daemon internals).
 /docs/handover.md
-
-# §7.5 memory. `MEMORY.md` is curated, redacted, team-valuable knowledge — commit it. The
-# append-only `learnings.jsonl` is unbounded machine-written detail, so it stays local.
-/.athanor/learnings.jsonl
