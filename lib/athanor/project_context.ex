@@ -64,10 +64,15 @@ defmodule Athanor.ProjectContext do
 
   # Nearest wins: test AGENTS.md *before* the `.git` boundary so a nested file is preferred over
   # the repo-root one, and stop at the boundary even when the directory has no AGENTS.md.
+  #
+  # The root is also a boundary. Without it, a `cwd` with no `.git` anywhere above it walks
+  # `"/"` → `Path.dirname("/") == "/"` → `"/"` … forever: `load/1` never returns, so an agent
+  # whose `cd` is not inside a repository hangs at init while hammering the file server.
   defp walk_up(dir, max_bytes) do
     cond do
       body = read_agents_md(dir) -> {:ok, truncate(body, max_bytes)}
       git_boundary?(dir) -> :none
+      Path.dirname(dir) == dir -> :none
       true -> walk_up(Path.dirname(dir), max_bytes)
     end
   end

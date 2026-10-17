@@ -80,4 +80,19 @@ defmodule Athanor.ProjectContextTest do
       assert ProjectContext.sentinel() =~ "athanor:project-instructions"
     end
   end
+
+  describe "termination" do
+    # Regression: `walk_up/2` had no root boundary, so a cwd with no `.git` above it walked
+    # `"/" → Path.dirname("/") == "/"` forever and `load/1` never returned — an agent whose `cd`
+    # is not inside a repository hung at init. The timeout keeps a regression a failure rather
+    # than a 60-second hang.
+    @tag timeout: 5_000
+    test "a directory outside any repository returns :none instead of looping" do
+      dir = Path.join(System.tmp_dir!(), "pc_probe_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      assert ProjectContext.load(dir) == :none
+    end
+  end
 end
