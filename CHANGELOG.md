@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add a `/kill <id>` TUI command that removes a running session (a bare `/kill` lists what is running); only the process dies, so the transcript is kept and `/resume` can still offer it. A mid-turn session needs `--force` (#19)
 
 ### Fixed
+- ProjectContext.load/1 hangs forever when the cwd has no .git boundary (#45)
 - `ProjectContext.load/1` looped forever when the working directory had no `.git` boundary, hanging an agent at init (#45)
 - GoalManagerTest flake: 'a verified result closes the goal' races Process.alive? (#42)
 - Test suite is red when run from a default worktree (~/.athanor/worktrees) (#40)
