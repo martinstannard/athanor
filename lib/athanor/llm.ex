@@ -1,8 +1,21 @@
 defmodule Athanor.LLM do
   @moduledoc """
-  Stateless OpenAI-compatible streaming client for OpenCode Go (`opencode-go`).
+  Provider-dispatching LLM client: OpenCode Go (`:opencode`, the default) or Claude (`:claude`).
 
-  Streams Server-Sent Events (SSE) from `/chat/completions`, sending real-time
+  `stream/4` resolves the backend from `Athanor.Config.provider/0` and delegates:
+
+    * `:opencode` — this module, an OpenAI-compatible SSE client for OpenCode Go's
+      `/chat/completions`;
+    * `:claude` — `Athanor.LLM.Claude`, which drives the Claude Code CLI so a *subscription*
+      login can be used (its OAuth token cannot be used against `api.anthropic.com`).
+
+  Both paths honour the same contract — `{:llm_delta, chunk}` to the caller as text arrives, then
+  `{:ok, %{role: "assistant", content: text, tool_calls: calls}}` or `{:error, reason}` — so
+  `Athanor.Agent` does not branch on the provider. The one behavioural difference is tool calling:
+  it works on `:opencode`, and is not available on `:claude` (see `Athanor.LLM.Claude`'s module
+  doc for exactly why, and what a session that needs tools should use).
+
+  The rest of this module is the OpenCode Go path: it streams SSE, sending real-time
   `{:llm_delta, text}` messages to the caller and returning the assembled
   assistant message (including any accumulated tool calls).
 
@@ -12,6 +25,7 @@ defmodule Athanor.LLM do
   """
 
   alias Athanor.Config
+  alias Athanor.LLM.Claude
 
   # Placeholder for a tool call slot seen for the first time in a streaming delta.
   @empty_tool_call %{id: "", type: "function", function: %{name: "", arguments: ""}}
@@ -44,14 +58,37 @@ defmodule Athanor.LLM do
         }
 
   @doc """
-  Streams a chat completion from OpenCode Go.
+  Streams a chat completion from the configured provider (`Athanor.Config.provider/0`).
 
   Sends `{:llm_delta, chunk}` to `caller_pid` as content tokens arrive.
   Returns `{:ok, assistant_message}` when complete, or `{:error, reason}`.
+
+  Dispatches on the provider, which is read from the environment/config rather than from `opts`,
+  so that every caller in the tree (the agent turn, a goal verifier's peer) agrees with the
+  daemon on which backend is in use. A call site that genuinely needs to pin one backend can call
+  the path directly — `Athanor.LLM.Claude.stream/4` or `stream_opencode/4`.
+
+  The 3-arity/default-argument shape is unchanged, so existing callers
+  (`Athanor.Agent.start_llm_turn/1` is the only one) are unaffected.
   """
   @spec stream([map()], [map()], pid(), keyword()) ::
           {:ok, assistant_message()} | {:error, String.t()}
   def stream(messages, tools, caller_pid \\ self(), opts \\ []) do
+    case Config.provider() do
+      :claude -> Claude.stream(messages, tools, caller_pid, opts)
+      :opencode -> stream_opencode(messages, tools, caller_pid, opts)
+    end
+  end
+
+  @doc """
+  Streams from OpenCode Go directly, bypassing provider resolution.
+
+  This is the historical body of `stream/4`, exposed so a caller can pin the HTTP backend
+  regardless of `ATHANOR_PROVIDER`.
+  """
+  @spec stream_opencode([map()], [map()], pid(), keyword()) ::
+          {:ok, assistant_message()} | {:error, String.t()}
+  def stream_opencode(messages, tools, caller_pid, opts) do
     with {:ok, api_key} <- resolve_api_key(opts) do
       base_url = Keyword.get(opts, :base_url, Config.base_url())
       model = Keyword.get(opts, :model, Config.model())
