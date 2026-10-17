@@ -882,4 +882,90 @@ defmodule Athanor.TUITest do
       assert {:submit, "/unqueuex", _} = TUI.handle_key(typed, "\r")
     end
   end
+
+  describe "daemon connectivity header (#25)" do
+    test "reports connected, unreachable and local, with theme roles" do
+      base = TUI.new(daemon_node: :"athanor_daemon@127.0.0.1", width: 120)
+      assert {"● athanor_daemon@127.0.0.1", :success} = TUI.daemon_status(%{base | daemon_connected?: true})
+
+      down = %{
+        base
+        | daemon_connected?: false,
+          daemon_down_since: System.monotonic_time(:millisecond) - 12_500
+      }
+
+      assert {"✕ unreachable (12s)", :error} = TUI.daemon_status(down)
+
+      local = TUI.new(daemon_node: Node.self(), daemon_mode: :local)
+      assert {"○ local", :warning} = TUI.daemon_status(local)
+    end
+
+    test "a nodedown of the attached node flips the status; unrelated nodes are ignored" do
+      tui =
+        TUI.new(daemon_node: :"athanor_daemon@127.0.0.1", width: 120)
+        |> Map.put(:daemon_connected?, true)
+
+      assert TUI.handle_node_event(tui, {:nodedown, :"someone_else@127.0.0.1"}) == tui
+
+      down = TUI.handle_node_event(tui, {:nodedown, :"athanor_daemon@127.0.0.1"})
+      refute down.daemon_connected?
+      assert down.dirty
+      assert is_integer(down.daemon_down_since)
+
+      up = TUI.handle_node_event(down, {:nodeup, :"athanor_daemon@127.0.0.1"})
+      assert up.daemon_connected?
+      assert up.daemon_down_since == nil
+    end
+
+    test "the header renders the daemon indicator" do
+      tui =
+        TUI.new(width: 120)
+        |> Map.put(:daemon_node, :"athanor_daemon@127.0.0.1")
+        |> Map.put(:daemon_connected?, true)
+
+      assert TUI.render_frame(tui) =~ "daemon ● athanor_daemon@127.0.0.1"
+    end
+  end
+
+  describe "/stats (#26)" do
+    test "renders the active session's stats into the viewport" do
+      stats = %{
+        turns: 2,
+        tool_calls: %{"bash" => 1},
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        cached_tokens: 0,
+        reasoning_tokens: 0,
+        context_tokens: 50,
+        model: "m"
+      }
+
+      tui = TUI.new() |> TUI.handle_agent_event({:stats, stats}) |> TUI.stats_command(:active)
+      {:system, text} = tui.sessions["conductor-main"].entries |> List.last()
+      assert text =~ "Stats — conductor-main (model: m)"
+      assert text =~ "tool calls:   1 (bash 1)"
+    end
+
+    test "says so when there are no stats yet" do
+      tui = TUI.new() |> TUI.stats_command(:active)
+      {:system, text} = tui.sessions["conductor-main"].entries |> List.last()
+      assert text =~ "No stats yet"
+    end
+
+    test "/stats all aggregates every session that has stats" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event({:stats, %{turns: 2, tool_calls: %{"bash" => 1}, model: "m"}})
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started, %{id: "worker-1", title: "w", role: :worker, parent_id: "conductor-main"}}
+        )
+        |> TUI.handle_agent_event("worker-1", {:stats, %{turns: 3, tool_calls: %{"bash" => 2}, model: "m"}})
+        |> TUI.stats_command(:all)
+
+      {:system, text} = tui.sessions["conductor-main"].entries |> List.last()
+      assert text =~ "Stats — total (2 session(s))"
+      assert text =~ "turns:        5"
+    end
+  end
 end

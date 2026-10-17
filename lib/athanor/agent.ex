@@ -148,6 +148,16 @@ defmodule Athanor.Agent do
     :turn_timeout_ms,
     status: :idle,
     turn_count: 0,
+    # Per-session consumption totals for `/stats` (#26). In-process and cheap: folded from the
+    # provider's real `usage` when it arrives, otherwise left at zero — never estimated into the
+    # totals (the estimate is computed on demand for context occupancy only).
+    stats: %{
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cached_tokens: 0,
+      reasoning_tokens: 0,
+      tool_calls: %{}
+    },
     compacted?: false,
     messages: [],
     prompt_queue: :queue.new(),
@@ -451,7 +461,8 @@ defmodule Athanor.Agent do
       session_id: state.session_id,
       turn_count: state.turn_count,
       goal_id: state.goal_id,
-      prompt_queue_len: prompt_queue_len(state)
+      prompt_queue_len: prompt_queue_len(state),
+      stats: public_stats(state)
     }
 
     {:reply, snapshot, state}
@@ -531,6 +542,8 @@ defmodule Athanor.Agent do
       |> Map.put(:current_task, nil)
       |> disarm_watchdog()
       |> record_messages(assistant_msg)
+      |> accumulate_usage(assistant_msg)
+      |> publish_stats()
 
     case Map.get(assistant_msg, :tool_calls, []) do
       [] ->
@@ -1000,7 +1013,7 @@ defmodule Athanor.Agent do
   end
 
   defp start_tool_execution(state, tool_calls) do
-    state = set_status(state, :executing_tools)
+    state = set_status(state, :executing_tools) |> count_tool_calls(tool_calls) |> publish_stats()
     agent_pid = self()
     cd = state.cd
     session_id = state.id
@@ -1172,6 +1185,99 @@ defmodule Athanor.Agent do
     updated
   end
 
+  # -- stats (#26) ---------------------------------------------------------------------
+
+  # Folds the provider's real `usage` block (when it was sent) into the session totals. Absent or
+  # unexpected shapes contribute nothing — the totals are never invented.
+  defp accumulate_usage(state, assistant_msg) do
+    case get(assistant_msg, :usage) do
+      usage when is_map(usage) ->
+        stats = state.stats
+
+        %{
+          state
+          | stats: %{
+              stats
+              | prompt_tokens: stats.prompt_tokens + num(usage, :prompt_tokens),
+                completion_tokens: stats.completion_tokens + num(usage, :completion_tokens),
+                cached_tokens: stats.cached_tokens + cached_tokens(usage),
+                reasoning_tokens: stats.reasoning_tokens + reasoning_tokens(usage)
+            }
+        }
+
+      _other ->
+        state
+    end
+  end
+
+  # Verified against the live endpoint: OpenCode Go reports cached prompt tokens as
+  # `prompt_tokens_details.cached_tokens`. The OpenAI-documented `prompt_cache_hit_tokens` is
+  # accepted too, so neither shape is lost.
+  defp cached_tokens(usage) do
+    direct = get(usage, :prompt_cache_hit_tokens)
+
+    if is_integer(direct) do
+      direct
+    else
+      case get(usage, :prompt_tokens_details) do
+        %{} = details -> num(details, :cached_tokens)
+        _other -> 0
+      end
+    end
+  end
+
+  defp reasoning_tokens(usage) do
+    case get(usage, :completion_tokens_details) do
+      %{} = details -> num(details, :reasoning_tokens)
+      _other -> 0
+    end
+  end
+
+  defp count_tool_calls(state, tool_calls) when is_list(tool_calls) do
+    counted =
+      Enum.reduce(tool_calls, state.stats.tool_calls, fn tool_call, acc ->
+        Map.update(acc, tool_call_name(tool_call), 1, &(&1 + 1))
+      end)
+
+    %{state | stats: %{state.stats | tool_calls: counted}}
+  end
+
+  defp count_tool_calls(state, _tool_calls), do: state
+
+  defp tool_call_name(%{function: %{name: name}}) when is_binary(name), do: name
+  defp tool_call_name(%{"function" => %{"name" => name}}) when is_binary(name), do: name
+  defp tool_call_name(_other), do: "unknown"
+
+  # The public view of a session's consumption: real token buckets, tool calls by name, and the
+  # context-occupancy estimate — the one place an estimate is used, and labelled as such in the UI.
+  defp public_stats(state) do
+    Map.merge(state.stats, %{
+      turns: state.turn_count,
+      context_tokens: Tokens.estimate_messages(state.messages),
+      model: state.model
+    })
+  end
+
+  defp publish_stats(state) do
+    notify(state, {:stats, public_stats(state)})
+    state
+  end
+
+  defp num(map, key) do
+    case get(map, key) do
+      value when is_integer(value) -> value
+      _other -> 0
+    end
+  end
+
+  # Usage arrives string-keyed from the wire and atom-keyed from an in-process `llm_fn`.
+  defp get(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> value
+      :error -> Map.get(map, to_string(key))
+    end
+  end
+
   defp snapshot_meta(state) do
     %{
       id: state.id,
@@ -1181,7 +1287,8 @@ defmodule Athanor.Agent do
       model: state.model,
       status: state.status,
       session_id: state.session_id,
-      prompt_queue_len: prompt_queue_len(state)
+      prompt_queue_len: prompt_queue_len(state),
+      stats: public_stats(state)
     }
   end
 

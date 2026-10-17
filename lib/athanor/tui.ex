@@ -151,6 +151,11 @@ defmodule Athanor.TUI do
     focus: :input,
     sidebar_index: 0,
     tick: 0,
+    # Daemon connectivity (#25), event-driven: `:net_kernel.monitor_nodes/1` in `run/1` feeds
+    # `handle_node_event/2`. `daemon_mode` distinguishes "should be attached" from "--local".
+    daemon_mode: :daemon,
+    daemon_connected?: true,
+    daemon_down_since: nil,
     dirty: true
   ]
 
@@ -170,7 +175,8 @@ defmodule Athanor.TUI do
           entries: [entry()],
           streaming_buffer: String.t() | nil,
           prompt_queue_len: non_neg_integer(),
-          queue_next: String.t() | nil
+          queue_next: String.t() | nil,
+          stats: map() | nil
         }
 
   @type focus :: :input | :sessions
@@ -198,7 +204,10 @@ defmodule Athanor.TUI do
           paste_buffer: paste_buffer(),
           scroll_offset: non_neg_integer(),
           focus: focus(),
-          sidebar_index: non_neg_integer()
+          sidebar_index: non_neg_integer(),
+          daemon_mode: :daemon | :local | :fallback,
+          daemon_connected?: boolean(),
+          daemon_down_since: integer() | nil
         }
 
   @doc """
@@ -219,11 +228,12 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /kill <id> to remove a running one (its transcript is kept), /clear to reset the active session's context, /clear-queue to drop all stacked prompts, /unqueue to drop the last one. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /kill <id> to remove a running one (its transcript is kept), /stats [all] for token/cost consumption, /clear to reset the active session's context, /clear-queue to drop all stacked prompts, /unqueue to drop the last one. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
       streaming_buffer: nil,
       prompt_queue_len: 0,
-      queue_next: nil
+      queue_next: nil,
+      stats: nil
     }
 
     base = %__MODULE__{
@@ -235,7 +245,9 @@ defmodule Athanor.TUI do
       width: Keyword.get(opts, :width, 80),
       height: Keyword.get(opts, :height, 24),
       sessions: %{active_id => initial_session},
-      session_order: [active_id]
+      session_order: [active_id],
+      daemon_mode: Keyword.get(opts, :daemon_mode, :daemon),
+      daemon_connected?: daemon_reachable?(daemon_node)
     }
 
     case Keyword.get(opts, :hydrated_sessions) do
@@ -274,7 +286,8 @@ defmodule Athanor.TUI do
         entries: entries,
         streaming_buffer: nil,
         prompt_queue_len: Map.get(s, :prompt_queue_len, 0),
-        queue_next: Map.get(s, :queue_next)
+        queue_next: Map.get(s, :queue_next),
+        stats: Map.get(s, :stats)
       }
 
       order =
@@ -343,6 +356,7 @@ defmodule Athanor.TUI do
     tui =
       new(
         daemon_node: target_node,
+        daemon_mode: mode,
         active_id: main_id,
         model: model,
         theme: Keyword.get(opts, :theme),
@@ -351,6 +365,11 @@ defmodule Athanor.TUI do
         hydrated_sessions: hydrated_sessions
       )
       |> add_system(mode_banner(mode, target_node))
+
+    # #25: event-driven connectivity. `:net_kernel` delivers `{:nodeup, _}`/`{:nodedown, _}` to
+    # this process, so the header can never disagree with reality for longer than one message —
+    # and nothing polls on the render path.
+    enable_node_monitoring(target_node, mode)
 
     tui =
       case resume_error do
@@ -388,6 +407,14 @@ defmodule Athanor.TUI do
         term = Terminal.resize(term)
         tui = %{tui | width: term.size.width, height: term.size.height, dirty: true}
         loop(term, tui)
+
+      # Daemon connectivity (#25). `monitor_nodes/1` may deliver either 2- or 3-tuples depending
+      # on the options used, so both shapes are accepted.
+      {tag, node} when tag in [:nodeup, :nodedown] ->
+        loop(term, handle_node_event(tui, {tag, node}))
+
+      {tag, node, _info} when tag in [:nodeup, :nodedown] ->
+        loop(term, handle_node_event(tui, {tag, node}))
 
       {:agent_event, session_id, event} ->
         tui = handle_agent_event(tui, session_id, event)
@@ -442,6 +469,53 @@ defmodule Athanor.TUI do
       0 -> tui
     end
   end
+
+  # -- daemon connectivity (#25) ---------------------------------------------------------
+
+  @doc """
+  Folds a `:net_kernel` node event into the TUI state (#25).
+
+  Only the node we are attached to matters — an unrelated node coming or going is ignored. Sets
+  `dirty` so the header re-renders on the next loop iteration.
+  """
+  @spec handle_node_event(t(), {:nodeup | :nodedown, node()}) :: t()
+  def handle_node_event(tui, {:nodeup, node}) do
+    if node == tui.daemon_node do
+      %{tui | daemon_connected?: true, daemon_down_since: nil, dirty: true}
+    else
+      tui
+    end
+  end
+
+  def handle_node_event(tui, {:nodedown, node}) do
+    if node == tui.daemon_node do
+      %{tui | daemon_connected?: false, daemon_down_since: now_ms(), dirty: true}
+    else
+      tui
+    end
+  end
+
+  @doc """
+  The header's daemon indicator as a `{label, theme_role}` pair (#25).
+
+  `:local` is a mode, not a failure — muted `○ local`. A daemon we *expected* but cannot reach is
+  `✕ unreachable`, in the error role, with how long it has been down. Colours come from theme
+  roles, so all themes render it legibly.
+  """
+  @spec daemon_status(t()) :: {String.t(), atom()}
+  def daemon_status(%{daemon_mode: :daemon, daemon_connected?: true} = tui) do
+    {"● " <> node_label(tui.daemon_node), :success}
+  end
+
+  def daemon_status(%{daemon_mode: :daemon} = tui) do
+    {"✕ unreachable" <> age_suffix(tui), :error}
+  end
+
+  def daemon_status(%{daemon_mode: :fallback} = tui) do
+    {"✕ unreachable (local fallback)" <> age_suffix(tui), :error}
+  end
+
+  def daemon_status(_tui), do: {"○ local", :warning}
 
   # A frame is only rendered when something actually changed: every mutation sets `dirty`, key
   # presses set it on the way in, and a tick sets it only while a session is busy.
@@ -539,6 +613,9 @@ defmodule Athanor.TUI do
   # these fixes exist to survive.
   defp dispatch_session(term, target_node, command) do
     case command do
+      {:stats, scope, tui} ->
+        loop(term, stats_command(tui, scope))
+
       {:clear_queue, tui} ->
         _ = send_queue_command(target_node, tui.active_id, :clear_prompt_queue)
         loop(term, clear_local_queue(tui))
@@ -621,6 +698,12 @@ defmodule Athanor.TUI do
     update_session(tui, session_id, fn s ->
       %{s | status: status}
     end)
+  end
+
+  # `/stats` reads this, rather than making an RPC on the render path: the agent publishes its
+  # consumption once per turn (#26).
+  def handle_agent_event(tui, session_id, {:stats, stats}) when is_map(stats) do
+    update_session(tui, session_id, fn s -> %{s | stats: stats} end)
   end
 
   # The agent's own report of its pending queue depth. It is authoritative — it is published by
@@ -1105,6 +1188,36 @@ defmodule Athanor.TUI do
     end
   end
 
+  # `/stats` / `/stats all` (#26): render what the sessions have consumed. Read-only and
+  # RPC-free — the agent publishes {:stats, …} once per turn, so the figures are already local.
+  @doc false
+  @spec stats_command(t(), :active | :all) :: t()
+  def stats_command(tui, :active) do
+    session = Map.get(tui.sessions, tui.active_id)
+
+    case session && Map.get(session, :stats) do
+      %{} = stats -> add_system(tui, Athanor.Stats.block(stats_label(session), stats))
+      _other -> add_system(tui, "No stats yet — they appear once this session has completed a turn.")
+    end
+  end
+
+  def stats_command(tui, :all) do
+    rows =
+      tui.session_order
+      |> Enum.map(&Map.get(tui.sessions, &1))
+      |> Enum.flat_map(fn
+        %{stats: stats} = session when is_map(stats) -> [{stats_label(session), stats}]
+        _other -> []
+      end)
+
+    case rows do
+      [] -> add_system(tui, "No stats yet — they appear once a session has completed a turn.")
+      rows -> add_system(tui, Athanor.Stats.all(rows))
+    end
+  end
+
+  defp stats_label(session), do: Map.get(session, :title) || Map.get(session, :id, "session")
+
   # The single definition of "this session's view has been cleared": the transcript entries are
   # *replaced* by one notice (so this client's `/clear` and the agent's `{:context_cleared, _}`
   # event are idempotent), any half-streamed buffer is dropped, and the queue indicator is
@@ -1127,6 +1240,10 @@ defmodule Athanor.TUI do
   defp slash_command(tui, "/clear"), do: {:clear_context, %{tui | input: ""}}
   defp slash_command(tui, "/clear-queue"), do: {:clear_queue, %{tui | input: ""}}
   defp slash_command(tui, "/unqueue"), do: {:drop_queued, %{tui | input: ""}}
+  # `/stats all` must be matched before a bare `/stats` prefix could ever be considered; these are
+  # exact-string clauses, so the longer form is simply listed first for clarity.
+  defp slash_command(tui, "/stats all"), do: {:stats, :all, %{tui | input: ""}}
+  defp slash_command(tui, "/stats"), do: {:stats, :active, %{tui | input: ""}}
 
   defp slash_command(tui, trimmed) do
     case argument_command(tui, trimmed) do
@@ -1315,17 +1432,40 @@ defmodule Athanor.TUI do
   defp render_header(tui, width) do
     session_count = map_size(tui.sessions)
     theme = tui.theme
-    left = " ⚗ ATHANOR │ model: #{tui.model} │ theme: #{theme.key} │ sessions: #{session_count}"
-    right = "Tab: input/deck "
-    gap = max(1, width - String.length(left) - String.length(right))
-    bar = String.slice(left <> String.duplicate(" ", gap) <> right, 0, width)
-    padded = String.pad_trailing(bar, width)
+    {status_label, status_role} = daemon_status(tui)
 
-    Style.ansi256()
-    |> Style.background(Theme.colour(theme, :surface))
-    |> Style.foreground(Theme.colour(theme, :accent))
-    |> Style.bold()
-    |> Style.render_to_string(padded)
+    before = " ⚗ ATHANOR │ daemon "
+    rest = " │ model: #{tui.model} │ theme: #{theme.key} │ sessions: #{session_count}"
+    right = "Tab: input/deck "
+
+    base_style =
+      Style.ansi256()
+      |> Style.background(Theme.colour(theme, :surface))
+      |> Style.foreground(Theme.colour(theme, :accent))
+      |> Style.bold()
+
+    status_style =
+      Style.ansi256()
+      |> Style.background(Theme.colour(theme, :surface))
+      |> Style.foreground(Theme.colour(theme, status_role))
+      |> Style.bold()
+
+    plain = before <> status_label <> rest
+    gap = width - String.length(plain) - String.length(right)
+
+    if gap >= 1 do
+      # Segments, not one styled string: the daemon indicator must carry its own colour while the
+      # rest of the bar keeps the header style (#25).
+      [
+        {base_style, before},
+        {status_style, status_label},
+        {base_style, rest <> String.duplicate(" ", gap) <> right}
+      ]
+      |> Enum.map_join("", fn {style, text} -> Style.render_to_string(style, text) end)
+    else
+      # Too narrow to split colours without wrapping: fall back to one truncated styled line.
+      Style.render_to_string(base_style, String.slice(plain <> String.duplicate(" ", width), 0, width))
+    end
   end
 
   defp render_sidebar(tui, sidebar_w, height) do
@@ -1844,6 +1984,32 @@ defmodule Athanor.TUI do
     "Resume failed (#{inspect(reason)}) — started a fresh Conductor instead."
   end
 
+  # -- connectivity helpers (#25) ---------------------------------------------------------
+
+  defp daemon_reachable?(node), do: node == Node.self() or node in Node.list()
+
+  # Only meaningful when we actually expect a daemon and distribution is up; in `--local` there is
+  # no remote node to monitor, and calling this on `:nonode@nohost` would error.
+  defp enable_node_monitoring(target_node, :daemon) do
+    if Node.alive?() and target_node != Node.self() do
+      :net_kernel.monitor_nodes(true)
+    end
+
+    :ok
+  end
+
+  defp enable_node_monitoring(_target_node, _mode), do: :ok
+
+  defp node_label(node), do: to_string(node)
+
+  defp age_suffix(%{daemon_down_since: nil}), do: ""
+
+  defp age_suffix(%{daemon_down_since: since}) when is_integer(since) do
+    " (#{div(max(now_ms() - since, 0), 1000)}s)"
+  end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
   defp mode_banner(:daemon, node) do
     "Attached to the Athanor daemon (#{node}). Ctrl+Q / /detach leaves it running."
   end
@@ -1964,14 +2130,16 @@ defmodule Athanor.TUI do
         entries: [],
         streaming_buffer: nil,
         prompt_queue_len: 0,
-        queue_next: nil
+        queue_next: nil,
+        stats: nil
       })
 
     updated = %{
       existing
       | title: Map.get(meta, :title, existing.title),
         role: Map.get(meta, :role, existing.role),
-        parent_id: Map.get(meta, :parent_id, existing.parent_id)
+        parent_id: Map.get(meta, :parent_id, existing.parent_id),
+        stats: Map.get(meta, :stats, Map.get(existing, :stats))
     }
 
     order =

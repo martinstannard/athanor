@@ -61,7 +61,10 @@ defmodule Athanor.LLM do
         %{
           "model" => model,
           "messages" => format_messages(messages),
-          "stream" => true
+          "stream" => true,
+          # Ask for the `usage` block on the final chunk (#26): on an OpenAI-compatible stream the
+          # provider omits it unless asked, and without it `/stats` has no real token counts.
+          "stream_options" => %{"include_usage" => true}
         }
         |> maybe_put_tools(tools)
 
@@ -118,6 +121,7 @@ defmodule Athanor.LLM do
       buffer: "",
       content: "",
       tool_calls: %{},
+      usage: nil,
       raw_error: ""
     }
   end
@@ -171,11 +175,18 @@ defmodule Athanor.LLM do
       |> Enum.sort_by(fn {index, _call} -> index end)
       |> Enum.map(fn {_index, call} -> call end)
 
-    %{
+    message = %{
       role: "assistant",
       content: state.content,
       tool_calls: tool_calls
     }
+
+    # `usage` is carried on the message only when the provider actually sent it (#26), so every
+    # existing exact-match assertion on an assistant message is unaffected.
+    case Map.get(state, :usage) do
+      nil -> message
+      usage -> Map.put(message, :usage, usage)
+    end
   end
 
   @doc """
@@ -248,13 +259,13 @@ defmodule Athanor.LLM do
     payload = String.trim_leading(rest)
 
     case JSON.decode(payload) do
-      {:ok, %{"choices" => [%{"delta" => delta} | _]}} when is_map(delta) ->
-        state
-        |> apply_content_delta(delta, caller_pid)
-        |> apply_tool_calls_delta(delta)
-
       {:ok, %{"error" => err}} ->
         %{state | raw_error: inspect(err)}
+
+      {:ok, %{} = decoded} ->
+        state
+        |> capture_usage(decoded)
+        |> apply_choices(decoded, caller_pid)
 
       _ ->
         state
@@ -268,6 +279,25 @@ defmodule Athanor.LLM do
       state
     end
   end
+
+  defp apply_choices(state, %{"choices" => [%{"delta" => delta} | _]}, caller_pid)
+       when is_map(delta) do
+    state
+    |> apply_content_delta(delta, caller_pid)
+    |> apply_tool_calls_delta(delta)
+  end
+
+  # A usage-only chunk (empty `choices`) is normal: the provider reports usage on the final
+  # chunk, and that chunk may carry nothing else (#26).
+  defp apply_choices(state, _decoded, _caller_pid), do: state
+
+  # The only *real* token counts we ever see — the whole reason `/stats` can be non-estimated.
+  # Kept verbatim, including `prompt_cache_hit_tokens` and any reasoning breakdown.
+  defp capture_usage(state, %{"usage" => usage}) when is_map(usage) do
+    %{state | usage: usage}
+  end
+
+  defp capture_usage(state, _decoded), do: state
 
   defp apply_content_delta(state, %{"content" => text}, caller_pid)
        when is_binary(text) and text != "" do

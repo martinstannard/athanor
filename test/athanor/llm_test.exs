@@ -308,4 +308,38 @@ defmodule Athanor.LLMTest do
       :ok
     end
   end
+
+  describe "usage capture (#26)" do
+    test "captures the usage block from the final chunk" do
+      usage =
+        ~s({"choices":[],"usage":{"prompt_tokens":37,"completion_tokens":14,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":12}}})
+
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(~s(data: {"choices":[{"delta":{"content":"ok"}}]}\n\n), self())
+        |> LLM.consume_sse_chunk("data: " <> usage <> "\n\n", self())
+        |> LLM.flush_buffer(self())
+
+      assert LLM.finalize_message(state) == %{
+               role: "assistant",
+               content: "ok",
+               tool_calls: [],
+               usage: %{
+                 "prompt_tokens" => 37,
+                 "completion_tokens" => 14,
+                 "prompt_tokens_details" => %{"cached_tokens" => 4},
+                 "completion_tokens_details" => %{"reasoning_tokens" => 12}
+               }
+             }
+    end
+
+    test "omits the usage key entirely when the provider sent none" do
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(~s(data: {"choices":[{"delta":{"content":"hi"}}]}\n\n), self())
+        |> LLM.flush_buffer(self())
+
+      refute Map.has_key?(LLM.finalize_message(state), :usage)
+    end
+  end
 end

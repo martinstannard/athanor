@@ -797,6 +797,32 @@ defmodule Athanor.Config do
   end
 
   # -- Tool guard (§7.6 / plan §7) -----------------------------------------------
+  @doc """
+  Model prices for `/stats`, in USD per million tokens, keyed by model id (#26).
+
+  **Empty by default.** A price that is guessed is worse than no price, so an unpriced model shows
+  its token counts with cost `—`. Supply a map via `:athanor, :prices`, or JSON via the
+  `ATHANOR_PRICES` env var, e.g.
+
+      ATHANOR_PRICES='{"some-model":{"input":0.27,"output":1.10,"cache_read":0.07}}'
+
+  An unparseable `ATHANOR_PRICES` is treated as empty rather than crashing a render.
+  """
+  @spec prices() :: map()
+  def prices do
+    case System.get_env("ATHANOR_PRICES") || Application.get_env(:athanor, :prices) do
+      %{} = prices -> prices
+      json when is_binary(json) -> decode_prices(json)
+      _other -> %{}
+    end
+  end
+
+  defp decode_prices(json) do
+    case JSON.decode(json) do
+      {:ok, %{} = prices} -> prices
+      _other -> %{}
+    end
+  end
 
   @doc """
   Master switch for the read-before-write guard (default `#{@default_tool_guard_enabled}`).

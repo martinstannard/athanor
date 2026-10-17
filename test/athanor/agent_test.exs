@@ -1386,4 +1386,72 @@ defmodule Athanor.AgentTest do
       assert sys =~ "mix deps.get"
     end
   end
+
+  describe "usage stats (#26)" do
+    test "accumulates real usage and tool-call counts, and publishes them", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "x.txt"), "hi")
+
+      usage = %{
+        "prompt_tokens" => 37,
+        "completion_tokens" => 14,
+        "prompt_tokens_details" => %{"cached_tokens" => 4},
+        "completion_tokens_details" => %{"reasoning_tokens" => 12}
+      }
+
+      llm_fn = fn messages, _tools, _pid ->
+        if Enum.any?(messages, &(Map.get(&1, :role) == "tool")) do
+          {:ok, %{role: "assistant", content: "done", tool_calls: [], usage: usage}}
+        else
+          {:ok,
+           %{
+             role: "assistant",
+             content: "",
+             tool_calls: [
+               %{
+                 id: "c1",
+                 type: "function",
+                 function: %{name: "read_file", arguments: JSON.encode!(%{"path" => "x.txt"})}
+               }
+             ],
+             usage: usage
+           }}
+        end
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+      assert :ok = Agent.prompt(agent, "go")
+
+      # Published to the TUI, which is how `/stats` reads it without an RPC. This first event
+      # carries the first turn's usage; tool counts and the second turn's usage follow.
+      assert_receive {:agent_event, {:stats, published}}, 2_000
+      assert published.prompt_tokens == 37
+
+      assert_receive {:agent_event, {:turn_complete, "done"}}, 2_000
+
+      stats = Agent.get_state(agent).stats
+      assert stats.turns == 1
+      assert stats.tool_calls == %{"read_file" => 1}
+      assert stats.prompt_tokens == 74
+      assert stats.completion_tokens == 28
+      assert stats.cached_tokens == 8
+      assert stats.reasoning_tokens == 24
+      assert stats.model == Agent.get_state(agent).model
+      assert is_integer(stats.context_tokens)
+    end
+
+    test "a provider that sends no usage leaves the totals at zero", %{tmp_dir: tmp_dir} do
+      llm_fn = fn _messages, _tools, _pid ->
+        {:ok, %{role: "assistant", content: "hi", tool_calls: []}}
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+      assert :ok = Agent.prompt(agent, "go")
+      assert_receive {:agent_event, {:turn_complete, "hi"}}, 2_000
+
+      stats = Agent.get_state(agent).stats
+      assert stats.prompt_tokens == 0
+      assert stats.completion_tokens == 0
+      assert stats.tool_calls == %{}
+    end
+  end
 end

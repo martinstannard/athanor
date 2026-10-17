@@ -136,6 +136,8 @@ Built with `Termite` in raw alternate-screen mode (illustrative mock — exact g
 
 Assistant output is rendered through `Athanor.Markdown`, so headings, lists, code blocks and pipe tables appear syntax-highlighted and wrapped to the viewport width. By default the TUI attaches to the background daemon (see §7.7); pass `mix athanor --local` to run fully in-process instead.
 
+The header also carries a **daemon connectivity indicator** (issue #25): `● <node>` while attached, `○ local` when running in-process, and `✕ unreachable (12s)` — in the error role, with how long it has been down — once the daemon goes away. It is **event-driven** (`:net_kernel.monitor_nodes/1`, folded by `Athanor.TUI.handle_node_event/2`), never a poll on the render path, so "busy" and "dead" can no longer look identical. Colours come from theme roles (`:success` / `:warning` / `:error`).
+
 ### Interactive TUI Commands & Shortcuts
 - **`Tab`**: Toggle focus between the input line and the session deck. The header shows `[nav]` and the status bar shows deck hints while the deck is focused.
 - **`j` / `k` / `↓` / `↑`** (deck focused): Move the highlight up/down the session list. **`g` / `G`**: jump to the first/last session. **`Enter`**: select the highlighted session and return focus to the input line. **`Esc`**: leave the deck without changing the active session. While the deck is focused, all other keys are swallowed so they never reach the input buffer.
@@ -144,6 +146,7 @@ Assistant output is rendered through `Athanor.Markdown`, so headings, lists, cod
 - **`/spawn <title> :: <prompt>`**: Manually launch a child sub-agent under the active conductor from the TUI. `/spawn <prompt>` without `::` defaults the title to `"worker"`.
 - **`/conductor <title>`**: Launch a new root-level peer Conductor session.
 - **`/quit`, `/exit`, `/detach`, `Ctrl+C`, `Ctrl+D` or `Ctrl+Q`**: Detach the TUI client, restore the alternate screen, and leave the daemon's Conductors and Sub-Agents running (see §7.7).
+- **`/stats`** (active session) and **`/stats all`** (every session plus a total): turns, tool calls by name, language-model tokens (prompt / completion / cached / reasoning, from the provider's real `usage` block), context occupancy (estimated, and labelled so) and an **estimated** cost. Prices are USD per million tokens from `ATHANOR_PRICES` / `:athanor, :prices` (`Athanor.Pricing`); there is no built-in price table, so an unpriced model renders `—` rather than a fabricated number (issue #26).
 
 ---
 
