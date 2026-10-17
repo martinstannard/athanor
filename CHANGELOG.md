@@ -19,4 +19,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
 
 ### Changed
+- `write_file`/`edit_file` now refuse to modify an existing file the session has not read; creating a new file is unaffected. Disable with `ATHANOR_TOOL_GUARD=0` (#7)
 - Document chainlink's single-session-per-database model and its multi-agent workarounds (#32)
