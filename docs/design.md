@@ -266,7 +266,7 @@ To ensure Athanor can restart cleanly without losing in-progress work or re-lear
 
 > **Implemented subset** — modules: `Athanor.Memory` (facade: `resolve/1`,
 > `system_prompt_section/1`, `remember/2`, `recall/2`, `forget/2`, `distill/2`, `bullet_id/1`),
-> `Athanor.Memory.{Entry,Store,Redact,Merge,Injector,Retrieval}`. Layout: `<workspace>/.athanor/`
+> `Athanor.Memory.{Entry,Store,Redact,Merge,Injector,Retrieval,Transcripts}`. Layout: `<workspace>/.athanor/`
 > (project tier, `<workspace>` found by ascending for `.athanor/`/`.git/`, following a linked
 > worktree's `.git` pointer back to the main repo) and `~/.athanor/memory/` (global tier). Each
 > tier holds a curated `MEMORY.md` (auto-injected) and an append-only `learnings.jsonl` (recall
@@ -274,10 +274,14 @@ To ensure Athanor can restart cleanly without losing in-progress work or re-lear
 > role prompt and the project context; the global tier is header-only unless
 > `ATHANOR_MEMORY_GLOBAL_INJECT` is set. Tools `remember`/`recall`/`forget` go to **both** roles.
 > Redaction runs on write and on injection; files are `0600`, tier dirs `0700`;
-> `mix athanor.memory compact` rewrites the log without tombstones.
+> `mix athanor.memory compact` rewrites the log without tombstones, and the same compaction runs
+> **opportunistically** once a tier's `learnings.jsonl` passes
+> `Config.memory_compact_threshold_bytes/0` (default 256 KB; guarded so a concurrent `remember` is
+> never lost to housekeeping). `recall` also searches **§7.4 session transcripts** with
+> `scope: "transcripts"` — opt-in by name, snippets redacted on the way out (the files themselves
+> are not), and the sweep capped by `Config.memory_transcript_max_records/0`.
 > **Deferred:** session scope is not persisted (the schema offers `project`/`global`); no
-> embeddings (keyword scoring only); recall does not search §7.4 transcripts; no `learnings.jsonl`
-> auto-compaction trigger (the mix task is manual).
+> embeddings (keyword scoring only).
 A layered memory system so Conductors and Sub-Agents accumulate durable knowledge across sessions without polluting every prompt:
 1. **Workspace / Project Memory (`.athanor/MEMORY.md` & `.athanor/learnings.jsonl`)**:
    - Project-specific facts, architecture notes, recurring gotchas, and user preferences ("how we do things in this repo").

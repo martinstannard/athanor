@@ -29,6 +29,7 @@ defmodule Athanor.Memory do
   alias Athanor.Memory.Redact
   alias Athanor.Memory.Retrieval
   alias Athanor.Memory.Store
+  alias Athanor.Memory.Transcripts
 
   @typedoc "The tiers a session's working directory reaches."
   @type resolved :: %{
@@ -151,13 +152,24 @@ defmodule Athanor.Memory do
     query = args["query"] || ""
     limit = args["limit"] || Config.memory_recall_limit()
 
-    with {:ok, scopes} <- validate_recall_scope(args["scope"] || "project") do
+    with {:ok, scopes} <- validate_recall_scope(args["scope"] || "project"),
+         :ok <- transcript_recall_available(scopes) do
       results =
         scopes
         |> Enum.flat_map(&corpus(&1, opts))
         |> Retrieval.search(query, limit: limit)
 
       {:ok, format_results(results)}
+    end
+  end
+
+  # A disabled corpus must say so: silently returning "no matches" would look like "you have
+  # never discussed this", which is a different (and misleading) statement.
+  defp transcript_recall_available(scopes) do
+    if :transcripts in scopes and not Config.memory_transcript_recall?() do
+      {:error, "Transcript recall is disabled (ATHANOR_MEMORY_TRANSCRIPTS=0)."}
+    else
+      :ok
     end
   end
 
@@ -235,6 +247,9 @@ defmodule Athanor.Memory do
 
   defp corpus(:project, opts), do: learnings_for(tier_dir(:project, opts))
   defp corpus(:global, opts), do: learnings_for(tier_dir(:global, opts))
+  # Not part of `:all` on purpose: transcripts are the largest corpus and the rawest text, so they
+  # are opt-in by name (§7.3, OQ3).
+  defp corpus(:transcripts, opts), do: Transcripts.corpus(opts)
 
   # A missing project tier is not an error for recall: it just contributes nothing.
   defp learnings_for({:ok, dir}), do: Store.read_learnings(dir)
@@ -344,7 +359,7 @@ defmodule Athanor.Memory do
   end
 
   defp validate_recall_scope(scope) do
-    case coerce(scope, [:project, :global, :all]) do
+    case coerce(scope, [:project, :global, :all, :transcripts]) do
       nil -> {:error, "Unsupported recall scope #{inspect(scope)}."}
       :all -> {:ok, [:project, :global]}
       value -> {:ok, [value]}

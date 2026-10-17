@@ -51,6 +51,8 @@ defmodule Athanor.Config do
   @default_memory_recall_limit 5
   @default_memory_fact_max_chars 2_000
   @default_memory_compact_threshold_bytes 262_144
+  @default_memory_transcript_recall true
+  @default_memory_transcript_max_records 5_000
   @default_tool_guard_enabled true
   @default_prelude_read_required true
 
@@ -697,6 +699,40 @@ defmodule Athanor.Config do
   @spec memory_enabled?() :: boolean()
   def memory_enabled? do
     boolean_env("ATHANOR_MEMORY", :memory_enabled, @default_memory_enabled)
+  end
+
+  @doc """
+  Whether `recall` may search §7.4 session transcripts (default
+  `#{@default_memory_transcript_recall}`).
+
+  Transcripts are the raw, unredacted conversation record, so recall scrubs each snippet on the way
+  out; this switch exists for an operator who would rather the corpus were not searchable at all.
+  Overridable via `ATHANOR_MEMORY_TRANSCRIPTS` or `:athanor, :memory_transcript_recall`.
+  """
+  @spec memory_transcript_recall?() :: boolean()
+  def memory_transcript_recall? do
+    boolean_env(
+      "ATHANOR_MEMORY_TRANSCRIPTS",
+      :memory_transcript_recall,
+      @default_memory_transcript_recall
+    )
+  end
+
+  @doc """
+  How many transcript records a single `recall` may read before it stops (default
+  `#{@default_memory_transcript_max_records}`).
+
+  Transcripts are unbounded, so the sweep is capped rather than allowed to grow with the pile of
+  sessions on disk. Overridable via `ATHANOR_MEMORY_TRANSCRIPT_RECORDS` or
+  `:athanor, :memory_transcript_max_records`.
+  """
+  @spec memory_transcript_max_records() :: pos_integer()
+  def memory_transcript_max_records do
+    positive_int(
+      "ATHANOR_MEMORY_TRANSCRIPT_RECORDS",
+      :memory_transcript_max_records,
+      @default_memory_transcript_max_records
+    )
   end
 
   @doc """

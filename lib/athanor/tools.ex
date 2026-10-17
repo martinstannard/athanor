@@ -263,15 +263,16 @@ defmodule Athanor.Tools do
         "function" => %{
           "name" => "recall",
           "description" =>
-            "Search durable learnings (project and global learnings.jsonl) for facts relevant to a query. Returns ranked matches with ids.",
+            "Search durable learnings (project and global learnings.jsonl) for facts relevant to a query, or past session transcripts with scope 'transcripts'. Returns ranked matches with ids.",
           "parameters" => %{
             "type" => "object",
             "properties" => %{
               "query" => %{"type" => "string", "description" => "Keywords or a question."},
               "scope" => %{
                 "type" => "string",
-                "enum" => ["project", "global", "all"],
-                "description" => "Defaults to 'project'. 'all' searches project and global."
+                "enum" => ["project", "global", "all", "transcripts"],
+                "description" =>
+                  "Defaults to 'project'. 'all' searches project + global. 'transcripts' searches past session transcripts instead (largest corpus; snippets are redacted)."
               },
               "limit" => %{
                 "type" => "integer",
