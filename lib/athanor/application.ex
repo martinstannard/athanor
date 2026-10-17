@@ -19,6 +19,9 @@ defmodule Athanor.Application do
       # Before `GoalSupervisor`: a manager claims its `{:goal, id}` and `{:worker, id}` keys while it
       # starts, so the registry has to be listening (§7.2, plan §2.3).
       {Registry, keys: :unique, name: Athanor.GoalRegistry},
+      # The read-before-write guard owns a public ETS table that tool-runner processes write to
+      # (§7.6). Before `AgentSupervisor`, because `Agent.init/1` resets a session's read-set.
+      Athanor.ToolGuard,
       # Before `AgentSupervisor`, like `AgentRegistry`: a Sub-Agent resolves its worktree while it
       # is starting, and the Server is the only writer of `session_id → worktree` (§7.1, plan §2.2).
       {Athanor.Worktree.Server, []},

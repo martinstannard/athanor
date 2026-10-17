@@ -49,6 +49,8 @@ defmodule Athanor.Config do
   @default_memory_global_inject false
   @default_memory_recall_limit 5
   @default_memory_fact_max_chars 2_000
+  @default_tool_guard_enabled true
+  @default_prelude_read_required true
 
   @doc """
   Returns the OpenCode Go base URL.
@@ -777,6 +779,33 @@ defmodule Athanor.Config do
       path when is_binary(path) -> if String.trim(path) == "", do: nil, else: path
       _other -> nil
     end
+  end
+
+  # -- Tool guard (§7.6 / plan §7) -----------------------------------------------
+
+  @doc """
+  Master switch for the read-before-write guard (default `#{@default_tool_guard_enabled}`).
+
+  `ATHANOR_TOOL_GUARD=0` disables it entirely: `write_file`/`edit_file` then behave as they did
+  before §7.6. Overridable via `ATHANOR_TOOL_GUARD` or `:athanor, :tool_guard_enabled`.
+  """
+  @spec tool_guard_enabled?() :: boolean()
+  def tool_guard_enabled? do
+    boolean_env("ATHANOR_TOOL_GUARD", :tool_guard_enabled, @default_tool_guard_enabled)
+  end
+
+  @doc """
+  Whether the *specific* prelude-read rule is enforced (default
+  `#{@default_prelude_read_required}`).
+
+  The rule requires an existing file to have been `read_file`-ed this session before it may be
+  written or edited. Kept separate from `tool_guard_enabled?/0` so a broader guard can exist later
+  without this rule being the only thing it means. Overridable via `ATHANOR_PRELUDE_READ` or
+  `:athanor, :prelude_read_required`.
+  """
+  @spec prelude_read_required?() :: boolean()
+  def prelude_read_required? do
+    boolean_env("ATHANOR_PRELUDE_READ", :prelude_read_required, @default_prelude_read_required)
   end
 
   # Like `positive_int/3`, but zero is a legitimate value for the few knobs where "never" is a

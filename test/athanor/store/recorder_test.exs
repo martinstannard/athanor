@@ -816,6 +816,7 @@ defmodule Athanor.Store.RecorderTest do
                Athanor.GoalSupervisor,
                Athanor.AgentSupervisor,
                Athanor.Worktree.Server,
+               Athanor.ToolGuard,
                Athanor.GoalRegistry,
                Athanor.PubSub,
                Athanor.AgentRegistry

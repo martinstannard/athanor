@@ -287,10 +287,15 @@ A layered memory system so Conductors and Sub-Agents accumulate durable knowledg
 > ignore rules and bounded output. Before that the tool set was exactly `read_file`, `write_file`,
 > `edit_file`, `bash` (all sessions) plus `launch_subagent`, `list_sessions`, `session_output`,
 > `send_session` (conductors).
-> **Still planned:** the tool guard and the MCP client.
+> **Shipped:** the **tool guard** (`Athanor.ToolGuard`) — read-before-write enforcement, on by
+> default, off with `ATHANOR_TOOL_GUARD=0`. The read-set is a public ETS table keyed
+> `{session_id, resolved_absolute_path}` (tool calls run in a spawned process, so it cannot live in
+> agent state); `Agent.init/1` resets it per session; the guard is a no-op without a `session_id` or
+> without the table, so a bare `Tools.execute/3` call is never refused.
+> **Still planned:** the MCP client.
 - **Built-in `glob` and `grep` tools**: Fast file discovery and regex search without shelling out to `bash`.
-- **Tool Guard & Prelude-Read Enforcement**: Track read files per session and require `read_file` before `edit_file` / `write_file` on existing files to prevent blind overwrites.
-- **MCP Client (`Athanor.MCP`)**: Attach stdio or SSE Model Context Protocol servers (e.g., Linear, Datadog, Postgres, Exa) per Conductor or Sub-Agent profile.
+- **Tool Guard & Prelude-Read Enforcement** *(implemented)*: A session may only `edit_file`/`write_file` an **existing** path it has already `read_file`-ed this session; a refusal is actionable ("Call read_file first") and creates nothing. Paths are canonicalised via `Tools.resolve_path/2`; symlinks are deliberately not resolved.
+- **MCP Client (`Athanor.MCP`)**: Attach stdio or SSE Model Context Protocol servers (e.g., Linear, Datadog, Postgres, Exa) per Conductor or Sub-Agent profile. **(not implemented)**
 
 ### 7.7 Persistent Daemon & Live Remote Attach (`Athanor.Daemon`) — *partly implemented*
 

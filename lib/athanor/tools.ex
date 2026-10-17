@@ -11,6 +11,7 @@ defmodule Athanor.Tools do
 
   alias Athanor.{Bus, GoalManager, Memory, Orchestrator, SessionId}
   alias Athanor.Memory.Entry
+  alias Athanor.ToolGuard
   alias Athanor.Tools.{Glob, Grep}
   alias Athanor.Tools.Goal, as: GoalTools
   alias Athanor.Tools.Worktree, as: WorktreeTools
@@ -578,8 +579,13 @@ defmodule Athanor.Tools do
     full_path = resolve_path(path, opts)
 
     case File.read(full_path) do
-      {:ok, content} -> {:ok, content}
-      {:error, reason} -> {:error, "Failed to read #{path}: #{:file.format_error(reason)}"}
+      {:ok, content} ->
+        # §7.6: a successful read is what licenses a later write to this path.
+        ToolGuard.mark_read(opts[:session_id], full_path)
+        {:ok, content}
+
+      {:error, reason} ->
+        {:error, "Failed to read #{path}: #{:file.format_error(reason)}"}
     end
   end
 
@@ -587,11 +593,18 @@ defmodule Athanor.Tools do
       when is_binary(path) and is_binary(content) do
     full_path = resolve_path(path, opts)
 
-    with :ok <- File.mkdir_p(Path.dirname(full_path)),
-         :ok <- File.write(full_path, content) do
-      {:ok, "Wrote #{byte_size(content)} bytes to #{path}"}
-    else
-      {:error, reason} -> {:error, "Failed to write #{path}: #{:file.format_error(reason)}"}
+    case guard_write(path, full_path, opts) do
+      :ok ->
+        with :ok <- File.mkdir_p(Path.dirname(full_path)),
+             :ok <- File.write(full_path, content) do
+          ToolGuard.mark_read(opts[:session_id], full_path)
+          {:ok, "Wrote #{byte_size(content)} bytes to #{path}"}
+        else
+          {:error, reason} -> {:error, "Failed to write #{path}: #{:file.format_error(reason)}"}
+        end
+
+      {:error, message} ->
+        {:error, message}
     end
   end
 
@@ -603,12 +616,9 @@ defmodule Athanor.Tools do
       when is_binary(path) and is_binary(old_str) and is_binary(new_str) do
     full_path = resolve_path(path, opts)
 
-    case File.read(full_path) do
-      {:ok, content} ->
-        edit_content(content, path, full_path, old_str, new_str)
-
-      {:error, reason} ->
-        {:error, "Failed to read #{path}: #{:file.format_error(reason)}"}
+    case guard_write(path, full_path, opts) do
+      :ok -> edit_file(path, full_path, old_str, new_str, opts)
+      {:error, message} -> {:error, message}
     end
   end
 
@@ -900,6 +910,35 @@ defmodule Athanor.Tools do
   end
 
   defp describe_launch_error(reason), do: inspect(reason)
+
+  # §7.6: refuse to modify an existing path that has not been read this session. A successful edit
+  # marks the path as known too — the model is looking at its own result.
+  defp edit_file(path, full_path, old_str, new_str, opts) do
+    case File.read(full_path) do
+      {:ok, content} ->
+        case edit_content(content, path, full_path, old_str, new_str) do
+          {:ok, _message} = ok ->
+            ToolGuard.mark_read(opts[:session_id], full_path)
+            ok
+
+          other ->
+            other
+        end
+
+      {:error, reason} ->
+        {:error, "Failed to read #{path}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  # The guard applies only to a path that already exists: creating a file destroys nothing, and
+  # refusing it would break scaffolding.
+  defp guard_write(path, full_path, opts) do
+    if ToolGuard.refuse?(opts[:session_id], full_path) do
+      {:error, ToolGuard.refusal_message(path)}
+    else
+      :ok
+    end
+  end
 
   defp edit_content(content, path, full_path, old_str, new_str) do
     parts = String.split(content, old_str)

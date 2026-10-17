@@ -99,7 +99,7 @@ defmodule Athanor.Agent do
 
   require Logger
 
-  alias Athanor.{Bus, Config, GoalManager, LLM, Memory, ProjectContext, SessionId, Tools}
+  alias Athanor.{Bus, Config, GoalManager, LLM, Memory, ProjectContext, SessionId, ToolGuard, Tools}
   alias Athanor.Store.{Compactor, Tokens}
 
   @default_conductor_prompt """
@@ -335,6 +335,10 @@ defmodule Athanor.Agent do
          :ok <- register_session(opts, id, title, role, parent_id, model) do
       # Subscribe to our own PubSub control inbox
       Bus.subscribe("agent:#{id}:inbox")
+
+      # A session starts with an empty read-set: the guard (§7.6) asks that a file be read *in
+      # this session*, and a reused id (a resume, a restart) must not inherit an earlier one's.
+      ToolGuard.reset(id)
 
       # Conductors subscribe to their children's lifecycle topic
       if role == :conductor do

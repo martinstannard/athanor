@@ -74,6 +74,7 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 | `Athanor.Store.Recorder` | `GenServer` | The single writer of `~/.athanor/sessions/**`: subscribes `"deck:events"` and persists messages, status, errors and compactions. |
 | `Athanor.Memory` | module | Hierarchical memory facade (design §7.5): resolves the project/global tiers for a session's `cd`, builds the injected prompt section, and backs the `remember`/`recall`/`forget` tools (`distill/2` batches them for conductors). |
 | `Athanor.Memory.{Entry,Store,Redact,Merge,Injector,Retrieval}` | modules | Pure data + file IO: the record and its dedup hash, `.athanor`/`~/.athanor/memory` read/write with workspace-root discovery (worktree-aware), secret scrubbing, §4.2 precedence, the budgeted prompt block, and keyword ranking. |
+| `Athanor.ToolGuard` | `GenServer` + ETS | Per-session read-before-write enforcement (§7.6): a public read-set keyed `{session_id, resolved_path}`, so a tool-runner process can record `read_file` and refuse a blind `write_file`/`edit_file` on an existing path. No-op without a session or when disabled. |
 | `Mix.Tasks.Athanor` | Mix task | `mix athanor` — connect to the daemon and start the TUI. |
 | `Mix.Tasks.Athanor.Daemon` | Mix task | `mix athanor.daemon` — run / `--status` / `--stop` / `--restart` the daemon node. |
 | `Mix.Tasks.Athanor.Memory` | Mix task | `mix athanor.memory compact` — rewrite `learnings.jsonl` without tombstones (the only housekeeping verb). |
@@ -499,7 +500,7 @@ supporting module exists in `lib/`:
 | 7.3 | Watchers / external channels (`Athanor.Watcher`) | Not implemented. |
 | 7.4 | Session history, resume & compaction (`Athanor.Store`) | **Implemented ("Resume v1")** — see §12. Deferred: transcript rotation, provider-`usage`-based token accounting, live migration between nodes, LLM-written `HANDOFF.md` summaries. |
 | 7.5 | Hierarchical memory (`Athanor.Memory`) | **Implemented (M1–M5)** — project/global tiers, session-start injection, `remember`/`recall`/`forget` tools, conductor-driven distillation, `mix athanor.memory compact`. Deferred: session scope persistence, embeddings, transcript recall. |
-| 7.6 | `glob`/`grep`, tool guard, MCP client (`Athanor.MCP`) | Not implemented. Tool set is exactly the eight tools in §3. |
+| 7.6 | `glob`/`grep`, tool guard, MCP client (`Athanor.MCP`) | **Partly implemented.** `glob`/`grep` (`Athanor.Tools.{Glob,Grep,Ignore}`) and the read-before-write `Athanor.ToolGuard` (on by default; `ATHANOR_TOOL_GUARD=0` disables). **Not implemented:** the MCP client. |
 | 7.7 | Persistent daemon & remote attach (`Athanor.Daemon`) | **Partly implemented** — see §9. Not implemented: systemd/auto-install, an `:ssh.daemon/2` subsystem, a standalone `athanor attach` binary; the node name is `athanor_daemon@127.0.0.1` (settled — design §8.4). |
 | 7.8 | Multi-host distributed BEAM clustering | Not implemented. `Athanor.Bus` is a single-node `Registry`; `Athanor.Daemon` connects two nodes but supervises nothing remotely. |
 
