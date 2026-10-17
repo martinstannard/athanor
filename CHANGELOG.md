@@ -20,7 +20,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - resume_all silently drops sessions: --resume reports success while skipping some (or all) (#46)
-- ProjectContext.load/1 hangs forever when the cwd has no .git boundary (#45)
 - `ProjectContext.load/1` looped forever when the working directory had no `.git` boundary, hanging an agent at init (#45)
 - GoalManagerTest flake: 'a verified result closes the goal' races Process.alive? (#42)
 - Test suite is red when run from a default worktree (~/.athanor/worktrees) (#40)
