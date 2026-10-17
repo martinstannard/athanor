@@ -284,7 +284,7 @@ defmodule Athanor.GoalManagerTest do
 
       assert :error = GoalManager.for_worker(worker_id)
       assert {:error, :not_found} = GoalManager.status(goal_id)
-      refute Process.alive?(pid)
+      await_death(pid)
 
       # The point of releasing the keys: the same worker can be given a new goal.
       %{goal_id: new_goal_id} = start_goal!(worker_id: worker_id)
@@ -355,7 +355,7 @@ defmodule Athanor.GoalManagerTest do
       # Terminal, and finished: keys released so the worker can be given another goal (C5).
       assert :error = GoalManager.for_worker(worker_id)
       assert {:error, :not_found} = GoalManager.status(goal_id)
-      refute Process.alive?(pid)
+      await_death(pid)
     end
 
     test "a contradicted result never closes a goal" do
@@ -474,7 +474,7 @@ defmodule Athanor.GoalManagerTest do
       # Terminal: both registry keys released so a new goal can be attached (C5).
       assert :error = GoalManager.for_worker(worker_id)
       assert {:error, :not_found} = GoalManager.status(goal_id)
-      refute Process.alive?(pid)
+      await_death(pid)
     end
   end
 
@@ -518,6 +518,15 @@ defmodule Athanor.GoalManagerTest do
     if Process.alive?(pid), do: DynamicSupervisor.terminate_child(Athanor.GoalSupervisor, pid)
   rescue
     _error -> :ok
+  end
+
+  # Awaits the manager's actual exit rather than sampling it. A terminal transition releases the
+  # registry keys first and the process dies a moment later, so `refute Process.alive?(pid)` right
+  # after `status/1` returns `:not_found` is a race (#42). Monitoring is race-free: a pid that has
+  # already exited delivers `{:DOWN, _, _, _, :noproc}` immediately.
+  defp await_death(pid) do
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
   end
 
   # Polls `status/1` until the snapshot satisfies `predicate`, so a test never has to guess how long
