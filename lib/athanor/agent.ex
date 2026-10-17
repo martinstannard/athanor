@@ -118,6 +118,8 @@ defmodule Athanor.Agent do
   @default_worker_prompt """
   You are an Athanor Sub-Agent worker spawned by a parent Conductor.
   Complete your assigned task thoroughly using the provided tools.
+  If your working directory is a fresh git worktree it will not contain `deps/` or `_build/`:
+  run `mix deps.get` there before your first build or test.
   When your task is completely finished, end your final message with:
   ===ATHANOR_DONE=== status=ok summary=<one-line summary of what you accomplished>
   (or status=fail if blocked).

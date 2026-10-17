@@ -166,17 +166,20 @@ defmodule Athanor.Worktree.Server do
 
   @impl GenServer
   def handle_call({:create, session_id, opts}, _from, state) do
-    opts = Keyword.put(opts, :repo, Keyword.get(opts, :repo, state.repo))
+    repo = Keyword.get(opts, :repo, state.repo)
+    opts = Keyword.put(opts, :repo, repo)
 
-    case Worktree.add(session_id, opts) do
-      {:ok, worktree} ->
-        published? = tracked_path(state, session_id) == worktree.path
-        state = track(state, worktree)
-        unless published?, do: publish(worktree.session_id, {:worktree_created, worktree})
-        {:reply, {:ok, worktree}, state}
+    cond do
+      # A session that already has a worktree is a lookup/re-attach, never capped: the cap exists to
+      # bound *new* checkouts, not to refuse a worker the tree it is already using (§7.1 OQ-W8).
+      Map.has_key?(state.sessions, session_id) ->
+        do_create(session_id, opts, state)
 
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+      tracked_in_repo(state, repo) >= Config.worktree_max() ->
+        {:reply, {:error, {:worktree_limit_reached, Config.worktree_max()}}, state}
+
+      true ->
+        do_create(session_id, opts, state)
     end
   end
 
@@ -226,6 +229,25 @@ defmodule Athanor.Worktree.Server do
   end
 
   # -- tracking ------------------------------------------------------------------------------
+
+  # Creates the worktree, tracking it and publishing `{:worktree_created, _}` only when it is new
+  # (a re-attach of a tracked tree is a lookup, not an event).
+  defp do_create(session_id, opts, state) do
+    case Worktree.add(session_id, opts) do
+      {:ok, worktree} ->
+        published? = tracked_path(state, session_id) == worktree.path
+        state = track(state, worktree)
+        unless published?, do: publish(worktree.session_id, {:worktree_created, worktree})
+        {:reply, {:ok, worktree}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp tracked_in_repo(state, repo) do
+    Enum.count(state.sessions, fn {_session_id, worktree} -> worktree.repo == repo end)
+  end
 
   defp tracked_path(state, session_id) do
     case Map.get(state.sessions, session_id) do

@@ -215,6 +215,72 @@ defmodule Athanor.Worktree.ServerTest do
     assert_receive {:agent_event, "worktree", {:worktree_pruned, ["srv-prune-event"]}}, 2_000
   end
 
+  describe "worktree cap (§7.1 OQ-W8, #38)" do
+    test "refuses a create beyond the cap, leaving existing worktrees alone", %{server: server} do
+      with_worktree_max(2, fn ->
+        assert {:ok, _} = Server.create("cap-a", server: server)
+        assert {:ok, _} = Server.create("cap-b", server: server)
+
+        assert {:error, {:worktree_limit_reached, 2}} = Server.create("cap-c", server: server)
+
+        # The existing two are untouched and still tracked — the cap refuses, it never prunes.
+        assert {:ok, path} = Server.path_for("cap-a", server: server)
+        assert File.dir?(path)
+        assert length(Server.list_sessions(server: server)) == 2
+
+        # A session that already has a worktree is served even at the cap (create-or-reuse).
+        assert {:ok, _} = Server.create("cap-a", server: server)
+      end)
+    end
+
+    test "a cap of 0 disables worktree creation", %{server: server} do
+      with_worktree_max(0, fn ->
+        assert {:error, {:worktree_limit_reached, 0}} = Server.create("nope", server: server)
+      end)
+    end
+
+    test "the cap is per repository", %{repo: repo, server: server, tmp_dir: dir} do
+      other = GitRepo.init!(Path.join(dir, "other-repo"))
+
+      with_worktree_max(1, fn ->
+        assert {:ok, _} = Server.create("same-1", server: server, repo: repo)
+        assert {:error, {:worktree_limit_reached, 1}} = Server.create("same-2", server: server, repo: repo)
+        # a second repository has its own budget
+        assert {:ok, _} = Server.create("other-1", server: server, repo: other)
+      end)
+    end
+
+    test "the create_worktree response warns about deps/_build (§7.1 OQ-W5, #39)", %{repo: repo} do
+      assert {:ok, message} =
+               Athanor.Tools.Worktree.create(%{}, cd: repo, session_id: "deps-doc")
+
+      assert message =~ "mix deps.get"
+      assert message =~ "deps/"
+    end
+
+    test "the create_worktree tool explains the cap to the model", %{repo: repo} do
+      with_worktree_max(1, fn ->
+        assert {:ok, _} = Athanor.Tools.Worktree.create(%{}, cd: repo, session_id: "tool-a")
+
+        assert {:error, message} =
+                 Athanor.Tools.Worktree.create(%{}, cd: repo, session_id: "tool-b")
+
+        assert message =~ "already has 1 tracked worktrees"
+        assert message =~ "ATHANOR_WORKTREE_MAX"
+      end)
+    end
+  end
+
+  defp with_worktree_max(value, fun) do
+    previous = Application.get_env(:athanor, :worktree_max)
+    Application.put_env(:athanor, :worktree_max, value)
+    on_exit(fn -> restore_app(:worktree_max, previous) end)
+    fun.()
+  end
+
+  defp restore_app(key, nil), do: Application.delete_env(:athanor, key)
+  defp restore_app(key, value), do: Application.put_env(:athanor, key, value)
+
   defp assert_path(session_id, server, expected) do
     assert {:ok, path} = Server.path_for(session_id, server: server)
     assert path == expected

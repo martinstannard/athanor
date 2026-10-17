@@ -38,6 +38,7 @@ defmodule Athanor.Config do
   @default_worktree_allow_dirty false
   @default_worktree_git_timeout_ms 30_000
   @default_worktree_branch_prefix "athanor/"
+  @default_worktree_max 8
   @default_goal_verify_interval_ms 30_000
   @default_goal_max_nudges 3
   @default_goal_stall_after_ms 60_000
@@ -543,6 +544,20 @@ defmodule Athanor.Config do
   def worktree_branch_prefix do
     System.get_env("ATHANOR_WORKTREE_BRANCH_PREFIX") ||
       Application.get_env(:athanor, :worktree_branch_prefix, @default_worktree_branch_prefix)
+  end
+
+  @doc """
+  Maximum number of worktrees tracked for one repository at a time (default `#{@default_worktree_max}`).
+
+  A conductor that spawns a hundred workers would otherwise create a hundred checkouts and exhaust
+  disk and inodes. The cap refuses the next *create* with `{:error, {:worktree_limit_reached, cap}}`
+  — it never removes or blocks an existing worktree, and asking for a session that already has one
+  is always allowed. `0` disables worktree creation entirely. Overridable via `ATHANOR_WORKTREE_MAX`
+  or `:athanor, :worktree_max`.
+  """
+  @spec worktree_max() :: non_neg_integer()
+  def worktree_max do
+    non_neg_int("ATHANOR_WORKTREE_MAX", :worktree_max, @default_worktree_max)
   end
 
   # -- project context (AGENTS.md, #33) --------------------------------------------------

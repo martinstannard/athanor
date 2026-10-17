@@ -46,6 +46,12 @@ defmodule Athanor.Tools.Worktree do
            "them, or pass allow_dirty: true to create it anyway — the result then names the commit it " <>
            "branched from."}
 
+      {:error, {:worktree_limit_reached, cap}} ->
+        {:error,
+         "Refusing to create a worktree: this repository already has #{cap} tracked worktrees, " <>
+           "which is the limit (ATHANOR_WORKTREE_MAX). Remove one with remove_worktree, or " <>
+           "`mix athanor.worktree cleanup --force`, before spawning another isolated worker."}
+
       {:error, reason} ->
         {:error, "Could not create a worktree for #{session_id}: #{describe_error(reason)}"}
     end
@@ -145,7 +151,8 @@ defmodule Athanor.Tools.Worktree do
       end
 
     "Worktree ready at #{worktree.path} (#{where}, base #{short_sha(worktree.base_sha)}). " <>
-      "Files, searches and commands run against that directory."
+      "Files, searches and commands run against that directory. A fresh worktree has no `deps/` " <>
+      "or `_build/` — run `mix deps.get` there once before building or testing."
   end
 
   defp line(entry, owners) do

@@ -1380,5 +1380,10 @@ defmodule Athanor.AgentTest do
       sys = capture_system_prompt(tmp_dir)
       assert sys =~ "remember(category, fact)"
     end
+
+    test "the worker prompt tells it to fetch deps in a fresh worktree (§7.1 OQ-W5, #39)", %{tmp_dir: tmp_dir} do
+      sys = capture_system_prompt(tmp_dir, parent_id: "conductor-x")
+      assert sys =~ "mix deps.get"
+    end
   end
 end

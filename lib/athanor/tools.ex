@@ -909,6 +909,11 @@ defmodule Athanor.Tools do
       "them. Commit or stash first, then spawn the worker again."
   end
 
+  defp describe_launch_error({:worktree_limit_reached, cap}) do
+    "the repository already has #{cap} tracked worktrees (the ATHANOR_WORKTREE_MAX limit). " <>
+      "Remove one first, or raise the limit."
+  end
+
   defp describe_launch_error(reason), do: inspect(reason)
 
   # §7.6: refuse to modify an existing path that has not been read this session. A successful edit
