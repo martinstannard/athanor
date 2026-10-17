@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add a `/kill <id>` TUI command that removes a running session (a bare `/kill` lists what is running); only the process dies, so the transcript is kept and `/resume` can still offer it. A mid-turn session needs `--force` (#19)
 
 ### Fixed
+- resume_all silently drops sessions: --resume reports success while skipping some (or all) (#46)
 - ProjectContext.load/1 hangs forever when the cwd has no .git boundary (#45)
 - `ProjectContext.load/1` looped forever when the working directory had no `.git` boundary, hanging an agent at init (#45)
 - GoalManagerTest flake: 'a verified result closes the goal' races Process.alive? (#42)
@@ -26,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
 
 ### Changed
+- `/.athanor/` (harness memory for a checkout) is gitignored as runtime state; commit a curated `MEMORY.md` with `git add -f` (#46)
 - `learnings.jsonl` compacts itself past 256 KB (`ATHANOR_MEMORY_COMPACT_BYTES`) (#41)
 - TUI header: show daemon connectivity (#25)
 - Document deps/_build bootstrap for fresh worktrees (design §7.1 OQ-W5) (#39)
