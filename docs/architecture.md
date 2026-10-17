@@ -498,22 +498,22 @@ supporting module exists in `lib/`:
 | 7.4 | Session history, resume & compaction (`Athanor.Store`) | **Implemented ("Resume v1")** — see §12. Deferred: transcript rotation, provider-`usage`-based token accounting, live migration between nodes, LLM-written `HANDOFF.md` summaries. |
 | 7.5 | Hierarchical memory (`Athanor.Memory`) | Not implemented. No `remember`/`recall` tools. |
 | 7.6 | `glob`/`grep`, tool guard, MCP client (`Athanor.MCP`) | Not implemented. Tool set is exactly the eight tools in §3. |
-| 7.7 | Persistent daemon & remote attach (`Athanor.Daemon`) | **Partly implemented** — see §9. Not implemented: systemd/auto-install, an `:ssh.daemon/2` subsystem, a standalone `athanor attach` binary; the node is named `athanor_daemon@127.0.0.1` rather than design's `athanor@127.0.0.1`. |
+| 7.7 | Persistent daemon & remote attach (`Athanor.Daemon`) | **Partly implemented** — see §9. Not implemented: systemd/auto-install, an `:ssh.daemon/2` subsystem, a standalone `athanor attach` binary; the node name is `athanor_daemon@127.0.0.1` (settled — design §8.4). |
 | 7.8 | Multi-host distributed BEAM clustering | Not implemented. `Athanor.Bus` is a single-node `Registry`; `Athanor.Daemon` connects two nodes but supervises nothing remotely. |
 
 ### Open questions
 
 These cannot be answered from the code alone and are flagged rather than guessed:
 
-1. **Parent-wakeup granularity.** `Athanor.Agent.maybe_publish_child_done/2` fires on *every* completed
-   worker turn, while design §1.3/§2.2 describes a sentinel-gated completion. Is the per-turn wakeup
-   intentional (a Conductor wants each sub-agent turn) or should it be gated on
-   `parse_done_sentinel/1`?
+1. **~~Parent-wakeup granularity.~~ _Resolved (issue #12)._** `maybe_publish_child_done/2` is now
+   gated on `parse_done_sentinel/1`: it publishes `{:child_done, report}` **only** on an asserted
+   completion, not on every completed turn (design §8.1).
 2. **~~ID uniqueness.~~ _Resolved._** Ids now come from `Athanor.SessionId.generate/1`
    (`:erlang.unique_integer/1` + 4 random bytes, `[a-z0-9_-]` only), `spawn_session/1` retries a
    bounded number of times, and a duplicate or invalid id is refused rather than started
    unregistered (`{:duplicate_session_id, id}` / `{:invalid_session_id, id}`). There is no
    `Orchestrator.generate_id/1` derived from `Registry.count/1` any more.
-3. **`mix athanor --local`.** The in-process mode bypasses the daemon and therefore loses
-   multi-client mirroring and detach-safety. Is it a supported long-term mode or a debugging aid?
+3. **~~`mix athanor --local`.~~ _Resolved (design §8.3)._** It is a **supported single-process
+   mode** — no daemon, no multi-client mirroring, no detach-safety — intended for CI, one-shot runs
+   and agent-loop debugging, and never the default.
 4. **Placeholder module.** `Athanor.hello/0` still exists (and is doctested). Keep or remove?

@@ -282,15 +282,15 @@ A layered memory system so Conductors and Sub-Agents accumulate durable knowledg
 > multi-client mirroring via per-client relays, and full session hydration on attach. The realised
 > node name is `athanor_daemon@127.0.0.1` (env `ATHANOR_DAEMON_NODE`); the distribution cookie is
 > generated on first use and persisted at `<ATHANOR_HOME>/cookie` (`0600`, env `ATHANOR_COOKIE`)
-> — **not** `athanor@127.0.0.1` as written below.
+> — **not** `athanor@127.0.0.1` as originally drafted (see §8.4).
 > **Still planned:** systemd-user auto-start, standalone `athanor` / `athanor attach` binaries, and
 > the optional native `:ssh.daemon/2` subsystem.
 
 So you can SSH into the machine from anywhere, run `athanor`, and immediately attach to the live running server without interrupting active agents:
 1. **Long-Lived Background Node (`athanord`)**:
-   - Runs as a persistent named BEAM daemon (`athanor@127.0.0.1`, managed via `systemd --user` or auto-started on first launch) that owns `Athanor.AgentSupervisor`, `Athanor.AgentRegistry`, `Athanor.Bus` PubSub, and all active Conductors/Sub-Agents.
+   - Runs as a persistent named BEAM daemon (`athanor_daemon@127.0.0.1`, managed via `systemd --user` or auto-started on first launch) that owns `Athanor.AgentSupervisor`, `Athanor.AgentRegistry`, `Athanor.Bus` PubSub, and all active Conductors/Sub-Agents.
 2. **Thin TUI Attach/Detach Client (`mix athanor` / `athanor attach`)**:
-   - When you SSH in and run `athanor`, it boots a lightweight TUI client node (`athanor_tui_<rand>@127.0.0.1`), connects to `athanor@127.0.0.1` via Distributed Erlang (`Node.connect/1` / `:erpc`), fetches the live session tree and message history, and subscribes the local `Termite` process to the daemon's `Athanor.Bus`.
+   - When you SSH in and run `athanor`, it boots a lightweight TUI client node (`athanor_tui_<rand>@127.0.0.1`), connects to `athanor_daemon@127.0.0.1` via Distributed Erlang (`Node.connect/1` / `:erpc`), fetches the live session tree and message history, and subscribes the local `Termite` process to the daemon's `Athanor.Bus`.
    - **Multi-Client Mirroring**: Multiple TUI clients (e.g., your local desktop monitor and an SSH session from a laptop or phone) can attach to the same daemon simultaneously and watch live token streams in sync.
    - **Safe Detach (`Ctrl+Q` / `/detach` / SSH drop)**: Closing the TUI or dropping an SSH connection only terminates the thin TUI client; Conductors and Sub-Agents keep running uninterrupted in the daemon.
 3. **Optional Native OTP `:ssh` Subsystem**:
@@ -308,6 +308,10 @@ So you can SSH into the machine from anywhere, run `athanor`, and immediately at
 
 Decisions the code cannot settle on its own (kept here so the docs do not silently guess):
 
+> **Status (2026-10-17): all five are resolved.** §8.1 and §8.2 by shipped work (issues #12 and the
+> session-id rework); §8.3 and §8.4 as the recorded decisions below; §8.5 was settled by §7.4's
+> no-`config/` idiom. The section is retained as the record of *what was decided and why*.
+
 1. **~~Parent-wakeup granularity.~~ _Resolved (issue #12)._** The wakeup is now gated on the
    sentinel: `maybe_publish_child_done/2` publishes `{:child_done, report}` **only** when
    `parse_done_sentinel/1` matches. A completed turn no longer wakes the conductor — only an
@@ -324,10 +328,17 @@ Decisions the code cannot settle on its own (kept here so the docs do not silent
    invalid id (`{:duplicate_session_id, id}` / `{:invalid_session_id, id}`) instead of running
    unregistered — `DynamicSupervisor` accepts duplicate child-spec ids, so the registry is the only
    guard, and its failure was previously swallowed.
-3. **`mix athanor --local`.** The in-process mode bypasses the daemon and therefore loses
-   multi-client mirroring and detach-safety. Supported long-term, or a debugging aid?
-4. **Daemon naming.** §7.7 writes `athanor@127.0.0.1`; the implementation uses
-   `athanor_daemon@127.0.0.1`. Reconcile the doc, or rename the node?
+3. **~~`mix athanor --local`.~~ _Resolved (decision, 2026-10-17)._** It is a **supported
+   single-process mode**, not merely a debugging aid: no daemon, no multi-client mirroring, no
+   detach-safety. It is the right choice for CI, for a one-shot scripted run, and for debugging
+   the agent loop without a daemon in the way — and it is **never the default**. The flag stays
+   documented as an escape hatch, and the TUI renders a distinct mode banner (`mode_banner/2`), so
+   a `--local` session is never mistaken for a daemon-backed one.
+4. **~~Daemon naming.~~ _Resolved (decision, 2026-10-17)._** The **code wins**: the node stays
+   `athanor_daemon@127.0.0.1`. The name is already a shipped, overridable interface
+   (`ATHANOR_DAEMON_NODE`, the systemd unit), the extra qualifier reads better than the bare
+   `athanor@`, and renaming it would be a breaking change for no functional gain. §7.7's prose has
+   been corrected to match; the original `athanor@127.0.0.1` survives only as a note of the drift.
 5. **~~Store/`config` conventions.~~ _Settled._** §7.4 shipped with **no `config/` directory**: the
    Store root, the enable switch and the compaction knobs are all `Athanor.Config` module
    attributes + `Application.get_env(:athanor, …)` + env vars (`ATHANOR_HOME`, `ATHANOR_STORE`,
@@ -519,7 +530,8 @@ prompt — extend those instead:
 | attach (select) | `mix athanor attach <id\|name>` | `/attach <id\|name>` |
 | detach | *(n/a — the process exits)* | `Ctrl+Q` / `/detach` *(exists)* |
 | rename | `mix athanor rename <id> <name>` | `/rename <name>` |
-| kill | `mix athanor kill <id>` | `/kill <id>` |
+| kill | `mix athanor kill <id>` *(exists — #19)* | `/kill <id>` |
+| take control of input | *(n/a)* | `/take-control` *(T2)* |
 | new | `mix athanor conductor <name>` | `/conductor <name>` *(exists)* |
 
 `kill` must reuse §7.2's rule that only a managed, verified path may terminate work — killing a
@@ -587,29 +599,35 @@ lock holder should be visible in the status bar.
 |---|---|
 | durable attach | **§7.4** (prerequisite, §10.2) |
 | `name` + `/rename` + `/kill` verbs | nothing (small: registry key + TUI commands) |
-| writer lock | `name`/attach work being settled |
+| writer lock | `name`/attach work (T2/T4 settled — §10.9) |
 | `attach -t <id\|name>` preselect | `name` |
 
 Suggested order: land §7.4 first (it is §9's step 1 anyway), then the naming and verb surface, then
 the writer lock. The verbs are a good "while you're in there" addition to the §7.7 daemon surface
 rather than a reason to reorder §9. *(§7.4 is done — start with the naming and verb surface.)*
 
-### 10.9 Open questions
+### 10.9 Decisions (settled 2026-10-17)
 
-- **T1 — one identifier or two?** Keep `id` + add a unique `name` (recommended), or collapse `title`
-  into a single renameable identifier that doubles as the attach handle? The second is simpler but
-  conflates two different contracts (immutable identity vs mutable label) and risks §10.5's
-  path/branch hazard.
-- **T2 — input model:** (a) status quo / (b) single writer + read-only viewers / (c) shared input
-  echo? Recommended: (b).
-- **T3 — what does `/rename` rename?** The `name` only (recommended, per §10.5), or also `title`
-  together? Two labels with no visible distinction would be confusing.
-- **T4 — does detaching release the writer lock?** Recommended: yes, on a short grace period, so an
-  SSH flap does not lock everyone else out.
-- **T5 — is `kill` modelled as `terminate_child` only, or as a tombstone?** With §7.4, a killed
-  session could linger as a resumable transcript. Recommended: kill the process, **keep** the
-  transcript, and let `/resume` offer it — matching the §9 principle that destroying state is never
-  the default.
+- **T1 — one identifier or two?** **Two.** Keep the immutable, path/ref-safe `id` as the `Registry`
+  key, §7.4 directory name and §7.1 branch component, and add a separate human-chosen `name`
+  (unique, renameable, same safe charset, its own `{:name, name}` registry key). Collapsing `title`
+  into a single renameable identifier is rejected: it conflates two different contracts (immutable
+  identity vs mutable label) and reintroduces §10.5's path/branch hazard.
+- **T2 — input model.** **(b) single writer + read-only viewers.** The first attached client holds
+  the write lock; other clients are viewers; `/take-control` transfers it. `/take-control` is
+  added to the §10.3 verb table below. `kill` must reuse §7.2's rule that only a managed, verified
+  path may terminate work.
+- **T3 — what does `/rename` rename?** The **`name` only**, never `id` and never the transcript
+  directory or branch (§10.5).
+- **T4 — does detaching release the writer lock?** **Yes, after a short grace period**, so an SSH
+  flap does not lock everyone else out of the session.
+- **T5 — is `kill` modelled as `terminate_child` only, or as a tombstone?** **Kill the process,
+  keep the transcript**; `/resume` still offers it. A mid-turn session requires `--force`, and a
+  hard delete is opt-in via `--delete-transcript` (§9: destroying state is never the default).
+  *Implemented for the CLI (`mix athanor kill`); the TUI `/kill` verb is the remaining piece.*
+
+> **Status:** these are decisions, not yet all built. T5's CLI path shipped with issue #19; T1–T4
+> and the TUI verbs are tracked by issue #11 (§10.3/§10.8).
 
 
 
