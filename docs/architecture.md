@@ -487,13 +487,13 @@ turns), and bump `meta.json#compaction` to `%{count, last_at, transcript_bytes}`
 ## 13. Future Work & Open Questions
 
 The realised system above covers design §1–§5 (philosophy, session taxonomy, PubSub, tools and TUI),
-§7.4 (`Athanor.Store` — §12) and §7.7. The rest of design §7 is **planned, not implemented** — no
+§7.1 (worktrees), §7.2 (goals), §7.4 (`Athanor.Store` — §12) and §7.7. The rest of design §7 is **planned, not implemented** — no
 supporting module exists in `lib/`:
 
 | design § | Feature | Status |
 |---|---|---|
-| 7.1 | Git worktree isolation (`Athanor.Worktree`) | Not implemented. `launch_subagent` has no `worktree` argument. |
-| 7.2 | Goal-driven autonomy (`Athanor.Goal` / `Verifier` / `GoalManager`) | Not implemented. Plan lives at `docs/plans/7.2-goal-driven-autonomy.md`. |
+| 7.1 | Git worktree isolation (`Athanor.Worktree`) | **Implemented** — `launch_subagent` takes `worktree:`, plus conductor `create_worktree` / `list_worktrees` / `remove_worktree`. |
+| 7.2 | Goal-driven autonomy (`Athanor.Goal` / `Verifier` / `GoalManager`) | **Implemented (M1–M6)** — plan at `docs/plans/7.2-goal-driven-autonomy.md`; conductor `set_goal` / `verify_goal` / `goal_status` / `list_goals`, worker `report_progress`. |
 | 7.3 | Watchers / external channels (`Athanor.Watcher`) | Not implemented. |
 | 7.4 | Session history, resume & compaction (`Athanor.Store`) | **Implemented ("Resume v1")** — see §12. Deferred: transcript rotation, provider-`usage`-based token accounting, live migration between nodes, LLM-written `HANDOFF.md` summaries. |
 | 7.5 | Hierarchical memory (`Athanor.Memory`) | Not implemented. No `remember`/`recall` tools. |

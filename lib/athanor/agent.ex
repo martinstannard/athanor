@@ -242,6 +242,15 @@ defmodule Athanor.Agent do
   end
 
   @doc """
+  Attaches a verified goal to an already-running worker session so its `===ATHANOR_DONE===`
+  sentinel is routed as `{:goal_candidate_done, _}` rather than `{:child_done, _}`.
+  """
+  @spec attach_goal(GenServer.server(), String.t(), String.t() | nil) :: :ok
+  def attach_goal(agent, goal_id, objective \\ nil) when is_binary(goal_id) do
+    GenServer.cast(agent, {:attach_goal, goal_id, objective})
+  end
+
+  @doc """
   Cancels any in-flight LLM stream or tool execution and returns the agent to `:idle`.
 
   Also clears the pending prompt queue (see the moduledoc): a cancel means *stop*, not "start the
@@ -441,6 +450,10 @@ defmodule Athanor.Agent do
   @impl GenServer
   def handle_cast({:enqueue_prompt, text}, state) do
     {:noreply, do_enqueue_prompt(state, text)}
+  end
+
+  def handle_cast({:attach_goal, goal_id, objective}, state) do
+    {:noreply, %{state | goal_id: goal_id, goal_objective: objective}}
   end
 
   @impl GenServer

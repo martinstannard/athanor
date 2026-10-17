@@ -169,9 +169,12 @@ Assistant output is rendered through `Athanor.Markdown`, so headings, lists, cod
 
 ## 7. Future Plans
 
-> **Status legend (verified against `lib/` at commit `ce4efea`):** §7.1, §7.2, §7.3, §7.5 and §7.8
+> **Status legend (verified against `lib/` at commit `ce4efea`):** §7.3, §7.5 and §7.8
 > are **planned, not implemented** — no supporting module
-> exists in `lib/`. **§7.4 is implemented ("Resume v1")**: `Athanor.Store` plus its seven
+> exists in `lib/`. **§7.1 is implemented** (`Athanor.Worktree`, `Athanor.Worktree.Server`,
+> `Athanor.Git`). **§7.2 is implemented** (`Athanor.Goal`, `Athanor.Verifier`,
+> `Athanor.GoalManager` plus conductor `set_goal` / `verify_goal` / `goal_status` /
+> `list_goals` and worker `report_progress`). **§7.4 is implemented ("Resume v1")**: `Athanor.Store` plus its seven
 > sub-modules persist, resume and compact sessions (see the *Implemented subset* note under §7.4);
 > deferred are transcript rotation, provider-`usage`-based token accounting, live migration
 > between nodes, and LLM-written `HANDOFF.md` summaries. §7.6 is **partly implemented**: `glob` and
@@ -187,12 +190,13 @@ Assistant output is rendered through `Athanor.Markdown`, so headings, lists, cod
 - **Branches:** one per session (`athanor/<session_id>`), and an existing one is re-attached rather than re-created, so a session that is torn down and spawned again keeps its branch. Removal keeps the branch unless `branch: :delete` is asked for, which uses `git branch -d` — the *safe* delete, which refuses unmerged work. Git's `--force` is never implied.
 - All git access goes through `Athanor.Git.run/2` (no shell, bounded by `worktree_git_timeout_ms`, structured exit code), every mutation through the single `Athanor.Worktree.Server` (git's worktree metadata is shared, so parallel adds race), and that Server is supervised **before** `AgentSupervisor` so a worker can resolve its `cd` while starting. The tracked map is a cache: `init/1` rebuilds it from `git worktree list --porcelain` plus a per-repository sidecar, and git remains the authority for what exists.
 
-### 7.2 Goal-Driven Autonomy & "Trust-but-Verify" (`Athanor.Goal`) — *planned*
-> Implementation plan: `docs/plans/7.2-goal-driven-autonomy.md` (status: not implemented).
-Inspired by `agent-deck`'s three-entity Goal architecture, Athanor will separate **doing**, **verifying**, and **managing** into distinct BEAM processes:
+### 7.2 Goal-Driven Autonomy & "Trust-but-Verify" (`Athanor.Goal`) — *implemented*
+> Implementation plan: `docs/plans/7.2-goal-driven-autonomy.md` (implemented, M1–M6).
+Inspired by `agent-deck`'s three-entity Goal architecture, Athanor separates **doing**, **verifying**, and **managing** into distinct BEAM processes:
 1. **Worker (`Athanor.Agent`, `role: :worker`)**: Takes bounded steps toward a goal and writes progress receipts, but **cannot** declare its own goal closed.
 2. **Verifier (`Athanor.Verifier`)**: Runs deterministic ground-truth checks—either a shell command (`mix test`, `gh pr view ...`) or an independent peer `Athanor.Agent` session (`parent_id: nil`) that re-derives completion claims from scratch without sharing the worker's context or blind spots.
 3. **Goal Manager (`Athanor.GoalManager` GenServer)**: Periodically wakes on a timer, runs the Verifier, nudges the Worker over PubSub (`"agent:<id>:inbox"`) if progress stalls, and escalates to the Conductor/user after `max_nudges`.
+- **Tools:** conductor-only `set_goal` (explicit `worker_id` form, or the combined form that spawns the worker and attaches the goal atomically), `verify_goal`, `goal_status`, `list_goals`; worker-only `report_progress`. A goal-attached worker's `===ATHANOR_DONE===` sentinel is routed as `{:goal_candidate_done, _}` — never `{:child_done, _}` — and only a `:verified` verdict closes the goal; shell/peer AND-lists short-circuit on the first non-`:verified` check.
 
 ### 7.3 Watchers & External Channels (`Athanor.Watcher`) — *planned*
 Event-driven OTP GenServers ("doorbells, not messengers") that listen for external events and route notifications into a Conductor's PubSub inbox:

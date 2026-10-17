@@ -1,7 +1,7 @@
 defmodule Athanor.GoalTest do
   use ExUnit.Case, async: true
 
-  alias Athanor.{Goal, Tools, Verifier}
+  alias Athanor.{Bus, Goal, Orchestrator, Tools, Verifier}
   alias Athanor.Goal.Receipt
   alias Athanor.Verifier.Result
 
@@ -205,10 +205,16 @@ defmodule Athanor.GoalTest do
       assert {:ok, %Result{verdict: :contradicted}} = Verifier.verify(%{goal | verifier: {:shell, "false"}})
     end
 
-    test "an AND-list short-circuits on the first contradiction (C14)", %{tmp_dir: dir} do
-      # The peer check is the expensive one, and a goal that is already disproved cannot be rescued
-      # by it. Until §7.2's M6 wires real peer sessions, a `:peer` entry reports `:inconclusive` —
-      # so the mode of the returned result is what proves the rest of the list never ran.
+    test "an AND-list short-circuits on the first contradiction and never invokes later checks (C14)", %{
+      tmp_dir: dir
+    } do
+      test_pid = self()
+
+      peer_llm_fn = fn _messages, _tools, _pid ->
+        send(test_pid, :peer_invoked)
+        {:ok, %{role: "assistant", content: "===ATHANOR_DONE=== status=ok summary=passed", tool_calls: []}}
+      end
+
       goal =
         Goal.new(
           objective: "x",
@@ -217,7 +223,10 @@ defmodule Athanor.GoalTest do
           verifier: [{:shell, "exit 7"}, {:peer, "is it done?"}]
         )
 
-      assert {:ok, %Result{mode: :shell, verdict: :contradicted}} = Verifier.verify(goal)
+      assert {:ok, %Result{mode: :shell, verdict: :contradicted}} =
+               Verifier.verify(goal, llm_fn: peer_llm_fn)
+
+      refute_received :peer_invoked
     end
 
     test "an AND-list runs every check when none contradicts", %{tmp_dir: dir} do
@@ -232,11 +241,68 @@ defmodule Athanor.GoalTest do
       assert {:ok, %Result{verdict: :verified}} = Verifier.verify(goal)
     end
 
-    test "an unimplemented peer check is inconclusive, so it can never close a goal", %{tmp_dir: dir} do
-      goal = Goal.new(objective: "x", worker_id: "w-1", cd: dir, verifier: {:peer, "is it done?"})
+    test "peer mode spawns an independent unregistered session (C13) and maps status=ok|fail|none", %{
+      tmp_dir: dir
+    } do
+      test_pid = self()
+      goal = Goal.new(objective: "verify README", worker_id: "w-1", cd: dir, verifier: {:peer, "is README good?"})
 
-      assert {:ok, %Result{mode: :peer, verdict: :inconclusive, evidence: evidence}} = Verifier.verify(goal)
-      assert evidence =~ "not implemented"
+      ok_llm = fn _messages, _tools, _pid ->
+        # C13: while the peer is mid-turn, it must NOT appear in Orchestrator.list_sessions/0!
+        send(test_pid, {:sessions_during_peer, Orchestrator.list_sessions()})
+
+        {:ok,
+         %{
+           role: "assistant",
+           content: "Looks great.\n===ATHANOR_DONE=== status=ok summary=README verified",
+           tool_calls: []
+         }}
+      end
+
+      assert {:ok, %Result{mode: :peer, verdict: :verified, evidence: "README verified", peer_id: peer_id}} =
+               Verifier.verify(goal, llm_fn: ok_llm)
+
+      assert is_binary(peer_id) and String.starts_with?(peer_id, "verifier-")
+      assert_receive {:sessions_during_peer, sessions}
+      refute Enum.any?(sessions, &(&1.id == peer_id))
+
+      fail_llm = fn _messages, _tools, _pid ->
+        {:ok,
+         %{
+           role: "assistant",
+           content: "Missing section.\n===ATHANOR_DONE=== status=fail summary=missing section",
+           tool_calls: []
+         }}
+      end
+
+      assert {:ok, %Result{mode: :peer, verdict: :contradicted, evidence: "missing section"}} =
+               Verifier.verify(goal, llm_fn: fail_llm)
+
+      no_sentinel_llm = fn _messages, _tools, _pid ->
+        {:ok, %{role: "assistant", content: "I am unsure.", tool_calls: []}}
+      end
+
+      assert {:ok, %Result{mode: :peer, verdict: :inconclusive, evidence: evidence}} =
+               Verifier.verify(goal, llm_fn: no_sentinel_llm)
+
+      assert evidence =~ "without ===ATHANOR_DONE=== sentinel"
+    end
+  end
+
+  describe "Bus.publish_goal_event/3" do
+    test "fans out to goal:<id>:events, deck:events, and conductor:<cid>:goals" do
+      goal_id = "goal-bus-#{System.unique_integer([:positive])}"
+      parent_id = "cond-bus-#{System.unique_integer([:positive])}"
+
+      Bus.subscribe("goal:#{goal_id}:events")
+      Bus.subscribe("deck:events")
+      Bus.subscribe("conductor:#{parent_id}:goals")
+
+      assert :ok = Bus.publish_goal_event(goal_id, parent_id, {:goal_ping, :ok})
+
+      assert_receive {:goal_event, ^goal_id, {:goal_ping, :ok}}
+      assert_receive {:goal_event, ^goal_id, {:goal_ping, :ok}}
+      assert_receive {:goal_event, ^goal_id, {:goal_ping, :ok}}
     end
   end
 

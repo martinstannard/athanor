@@ -11,6 +11,7 @@ defmodule Athanor.Tools do
 
   alias Athanor.{Bus, GoalManager, Orchestrator, SessionId}
   alias Athanor.Tools.{Glob, Grep}
+  alias Athanor.Tools.Goal, as: GoalTools
   alias Athanor.Tools.Worktree, as: WorktreeTools
 
   @default_bash_timeout_ms 30_000
@@ -27,7 +28,7 @@ defmodule Athanor.Tools do
     role = Keyword.get(opts, :role, :worker)
 
     case role do
-      :conductor -> workspace_schemas() ++ conductor_schemas()
+      :conductor -> workspace_schemas() ++ conductor_schemas() ++ goal_schemas()
       # `report_progress` is worker-only: a conductor has no goal of its own to report against, so
       # offering it there is pure token cost (§7.2, plan §7).
       _worker -> workspace_schemas() ++ worker_schemas()
@@ -385,6 +386,88 @@ defmodule Athanor.Tools do
     ]
   end
 
+  # Goal tools are conductor-only (plan §7, C10): a worker reports progress on its own goal, it
+  # never mints goals. Kept as a separate group so the role gate in `schemas/1` stays obvious.
+  defp goal_schemas do
+    [
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "set_goal",
+          "description" =>
+            "Attach a verified goal to a worker. With worker_id, attaches to that existing worker; without it, spawns a new worker and attaches the goal atomically. Verification (verify) is required: a shell command, a peer question with verify_mode=peer, or a list of checks.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "objective" => %{
+                "type" => "string",
+                "description" => "What the worker must achieve."
+              },
+              "verify" => %{
+                "description" =>
+                  "Ground-truth check: a shell command string, a peer-verifier question (with verify_mode=peer), or a list of checks run in order."
+              },
+              "verify_mode" => %{
+                "type" => "string",
+                "enum" => ["shell", "peer"],
+                "description" => "How to interpret a string verify: shell command (default) or peer question."
+              },
+              "worker_id" => %{
+                "type" => "string",
+                "description" => "Existing worker to attach the goal to. Omit to spawn a new worker."
+              },
+              "title" => %{"type" => "string", "description" => "Short title for the goal / new worker."},
+              "prompt" => %{
+                "type" => "string",
+                "description" => "Initial prompt for a newly spawned worker. Defaults to the objective."
+              },
+              "cd" => %{"type" => "string", "description" => "Working directory for the goal and verification."},
+              "worktree" => %{
+                "description" => "true (or a base ref string) to run a newly spawned worker in its own git worktree."
+              },
+              "max_nudges" => %{"type" => "integer", "description" => "Nudges before escalation (default 3)."},
+              "stall_after_ms" => %{"type" => "integer", "description" => "Ms without progress before a nudge."},
+              "verify_interval_ms" => %{"type" => "integer", "description" => "Ms between verification ticks."}
+            },
+            "required" => ["objective", "verify"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "verify_goal",
+          "description" => "Trigger immediate ground-truth verification for a goal.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{"goal_id" => %{"type" => "string", "description" => "Goal to verify."}},
+            "required" => ["goal_id"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "goal_status",
+          "description" => "Show a goal's status, receipts, nudges, and last verifier verdict.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{"goal_id" => %{"type" => "string", "description" => "Goal to inspect."}},
+            "required" => ["goal_id"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "list_goals",
+          "description" => "List all active goals with their workers and objectives.",
+          "parameters" => %{"type" => "object", "properties" => %{}}
+        }
+      }
+    ]
+  end
+
   @doc """
   Executes a named tool with a map of string-keyed arguments (or a JSON-encoded string).
   """
@@ -527,6 +610,22 @@ defmodule Athanor.Tools do
     with :ok <- conductor_only(opts, "remove_worktree"), do: WorktreeTools.remove(args, opts)
   end
 
+  def execute("set_goal", args, opts) when is_map(args) do
+    with :ok <- conductor_only(opts, "set_goal"), do: GoalTools.set_goal(args, opts)
+  end
+
+  def execute("verify_goal", args, opts) when is_map(args) do
+    with :ok <- conductor_only(opts, "verify_goal"), do: GoalTools.verify_goal(args, opts)
+  end
+
+  def execute("goal_status", args, opts) when is_map(args) do
+    with :ok <- conductor_only(opts, "goal_status"), do: GoalTools.goal_status(args, opts)
+  end
+
+  def execute("list_goals", args, opts) when is_map(args) do
+    with :ok <- conductor_only(opts, "list_goals"), do: GoalTools.list_goals(args, opts)
+  end
+
   def execute("list_sessions", _args, _opts) do
     sessions =
       Orchestrator.list_sessions()
@@ -587,7 +686,11 @@ defmodule Athanor.Tools do
              "create_worktree",
              "list_worktrees",
              "remove_worktree",
-             "report_progress"
+             "report_progress",
+             "set_goal",
+             "verify_goal",
+             "goal_status",
+             "list_goals"
            ] do
     {:error, "Missing or invalid required arguments for tool #{tool_name}"}
   end
