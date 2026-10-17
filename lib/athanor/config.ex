@@ -43,6 +43,12 @@ defmodule Athanor.Config do
   @default_goal_stall_after_ms 60_000
   @default_goal_verify_timeout_ms 60_000
   @default_goal_peer_timeout_ms 120_000
+  @default_memory_enabled true
+  @default_memory_project_budget 2_000
+  @default_memory_global_budget 1_000
+  @default_memory_global_inject false
+  @default_memory_recall_limit 5
+  @default_memory_fact_max_chars 2_000
 
   @doc """
   Returns the OpenCode Go base URL.
@@ -658,6 +664,117 @@ defmodule Athanor.Config do
   def goal_verify_command do
     case System.get_env("ATHANOR_GOAL_VERIFY_COMMAND") || Application.get_env(:athanor, :goal_verify_command) do
       command when is_binary(command) -> if String.trim(command) == "", do: nil, else: command
+      _other -> nil
+    end
+  end
+
+  # -- Memory (§7.5 / plan §10) --------------------------------------------------
+
+  @doc """
+  Master switch for memory injection (default `#{@default_memory_enabled}`).
+
+  `ATHANOR_MEMORY=0` disables the system-prompt injection; the `remember`/`recall`/`forget`
+  tools still work, so an agent can read and write memory even when it is not auto-injected.
+  """
+  @spec memory_enabled?() :: boolean()
+  def memory_enabled? do
+    boolean_env("ATHANOR_MEMORY", :memory_enabled, @default_memory_enabled)
+  end
+
+  @doc """
+  Character budget for the injected project `MEMORY.md` section (default
+  `#{@default_memory_project_budget}`).
+
+  Overridable via `ATHANOR_MEMORY_PROJECT_BUDGET` or `:athanor, :memory_project_budget`.
+  """
+  @spec memory_project_budget() :: non_neg_integer()
+  def memory_project_budget do
+    non_neg_int(
+      "ATHANOR_MEMORY_PROJECT_BUDGET",
+      :memory_project_budget,
+      @default_memory_project_budget
+    )
+  end
+
+  @doc """
+  Character budget for the injected global `MEMORY.md` section (default
+  `#{@default_memory_global_budget}`).
+
+  Overridable via `ATHANOR_MEMORY_GLOBAL_BUDGET` or `:athanor, :memory_global_budget`.
+  """
+  @spec memory_global_budget() :: non_neg_integer()
+  def memory_global_budget do
+    non_neg_int(
+      "ATHANOR_MEMORY_GLOBAL_BUDGET",
+      :memory_global_budget,
+      @default_memory_global_budget
+    )
+  end
+
+  @doc """
+  Whether the **full** global `MEMORY.md` is injected (default
+  `#{@default_memory_global_inject}`).
+
+  Off by default so a machine-wide fact never silently contaminates an unrelated repo's prompt;
+  the caller gets a short pointer to `recall` instead (plan D8, §5.4). Overridable via
+  `ATHANOR_MEMORY_GLOBAL_INJECT` or `:athanor, :memory_global_inject`.
+  """
+  @spec memory_global_inject?() :: boolean()
+  def memory_global_inject? do
+    boolean_env(
+      "ATHANOR_MEMORY_GLOBAL_INJECT",
+      :memory_global_inject,
+      @default_memory_global_inject
+    )
+  end
+
+  @doc """
+  Default number of results a `recall` returns (default `#{@default_memory_recall_limit}`).
+
+  Overridable via `ATHANOR_MEMORY_RECALL_LIMIT` or `:athanor, :memory_recall_limit`.
+  """
+  @spec memory_recall_limit() :: pos_integer()
+  def memory_recall_limit do
+    positive_int("ATHANOR_MEMORY_RECALL_LIMIT", :memory_recall_limit, @default_memory_recall_limit)
+  end
+
+  @doc """
+  Maximum characters a single remembered fact may occupy (default
+  `#{@default_memory_fact_max_chars}`).
+
+  Bounds line size so the `O_APPEND` atomicity argument for `learnings.jsonl` holds (plan §12
+  risk 6). Overridable via `ATHANOR_MEMORY_FACT_MAX_CHARS` or `:athanor, :memory_fact_max_chars`.
+  """
+  @spec memory_fact_max_chars() :: pos_integer()
+  def memory_fact_max_chars do
+    positive_int(
+      "ATHANOR_MEMORY_FACT_MAX_CHARS",
+      :memory_fact_max_chars,
+      @default_memory_fact_max_chars
+    )
+  end
+
+  @doc """
+  Root of the global (user) memory tier, `<home>/memory` (default `~/.athanor/memory`).
+
+  Derived from `home/0`, so `ATHANOR_HOME` moves it (that is how tests and §7.7 daemon
+  deployments isolate the global tier).
+  """
+  @spec memory_global_dir() :: String.t()
+  def memory_global_dir do
+    Path.join(home(), "memory")
+  end
+
+  @doc """
+  Optional path to an external knowledge graph (e.g. a Logseq graph), or `nil`.
+
+  Phase 1 stores this as a link only; it does not crawl the graph (plan §1 non-goals).
+  Read from `ATHANOR_MEMORY_GRAPH` or `:athanor, :memory_graph_path`; an empty string is unset.
+  """
+  @spec memory_graph_path() :: String.t() | nil
+  def memory_graph_path do
+    case System.get_env("ATHANOR_MEMORY_GRAPH") || Application.get_env(:athanor, :memory_graph_path) do
+      path when is_binary(path) -> if String.trim(path) == "", do: nil, else: path
       _other -> nil
     end
   end
