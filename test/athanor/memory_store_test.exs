@@ -12,6 +12,15 @@ defmodule Athanor.MemoryStoreTest do
 
   defp entry(attrs), do: Entry.new(attrs)
 
+  # A directory with no `.athanor/` or `.git/` anywhere above it. ExUnit's own `:tmp_dir` is
+  # `<project>/tmp/...` — inside this repo — so it cannot serve for the "no workspace" cases.
+  defp outside_workspace_dir do
+    dir = Path.join(System.tmp_dir!(), "athanor_mem_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    dir
+  end
+
   defp mode(path) do
     {:ok, %File.Stat{mode: mode}} = File.stat(path)
     Bitwise.band(mode, 0o777)
@@ -166,7 +175,8 @@ defmodule Athanor.MemoryStoreTest do
       assert Store.project_dir(wt) == Path.join(main, ".athanor")
     end
 
-    test "no .athanor and no .git means no workspace (injection is a no-op)", %{tmp_dir: dir} do
+    test "no .athanor and no .git means no workspace (injection is a no-op)" do
+      dir = outside_workspace_dir()
       assert Store.workspace_root(dir) == nil
       assert Store.project_dir(dir) == nil
     end

@@ -16,6 +16,15 @@ defmodule Athanor.MemoryTest do
 
   defp entry(attrs), do: Entry.new(attrs)
 
+  # A directory with no `.athanor/` or `.git/` above it. ExUnit's `:tmp_dir` is `<project>/tmp/...`
+  # — inside this repo — so ascending from it always finds this repo's `.git`.
+  defp outside_workspace_dir do
+    dir = Path.join(System.tmp_dir!(), "athanor_mem_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    dir
+  end
+
   describe "Entry.new/1" do
     test "fills id, hash and timestamps" do
       e = entry(%{scope: :project, category: :gotcha, text: "A durable fact"})
@@ -206,7 +215,8 @@ defmodule Athanor.MemoryTest do
       assert resolved.global_dir == global
     end
 
-    test "degrades gracefully outside a workspace", %{tmp_dir: dir} do
+    test "degrades gracefully outside a workspace" do
+      dir = outside_workspace_dir()
       resolved = Memory.resolve(cd: dir, global_dir: Path.join(dir, "ghome"))
       assert resolved.workspace_root == nil
       assert resolved.project_dir == nil
@@ -242,15 +252,17 @@ defmodule Athanor.MemoryTest do
       assert length(String.split(memory, "- A durable gotcha")) == 2
     end
 
-    test "surfaces a failure rather than reporting success", %{tmp_dir: dir} do
+    test "surfaces a failure rather than reporting success" do
       # No .git/.athanor above the directory: there is nowhere to persist a project learning.
+      dir = outside_workspace_dir()
       assert {:error, message} = Memory.distill([%{"category" => "fact", "fact" => "x"}], cd: dir)
       assert message =~ "workspace"
     end
   end
 
   describe "Memory.system_prompt_section/1" do
-    test "is nil with no memory anywhere", %{tmp_dir: dir} do
+    test "is nil with no memory anywhere" do
+      dir = outside_workspace_dir()
       assert Memory.system_prompt_section(cd: dir, global_dir: Path.join(dir, "ghome")) == nil
     end
 
