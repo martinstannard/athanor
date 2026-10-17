@@ -1,6 +1,13 @@
 {
   "version": 1,
-  "locks": {},
+  "locks": {
+    "36": {
+      "agent_id": "conductor-main",
+      "branch": "fix/max-turns",
+      "claimed_at": "2026-10-17T03:51:57.412726594Z",
+      "signed_by": "conductor-main"
+    }
+  },
   "settings": {
     "stale_lock_timeout_minutes": 60
   }
