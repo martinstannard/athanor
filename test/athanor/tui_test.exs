@@ -1,7 +1,7 @@
 defmodule Athanor.TUITest do
   use ExUnit.Case, async: true
 
-  alias Athanor.{Daemon, Store, TUI}
+  alias Athanor.{Config, Daemon, Store, TUI}
   alias Athanor.Store.Transcript
 
   describe "handle_key/2" do
@@ -968,4 +968,44 @@ defmodule Athanor.TUITest do
       assert text =~ "turns:        5"
     end
   end
+
+  describe "context gauge header (#43)" do
+    test "no stats yet renders an em dash, not a number" do
+      assert {"ctx: —", :muted} = TUI.context_status(TUI.new())
+    end
+
+    test "bands the colour by the compaction threshold and the limit" do
+      limit = Config.context_limit_tokens()
+
+      assert {"ctx: 10%", :accent} = gauge(round(limit * 0.1))
+
+      # At the compaction threshold: compaction is imminent, so warn.
+      assert {"ctx: 80%", :warning} =
+               gauge(round(limit * Config.compaction_threshold()))
+
+      # At the limit, and past it, are errors.
+      assert {"ctx: 100%", :error} = gauge(limit)
+      assert {"ctx: 150%", :error} = gauge(round(limit * 1.5))
+    end
+
+    test "the header renders the gauge, and it survives 80-column truncation" do
+      limit = Config.context_limit_tokens()
+      tui = ctx_stats(round(limit * 0.1)) |> tui_with_stats()
+
+      assert TUI.render_frame(%{tui | width: 120}) =~ "ctx: 10%"
+      # The bar is longer than 80 columns by design; the gauges come first so they survive.
+      assert TUI.render_frame(%{tui | width: 80}) =~ "ctx: 10%"
+    end
+  end
+
+  defp gauge(context_tokens) do
+    context_tokens
+    |> ctx_stats()
+    |> tui_with_stats()
+    |> TUI.context_status()
+  end
+
+  defp ctx_stats(context_tokens), do: %{context_tokens: context_tokens, model: "m"}
+
+  defp tui_with_stats(stats), do: TUI.new() |> TUI.handle_agent_event({:stats, stats})
 end

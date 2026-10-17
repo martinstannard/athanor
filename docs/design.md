@@ -116,7 +116,7 @@ Built with `Termite` in raw alternate-screen mode (illustrative mock — exact g
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ ⚗ ATHANOR │ model: deepseek-v4.1-flash                    Tab: input/deck │
+│ ⚗ ATHANOR │ daemon ● athanor_daemon@127.0.0.1 │ ctx: 12% │ model: deepseek-v4.1-flash  Tab: input/deck │
 ├────────────────────────┬─────────────────────────────────────────────────────┤
 │ DECK SESSIONS [nav]    │ ♦ conductor-main (conductor)                        │
 │                        │                                                     │
@@ -137,6 +137,8 @@ Built with `Termite` in raw alternate-screen mode (illustrative mock — exact g
 Assistant output is rendered through `Athanor.Markdown`, so headings, lists, code blocks and pipe tables appear syntax-highlighted and wrapped to the viewport width. By default the TUI attaches to the background daemon (see §7.7); pass `mix athanor --local` to run fully in-process instead.
 
 The header also carries a **daemon connectivity indicator** (issue #25): `● <node>` while attached, `○ local` when running in-process, and `✕ unreachable (12s)` — in the error role, with how long it has been down — once the daemon goes away. It is **event-driven** (`:net_kernel.monitor_nodes/1`, folded by `Athanor.TUI.handle_node_event/2`), never a poll on the render path, so "busy" and "dead" can no longer look identical. Colours come from theme roles (`:success` / `:warning` / `:error`).
+
+Next to it is a **context gauge** (issue #43): `ctx: 42%`, the active session's occupancy as estimated by the same `Athanor.Store.Tokens` heuristic the compactor uses. It is banded by theme role — the header accent normally, `:warning` at or above `Config.compaction_threshold/0` (compaction is imminent) and `:error` at or above the limit — and renders `ctx: —` before a session has any stats. It is a *view of already-published state*: the agent folds `{:stats, _}` once per turn (§5's `/stats`), and the header never fetches. Because this bar is longer than an 80-column terminal, the two dynamic gauges sit **before** the static model/theme/session facts, so a narrowed terminal truncates what never changes rather than what you need to see.
 
 ### Interactive TUI Commands & Shortcuts
 - **`Tab`**: Toggle focus between the input line and the session deck. The header shows `[nav]` and the status bar shows deck hints while the deck is focused.

@@ -517,6 +517,40 @@ defmodule Athanor.TUI do
 
   def daemon_status(_tui), do: {"○ local", :warning}
 
+  @doc """
+  The header's context-occupancy gauge as a `{label, theme_role}` pair (#43).
+
+  `context_tokens` is the estimate the agent already publishes each turn (the same heuristic the
+  compactor uses — `Athanor.Store.Tokens`), so this is a view of existing state and never probes
+  anything. Bands, so the gauge reads at a glance:
+
+    * below `Config.compaction_threshold/0` → the header accent (nothing to see)
+    * at or above it → `:warning`, because compaction is imminent
+    * at or above the limit → `:error`
+
+  A session with no stats yet renders `ctx: —` rather than inventing a number.
+  """
+  @spec context_status(t()) :: {String.t(), atom()}
+  def context_status(tui) do
+    case active_stats(tui) do
+      %{context_tokens: tokens} when is_integer(tokens) and tokens >= 0 ->
+        limit = Config.context_limit_tokens()
+        ratio = if limit > 0, do: tokens / limit, else: 0.0
+        {"ctx: #{round(ratio * 100)}%", context_role(ratio)}
+
+      _other ->
+        {"ctx: —", :muted}
+    end
+  end
+
+  defp context_role(ratio) do
+    cond do
+      ratio >= 1.0 -> :error
+      ratio >= Config.compaction_threshold() -> :warning
+      true -> :accent
+    end
+  end
+
   # A frame is only rendered when something actually changed: every mutation sets `dirty`, key
   # presses set it on the way in, and a tick sets it only while a session is busy.
   defp render_if_dirty(term, %{dirty: false} = tui), do: {term, tui}
@@ -1433,9 +1467,11 @@ defmodule Athanor.TUI do
     session_count = map_size(tui.sessions)
     theme = tui.theme
     {status_label, status_role} = daemon_status(tui)
+    {context_label, context_role} = context_status(tui)
 
     before = " ⚗ ATHANOR │ daemon "
-    rest = " │ model: #{tui.model} │ theme: #{theme.key} │ sessions: #{session_count}"
+    after_status = " │ "
+    middle = " │ model: #{tui.model} │ theme: #{theme.key} │ sessions: #{session_count}"
     right = "Tab: input/deck "
 
     base_style =
@@ -1450,20 +1486,32 @@ defmodule Athanor.TUI do
       |> Style.foreground(Theme.colour(theme, status_role))
       |> Style.bold()
 
-    plain = before <> status_label <> rest
+    context_style =
+      Style.ansi256()
+      |> Style.background(Theme.colour(theme, :surface))
+      |> Style.foreground(Theme.colour(theme, context_role))
+      |> Style.bold()
+
+    # Order matters: this bar is longer than an 80-column terminal, so the *dynamic* gauges
+    # (connectivity, context fill) sit ahead of the static model/theme/session facts. When the
+    # line is truncated, what disappears is what never changes.
+    plain = before <> status_label <> after_status <> context_label <> middle
     gap = width - String.length(plain) - String.length(right)
 
     if gap >= 1 do
-      # Segments, not one styled string: the daemon indicator must carry its own colour while the
-      # rest of the bar keeps the header style (#25).
+      # Segments, not one styled string: the daemon indicator and the context gauge each carry
+      # their own colour while the rest of the bar keeps the header style (#25, #43).
       [
         {base_style, before},
         {status_style, status_label},
-        {base_style, rest <> String.duplicate(" ", gap) <> right}
+        {base_style, after_status},
+        {context_style, context_label},
+        {base_style, middle <> String.duplicate(" ", gap) <> right}
       ]
       |> Enum.map_join("", fn {style, text} -> Style.render_to_string(style, text) end)
     else
-      # Too narrow to split colours without wrapping: fall back to one truncated styled line.
+      # Too narrow to split colours without wrapping: fall back to one truncated styled line. The
+      # gauges are still present because they come first.
       Style.render_to_string(base_style, String.slice(plain <> String.duplicate(" ", width), 0, width))
     end
   end
@@ -1987,6 +2035,15 @@ defmodule Athanor.TUI do
   # -- connectivity helpers (#25) ---------------------------------------------------------
 
   defp daemon_reachable?(node), do: node == Node.self() or node in Node.list()
+
+  # The active session's published stats (#26), or `nil` before its first turn. Read only — the
+  # header must never be the thing that fetches.
+  defp active_stats(tui) do
+    case Map.get(tui.sessions, tui.active_id) do
+      %{stats: stats} when is_map(stats) -> stats
+      _other -> nil
+    end
+  end
 
   # Only meaningful when we actually expect a daemon and distribution is up; in `--local` there is
   # no remote node to monitor, and calling this on `:nonode@nohost` would error.
