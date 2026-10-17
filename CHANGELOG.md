@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- TUI header: show how full the active session's context is (#43)
 - Add /stats command: tokens, turns, tool calls and estimated cost (#26)
 - Cap concurrent worktrees in Athanor.Worktree.Server (design §7.1 OQ-W8) (#38)
 - Add hierarchical memory system (Athanor.Memory) (#6)
