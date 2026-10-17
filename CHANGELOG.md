@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Add /stats command: tokens, turns, tool calls and estimated cost (#26)
 - Cap concurrent worktrees in Athanor.Worktree.Server (design §7.1 OQ-W8) (#38)
 - Add hierarchical memory system (Athanor.Memory) (#6)
 - Support pasting multi-line text blocks into the TUI prompt, with bracketed-paste detection so a pasted block is never mistaken for a typed Enter (#34)
@@ -21,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
 
 ### Changed
+- TUI header: show daemon connectivity (#25)
 - Document deps/_build bootstrap for fresh worktrees (design §7.1 OQ-W5) (#39)
 - `write_file`/`edit_file` now refuse to modify an existing file the session has not read; creating a new file is unaffected. Disable with `ATHANOR_TOOL_GUARD=0` (#7)
 - Document chainlink's single-session-per-database model and its multi-agent workarounds (#32)
