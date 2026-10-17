@@ -50,6 +50,7 @@ defmodule Athanor.Config do
   @default_memory_global_inject false
   @default_memory_recall_limit 5
   @default_memory_fact_max_chars 2_000
+  @default_memory_compact_threshold_bytes 262_144
   @default_tool_guard_enabled true
   @default_prelude_read_required true
 
@@ -768,6 +769,24 @@ defmodule Athanor.Config do
       "ATHANOR_MEMORY_FACT_MAX_CHARS",
       :memory_fact_max_chars,
       @default_memory_fact_max_chars
+    )
+  end
+
+  @doc """
+  Size, in bytes, at which a tier's `learnings.jsonl` is compacted opportunistically (default
+  `#{@default_memory_compact_threshold_bytes}`).
+
+  The log is append-only, so `forget` leaves a tombstone and the file only grows (plan §8.3, OQ7).
+  Crossing this threshold on a write triggers a guarded rewrite without the dead lines; `0` disables
+  it and leaves compaction to `mix athanor.memory compact`. Overridable via
+  `ATHANOR_MEMORY_COMPACT_BYTES` or `:athanor, :memory_compact_threshold_bytes`.
+  """
+  @spec memory_compact_threshold_bytes() :: non_neg_integer()
+  def memory_compact_threshold_bytes do
+    non_neg_int(
+      "ATHANOR_MEMORY_COMPACT_BYTES",
+      :memory_compact_threshold_bytes,
+      @default_memory_compact_threshold_bytes
     )
   end
 

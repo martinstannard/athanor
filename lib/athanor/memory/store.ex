@@ -95,6 +95,7 @@ defmodule Athanor.Memory.Store do
 
       with :ok <- File.write(path, Entry.to_json(entry) <> "\n", [:append]) do
         secure(path)
+        maybe_compact(dir)
       end
     end
   end
@@ -140,6 +141,7 @@ defmodule Athanor.Memory.Store do
 
       with :ok <- File.write(path, line <> "\n", [:append]) do
         secure(path)
+        maybe_compact(dir)
       end
     end
   end
@@ -148,8 +150,10 @@ defmodule Athanor.Memory.Store do
   Rewrites a tier's `learnings.jsonl` without forgotten or deprecated entries (plan §8.3, OQ7).
 
   The log is append-only, so a deletion is a tombstone and the file only ever grows. Compaction is
-  an **explicit** housekeeping step (`mix athanor.memory compact`), never something that happens
-  behind a running session. Returns the number of lines dropped.
+  available as an **explicit** housekeeping step (`mix athanor.memory compact`), and also runs
+  opportunistically on the write path once the file passes
+  `Config.memory_compact_threshold_bytes/0` (see `maybe_compact/1`). Returns the number of lines
+  dropped; nothing is written when there is nothing to drop.
   """
   @spec compact(String.t()) :: {:ok, non_neg_integer()}
   def compact(dir) do
@@ -160,18 +164,68 @@ defmodule Athanor.Memory.Store do
         {:ok, 0}
 
       {:ok, content} ->
-        lines = String.split(content, "\n", trim: true)
-        {entries, forgotten} = Enum.reduce(lines, {[], MapSet.new()}, &collect/2)
+        {body, removed} = compacted(content)
 
-        kept =
-          entries
-          |> Enum.reverse()
-          |> Enum.reject(&(&1.deprecated or MapSet.member?(forgotten, &1.id)))
+        if removed > 0 do
+          File.write!(path, body)
+          secure(path)
+        end
 
-        File.write!(path, Enum.map_join(kept, "", &(Entry.to_json(&1) <> "\n")))
-        secure(path)
-        {:ok, length(lines) - length(kept)}
+        {:ok, removed}
     end
+  end
+
+  @doc """
+  Compacts a tier's log when it has grown past `Config.memory_compact_threshold_bytes/0` (plan
+  §8.3, OQ7).
+
+  Called after an append, so a long-lived workspace does not accumulate tombstones forever. The
+  rewrite is **optimistically guarded**: the file size is re-checked immediately before writing,
+  and the compaction is abandoned if another writer appended in between — a concurrent `remember`
+  must never be lost to housekeeping. A no-op when the threshold is `0` (disabled) or the file is
+  under it.
+  """
+  @spec maybe_compact(String.t()) :: :ok
+  def maybe_compact(dir) do
+    threshold = Config.memory_compact_threshold_bytes()
+    path = learnings_path(dir)
+
+    with true <- threshold > 0,
+         {:ok, %File.Stat{size: size}} when size > threshold <- File.stat(path) do
+      compact_if_unchanged(path, size)
+    else
+      _other -> :ok
+    end
+  end
+
+  # The read-then-write window is the only place a concurrent append could be lost, so the size is
+  # re-checked right before the rewrite and the whole thing is skipped if it moved.
+  defp compact_if_unchanged(path, expected_size) do
+    with {:ok, content} <- File.read(path),
+         {:ok, %File.Stat{size: ^expected_size}} <- File.stat(path) do
+      {body, removed} = compacted(content)
+
+      if removed > 0 do
+        File.write!(path, body)
+        secure(path)
+      end
+
+      :ok
+    else
+      _other -> :ok
+    end
+  end
+
+  defp compacted(content) do
+    lines = String.split(content, "\n", trim: true)
+    {entries, forgotten} = Enum.reduce(lines, {[], MapSet.new()}, &collect/2)
+
+    kept =
+      entries
+      |> Enum.reverse()
+      |> Enum.reject(&(&1.deprecated or MapSet.member?(forgotten, &1.id)))
+
+    {Enum.map_join(kept, "", &(Entry.to_json(&1) <> "\n")), length(lines) - length(kept)}
   end
 
   @doc "The bullets of a tier's `MEMORY.md` as `{section, text}` pairs, in file order."
