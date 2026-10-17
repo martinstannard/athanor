@@ -671,8 +671,15 @@ defmodule Athanor.AgentTest do
     test "the rebuilt system message is the one derived at init", %{tmp_dir: tmp_dir} do
       # `project_context: false` keeps this a test of /clear, not of AGENTS.md injection: the
       # temp dir sits inside this repo, whose own AGENTS.md would otherwise be composed in.
+      # `memory: false` for the same reason — a checkout that has `.athanor/MEMORY.md` would
+      # otherwise contribute a memory block to the prompt this asserts on exactly.
       {:ok, agent} =
-        Agent.start_link(cd: tmp_dir, system_prompt: "You are a test prompt.", project_context: false)
+        Agent.start_link(
+          cd: tmp_dir,
+          system_prompt: "You are a test prompt.",
+          project_context: false,
+          memory: false
+        )
 
       assert :ok = Agent.clear_context(agent)
 
@@ -1342,6 +1349,16 @@ defmodule Athanor.AgentTest do
     sys
   end
 
+  # A directory with no `.athanor/` or `.git/` anywhere above it. ExUnit's `:tmp_dir` is inside the
+  # checkout, so ascending from it reaches the repo's own `.athanor/`; anything asserting *no*
+  # memory must start somewhere this checkout cannot reach.
+  defp outside_workspace_dir do
+    dir = Path.join(System.tmp_dir!(), "athanor_agent_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    dir
+  end
+
   describe "memory injection (§7.5 M2)" do
     test "appends project memory after the role prompt, exactly once", %{tmp_dir: tmp_dir} do
       File.mkdir_p!(Path.join(tmp_dir, ".athanor"))
@@ -1355,8 +1372,12 @@ defmodule Athanor.AgentTest do
       assert String.starts_with?(String.trim(sys), "You are")
     end
 
-    test "no memory block when neither tier has a MEMORY.md", %{tmp_dir: tmp_dir} do
-      sys = capture_system_prompt(tmp_dir)
+    test "no memory block when neither tier has a MEMORY.md" do
+      # Must be outside the repo: ExUnit's `:tmp_dir` lives *inside* the checkout, so ascending
+      # from it reaches this repo's own `.athanor/` — and once this checkout has project memory
+      # (e.g. what the running daemon has `remember`ed), a "no memory anywhere" test would fail on
+      # ambient state rather than on behaviour. Same coupling class as #40.
+      sys = capture_system_prompt(outside_workspace_dir())
       refute sys =~ "## Memory"
     end
 
