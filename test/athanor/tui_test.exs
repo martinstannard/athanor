@@ -410,6 +410,106 @@ defmodule Athanor.TUITest do
     end
   end
 
+  # design §10.3 + §10.9 T5 / issue #19: the `/kill` command surface.
+  describe "/kill" do
+    test "/kill <id> parses to the kill branch; --force is accepted before or after the id" do
+      tui = TUI.new()
+
+      typed = elem(TUI.handle_key(tui, "/kill worker-1"), 1)
+      assert {:kill, "worker-1", false, cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      typed = elem(TUI.handle_key(tui, "/kill worker-1 --force"), 1)
+      assert {:kill, "worker-1", true, _} = TUI.handle_key(typed, "\r")
+
+      # Flag-first reads naturally too.
+      typed = elem(TUI.handle_key(tui, "/kill --force worker-1"), 1)
+      assert {:kill, "worker-1", true, _} = TUI.handle_key(typed, "\r")
+
+      # A bare `/kill` is the "what is running?" listing signal `loop/2` branches on.
+      typed = elem(TUI.handle_key(tui, "/kill"), 1)
+      assert {:kill, nil, false, cleared} = TUI.handle_key(typed, "\r")
+      assert cleared.input == ""
+
+      # Only the exact verb is a command: `/killx` stays an ordinary prompt.
+      typed = elem(TUI.handle_key(TUI.new(), "/killx"), 1)
+      assert {:submit, "/killx", _} = TUI.handle_key(typed, "\r")
+    end
+
+    test "removes only the named session from the deck, leaving peers and their transcripts" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started, %{id: "worker-1", title: "w", role: :worker, parent_id: "conductor-main"}}
+        )
+        |> TUI.handle_agent_event(
+          "worker-2",
+          {:session_started, %{id: "worker-2", title: "w2", role: :worker, parent_id: "conductor-main"}}
+        )
+
+      assert tui.session_order == ["conductor-main", "worker-1", "worker-2"]
+
+      # This is exactly what `dispatch/3` runs for `{:kill, …}` once the RPC succeeds.
+      killed = TUI.remove_local_session(tui, "worker-1")
+
+      refute Map.has_key?(killed.sessions, "worker-1")
+      refute "worker-1" in killed.session_order
+      assert Map.has_key?(killed.sessions, "worker-2")
+      assert Map.has_key?(killed.sessions, "conductor-main")
+
+      # conductor-main was active, and it still exists, so the selection does not move.
+      assert killed.active_id == "conductor-main"
+    end
+
+    test "killing the active worker selects its parent Conductor, not just any survivor" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started, %{id: "worker-1", title: "w", role: :worker, parent_id: "conductor-main"}}
+        )
+        |> TUI.handle_agent_event(
+          "conductor-2",
+          {:session_started, %{id: "conductor-2", title: "c2", role: :conductor, parent_id: nil}}
+        )
+        |> Map.put(:active_id, "worker-1")
+
+      killed = TUI.remove_local_session(tui, "worker-1")
+
+      # `conductor-2` comes later in the order, but the natural "where was I" is the parent.
+      assert killed.active_id == "conductor-main"
+      assert killed.scroll_offset == 0
+    end
+
+    test "killing the last remaining session keeps a valid active_id (never nil)" do
+      tui = TUI.new(active_id: "solo")
+
+      killed = TUI.remove_local_session(tui, "solo")
+
+      assert killed.session_order == []
+      assert killed.sessions == %{}
+      # Every renderer assumes a binary `active_id`; an empty deck must not produce `nil`.
+      assert is_binary(killed.active_id)
+    end
+
+    test "bare /kill lists what is running" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event(
+          "worker-1",
+          {:session_started, %{id: "worker-1", title: "w", role: :worker, parent_id: "conductor-main"}}
+        )
+
+      listed = TUI.list_killable_sessions(tui)
+
+      assert Enum.any?(entries(listed), fn
+               {:system, msg} -> msg =~ "worker-1" and msg =~ "/kill"
+               _ -> false
+             end)
+    end
+  end
+
   # Issue #34: pasting multi-line text into the prompt.
   describe "multi-line input and pasting (#34)" do
     test "a pasted block keeps its newlines instead of being flattened" do

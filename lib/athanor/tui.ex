@@ -11,6 +11,9 @@ defmodule Athanor.TUI do
   - All events and commands flow through `Athanor.Bus` PubSub (`"deck:events"` and `"agent:<id>:inbox"`).
   - `/resume <id>` rehydrates a persisted session (design §7.4) and restores its viewport via
     `hydrate_sessions/2`; a bare `/resume` lists what can be resumed.
+  - `/kill <id>` removes a running session (design §10.3). Only the **process** dies: the
+    transcript stays on disk (§10.9 T5), so `/resume` can still offer it. A session mid-turn is
+    refused unless `--force` is given. A bare `/kill` lists what is running.
   - `/clear` resets the **active** session's conversation context in place — no daemon restart and
     no new session. The agent's working set returns to its system message and the local viewport
     transcript is emptied, so the cleared context is never rendered as if it still existed.
@@ -216,7 +219,7 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /clear to reset the active session's context, /clear-queue to drop all stacked prompts, /unqueue to drop the last one. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /kill <id> to remove a running one (its transcript is kept), /clear to reset the active session's context, /clear-queue to drop all stacked prompts, /unqueue to drop the last one. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
       streaming_buffer: nil,
       prompt_queue_len: 0,
@@ -556,6 +559,9 @@ defmodule Athanor.TUI do
 
       {:resume, id, tui} ->
         loop(term, handle_resume(tui, target_node, id))
+
+      {:kill, id, force?, tui} ->
+        loop(term, handle_kill(tui, target_node, id, force?))
     end
   end
 
@@ -1043,6 +1049,50 @@ defmodule Athanor.TUI do
     update_session(tui, tui.active_id, &cleared_view/1)
   end
 
+  @doc """
+  Drops one session from the local deck: its viewport, its entry in `session_order`, and — when it
+  was the active one — the active selection, which moves to the nearest remaining session.
+
+  Pure, and called by `dispatch/3` for `{:kill, …}` **only after** `Athanor.Daemon.remove_session/3`
+  reports success, so the deck never forgets a session that is still running on the daemon. The
+  killed session's *transcript* is untouched here (§10.9 T5): it lives on disk and `/resume` can
+  still offer it — this only forgets the live view.
+  """
+  @spec remove_local_session(t(), String.t()) :: t()
+  def remove_local_session(%__MODULE__{} = tui, session_id) do
+    # Capture the parent *before* the delete: killing a worker should leave you looking at the
+    # Conductor that spawned it, and that link is gone once the view is removed.
+    parent_id =
+      case Map.get(tui.sessions, session_id) do
+        %{parent_id: pid} when is_binary(pid) -> pid
+        _ -> nil
+      end
+
+    order = Enum.reject(tui.session_order, &(&1 == session_id))
+    sessions = Map.delete(tui.sessions, session_id)
+
+    tui = %{tui | sessions: sessions, session_order: order, dirty: true}
+
+    if tui.active_id == session_id do
+      %{tui | active_id: fallback_active_id(tui, parent_id), scroll_offset: 0}
+    else
+      tui
+    end
+  end
+
+  # The session to show once the active one is gone: its still-present parent Conductor if there is
+  # one, else the first remaining session, else the id we already had — an empty deck keeps a valid
+  # `active_id` rather than `nil`, which every renderer assumes.
+  defp fallback_active_id(tui, parent_id) do
+    parent = parent_id && Map.get(tui.sessions, parent_id)
+
+    case parent || List.first(tui.session_order) do
+      nil -> tui.active_id
+      %{id: id} -> id
+      id -> id
+    end
+  end
+
   # `/clear`: ask the daemon to reset the ACTIVE session's context, and drop the local viewport
   # transcript **only when that succeeds**. A failed (unreachable or wedged) daemon must not leave
   # the user looking at an empty viewport for a context that is still live server-side; the
@@ -1079,27 +1129,11 @@ defmodule Athanor.TUI do
   defp slash_command(tui, "/unqueue"), do: {:drop_queued, %{tui | input: ""}}
 
   defp slash_command(tui, trimmed) do
-    cond do
-      String.starts_with?(trimmed, "/theme") ->
-        rest = String.trim(String.replace_prefix(trimmed, "/theme", ""))
-        {:theme, if(rest == "", do: nil, else: rest), %{tui | input: ""}}
+    case argument_command(tui, trimmed) do
+      {:ok, command} ->
+        command
 
-      # `/resume <id>` rehydrates one persisted session (design §7.4); a bare `/resume` asks for
-      # the listing instead. `nil` is the "no argument" signal `loop/2` branches on, which is why
-      # the two spellings are matched separately rather than with a prefix test.
-      trimmed == "/resume" ->
-        resume_command(nil, tui)
-
-      String.starts_with?(trimmed, "/resume ") ->
-        resume_command(trimmed, tui)
-
-      String.starts_with?(trimmed, "/conductor ") ->
-        conductor_command(tui, trimmed)
-
-      String.starts_with?(trimmed, "/spawn ") ->
-        spawn_worker(tui, String.trim(String.replace_prefix(trimmed, "/spawn ", "")))
-
-      true ->
+      :error ->
         # An unknown `/` verb is still a prompt, exactly as before `/resume` was added — but while
         # the session is busy it is a *stacked* prompt, so it goes the same way a plain prompt
         # does.
@@ -1107,12 +1141,72 @@ defmodule Athanor.TUI do
     end
   end
 
-  defp resume_command(nil, tui), do: {:resume, nil, %{tui | input: ""}}
+  # The verbs that take an argument, kept in their own tables so `slash_command/2` stays a readable
+  # dispatcher and no single function exceeds the complexity budget. `:error` means "not one of
+  # these" and the caller falls through to "treat it as a prompt".
+  #
+  # `/resume` and `/kill` are matched as *exact verb or verb + space*: a bare verb asks for a
+  # listing, and a longer word (`/resumex`) stays an ordinary prompt.
+  defp argument_command(tui, trimmed) do
+    cond do
+      String.starts_with?(trimmed, "/theme") ->
+        {:ok, theme_command(tui, trimmed)}
+
+      verb?(trimmed, "/resume") ->
+        {:ok, resume_command(trimmed, tui)}
+
+      verb?(trimmed, "/kill") ->
+        {:ok, kill_command(trimmed, tui)}
+
+      true ->
+        spawn_argument_command(tui, trimmed)
+    end
+  end
+
+  defp spawn_argument_command(tui, trimmed) do
+    cond do
+      String.starts_with?(trimmed, "/conductor ") ->
+        {:ok, conductor_command(tui, trimmed)}
+
+      String.starts_with?(trimmed, "/spawn ") ->
+        {:ok, spawn_worker(tui, String.trim(String.replace_prefix(trimmed, "/spawn ", "")))}
+
+      true ->
+        :error
+    end
+  end
+
+  defp verb?(trimmed, verb), do: trimmed == verb or String.starts_with?(trimmed, verb <> " ")
+
+  defp theme_command(tui, trimmed) do
+    rest = trimmed |> String.replace_prefix("/theme", "") |> String.trim()
+    {:theme, if(rest == "", do: nil, else: rest), %{tui | input: ""}}
+  end
 
   defp resume_command(trimmed, tui) do
     id = trimmed |> String.replace_prefix("/resume", "") |> String.trim()
     {:resume, if(id == "", do: nil, else: id), %{tui | input: ""}}
   end
+
+  # `/kill [--force] <id>`. The flag may appear before or after the id, because both spellings read
+  # naturally ("kill --force abc" / "kill abc --force"). `--delete-transcript` is deliberately NOT
+  # offered here: T5 makes keeping the transcript the default, and destroying state from a TUI
+  # keystroke is a footgun the CLI can carry instead (`mix athanor kill --delete-transcript`).
+  defp kill_command(trimmed, tui) do
+    args =
+      trimmed
+      |> String.replace_prefix("/kill", "")
+      |> String.split(~r/\s+/, trim: true)
+
+    {force?, id} = Enum.reduce(args, {false, nil}, &kill_arg/2)
+    {:kill, if(id == "", do: nil, else: id), force?, %{tui | input: ""}}
+  end
+
+  defp kill_arg("--force", {_force?, id}), do: {true, id}
+  defp kill_arg("-f", {_force?, id}), do: {true, id}
+  defp kill_arg(arg, {force?, nil}), do: {force?, arg}
+  # A second bare word is not a valid target; keep the first id and ignore the rest.
+  defp kill_arg(_arg, {force?, id}), do: {force?, id}
 
   defp conductor_command(tui, trimmed) do
     title = String.trim(String.replace_prefix(trimmed, "/conductor ", ""))
@@ -1797,6 +1891,65 @@ defmodule Athanor.TUI do
 
       {:error, reason} ->
         add_system(tui, "Could not resume #{id}: #{inspect(reason)}")
+    end
+  end
+
+  # `/kill` with no id: list the sessions the deck currently knows are running. With an id: ask the
+  # daemon to remove it (design §10.3) and, **only on success**, drop it from the local deck. The
+  # local removal is shared with nothing else and is pure (`remove_local_session/2`) so it can be
+  # asserted without a terminal, exactly like `clear_local_context/1`.
+  defp handle_kill(tui, _target_node, nil, _force?), do: list_killable_sessions(tui)
+
+  defp handle_kill(tui, target_node, id, force?) do
+    case Daemon.remove_session(target_node, id, force: force?) do
+      {:ok, _} ->
+        tui |> remove_local_session(id) |> note_removed(id, force?)
+
+      {:error, :busy} ->
+        add_system(
+          tui,
+          "#{id} is mid-turn; /kill #{id} --force to terminate it (its transcript is kept)."
+        )
+
+      {:error, :not_found} ->
+        add_system(tui, "No such session: #{id}")
+
+      {:error, reason} ->
+        add_system(tui, "Could not kill #{id}: #{inspect(reason)}")
+    end
+  end
+
+  defp note_removed(tui, id, force?) do
+    suffix = if force?, do: " (forced, mid-turn)", else: ""
+    add_system(tui, "Removed #{id}#{suffix} — its transcript is kept; /resume can offer it again.")
+  end
+
+  @doc """
+  Lists the sessions the deck currently knows are running, for a bare `/kill`.
+
+  Reads the local deck rather than the daemon: it is the same set the sidebar renders, so what the
+  user is told they can kill is exactly what they can see.
+  """
+  @spec list_killable_sessions(t()) :: t()
+  def list_killable_sessions(tui) do
+    running =
+      tui.session_order
+      |> Enum.map(&Map.get(tui.sessions, &1))
+      |> Enum.reject(&is_nil/1)
+
+    case running do
+      [] ->
+        add_system(tui, "No running sessions to kill.")
+
+      sessions ->
+        listing =
+          sessions
+          |> Enum.map_join("\n", fn s -> "  #{s.id}  (#{s.role}, #{s.status})" end)
+
+        add_system(
+          tui,
+          "Running sessions (#{length(sessions)}) — /kill <id> to remove:\n" <> listing
+        )
     end
   end
 

@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add a log file for the detached Athanor daemon (#13)
 - Add a `/clear` TUI command that resets a session's conversation context in place, without restarting the daemon or spawning a new session (#31)
 - Stack prompts while a session is streaming, with a pending-queue indicator and `/clear-queue` / `/unqueue` to drop the stack or its newest entry (#18)
+- Add a `/kill <id>` TUI command that removes a running session (a bare `/kill` lists what is running); only the process dies, so the transcript is kept and `/resume` can still offer it. A mid-turn session needs `--force` (#19)
 
 ### Fixed
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
