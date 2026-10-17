@@ -119,6 +119,49 @@ defmodule Athanor.Memory.Store do
     :ok
   end
 
+  @doc """
+  Appends a `forget` operation line for `id` (plan §8.3).
+
+  The log is append-only, so deletion is a tombstone: readers drop the named entry. Physically
+  compacting the file is a later, opportunistic job.
+  """
+  @spec append_tombstone(String.t(), String.t()) :: :ok | {:error, term()}
+  def append_tombstone(dir, id) do
+    with :ok <- ensure_dir(dir) do
+      at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+      line = JSON.encode!(%{"op" => "forget", "id" => id, "at" => at})
+      File.write(learnings_path(dir), line <> "\n", [:append])
+    end
+  end
+
+  @doc "The bullets of a tier's `MEMORY.md` as `{section, text}` pairs, in file order."
+  @spec read_bullets(String.t()) :: [{String.t() | nil, String.t()}]
+  def read_bullets(dir) do
+    case read_memory(dir) do
+      nil -> []
+      content -> parse_bullets(String.split(content, "\n"))
+    end
+  end
+
+  @doc "Removes the bullet whose text is exactly `text` from a tier's `MEMORY.md`. `:ok` if absent."
+  @spec remove_bullet(String.t(), String.t()) :: :ok
+  def remove_bullet(dir, text) do
+    case read_memory(dir) do
+      nil ->
+        :ok
+
+      content ->
+        cleaned =
+          content
+          |> String.split("\n")
+          |> Enum.reject(&(String.trim(&1) == "- " <> text))
+          |> Enum.join("\n")
+
+        File.write!(memory_path(dir), cleaned)
+        :ok
+    end
+  end
+
   @doc "Creates a tier directory (and parents) with mode `0700`."
   @spec ensure_dir(String.t()) :: :ok
   def ensure_dir(dir) do
@@ -162,10 +205,16 @@ defmodule Athanor.Memory.Store do
         if Enum.any?(body, &(String.trim(&1) == "- " <> text)) do
           content
         else
-          body = Enum.reject(body, &(String.trim(&1) == ""))
-          Enum.join(head ++ body ++ ["- " <> text] ++ rest, "\n")
+          Enum.join(head ++ insert_bullet(body, "- " <> text) ++ rest, "\n")
         end
     end
+  end
+
+  # Inserts before any trailing blank lines so a section keeps its spacing and an existing
+  # multi-paragraph body is not collapsed by the rewrite.
+  defp insert_bullet(body, bullet) do
+    {blank, kept} = body |> Enum.reverse() |> Enum.split_while(&(String.trim(&1) == ""))
+    Enum.reverse(kept) ++ [bullet] ++ Enum.reverse(blank)
   end
 
   defp section_length(tail) do
@@ -173,6 +222,26 @@ defmodule Athanor.Memory.Store do
       nil -> length(tail)
       index -> index
     end
+  end
+
+  defp parse_bullets(lines) do
+    {bullets, _section} =
+      Enum.reduce(lines, {[], nil}, fn line, {acc, section} ->
+        trimmed = String.trim(line)
+
+        cond do
+          String.starts_with?(trimmed, "## ") ->
+            {acc, trimmed |> String.replace_prefix("## ", "") |> String.trim()}
+
+          String.starts_with?(trimmed, "- ") ->
+            {[{section, String.replace_prefix(trimmed, "- ", "")} | acc], section}
+
+          true ->
+            {acc, section}
+        end
+      end)
+
+    Enum.reverse(bullets)
   end
 
   # -- workspace discovery ---------------------------------------------------

@@ -95,6 +95,15 @@ defmodule Athanor.MemoryStoreTest do
       assert length(String.split(content, "## Gotchas")) == 2
     end
 
+    test "upsert_bullet preserves existing blank-line formatting in the section", %{tmp_dir: dir} do
+      File.write!(Path.join(dir, "MEMORY.md"), "## Facts\n- first\n\n- second\n")
+      :ok = Store.upsert_bullet(dir, "Facts", "third")
+
+      content = Store.read_memory(dir)
+      assert content =~ "- first\n\n- second"
+      assert content =~ "- third"
+    end
+
     test "upsert_bullet preserves other sections", %{tmp_dir: dir} do
       :ok = Store.upsert_bullet(dir, "Architecture", "Auth lives in Athanor.Auth")
       :ok = Store.upsert_bullet(dir, "Gotchas", "A gotcha")

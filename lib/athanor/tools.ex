@@ -9,7 +9,8 @@ defmodule Athanor.Tools do
     available to `:conductor` sessions.
   """
 
-  alias Athanor.{Bus, GoalManager, Orchestrator, SessionId}
+  alias Athanor.{Bus, GoalManager, Memory, Orchestrator, SessionId}
+  alias Athanor.Memory.Entry
   alias Athanor.Tools.{Glob, Grep}
   alias Athanor.Tools.Goal, as: GoalTools
   alias Athanor.Tools.Worktree, as: WorktreeTools
@@ -28,10 +29,12 @@ defmodule Athanor.Tools do
     role = Keyword.get(opts, :role, :worker)
 
     case role do
-      :conductor -> workspace_schemas() ++ conductor_schemas() ++ goal_schemas()
+      :conductor -> workspace_schemas() ++ conductor_schemas() ++ goal_schemas() ++ memory_schemas()
       # `report_progress` is worker-only: a conductor has no goal of its own to report against, so
       # offering it there is pure token cost (§7.2, plan §7).
-      _worker -> workspace_schemas() ++ worker_schemas()
+      # Memory tools are for *every* agent — design §7.5 says "an agent", and a worker is usually
+      # the one who discovers the gotcha (plan D2).
+      _worker -> workspace_schemas() ++ worker_schemas() ++ memory_schemas()
     end
   end
 
@@ -213,6 +216,89 @@ defmodule Athanor.Tools do
               }
             },
             "required" => ["summary"]
+          }
+        }
+      }
+    ]
+  end
+
+  defp memory_schemas do
+    [
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "remember",
+          "description" =>
+            "Record a durable learning for future sessions: a project fact, gotcha, convention, preference or link. Written to the workspace .athanor/learnings.jsonl and, for curated categories, into .athanor/MEMORY.md. Secrets are redacted automatically.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "category" => %{
+                "type" => "string",
+                "enum" => Enum.map(Entry.categories(), &Atom.to_string/1),
+                "description" => "Kind of learning (drives MEMORY.md placement)."
+              },
+              "fact" => %{
+                "type" => "string",
+                "description" => "One or two sentences. State the durable truth, not the transient action."
+              },
+              "scope" => %{
+                "type" => "string",
+                "enum" => ["project", "global"],
+                "description" => "Defaults to 'project'. Use 'global' only for cross-project facts."
+              },
+              "tags" => %{
+                "type" => "array",
+                "items" => %{"type" => "string"},
+                "description" => "Optional keywords to improve recall."
+              }
+            },
+            "required" => ["category", "fact"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "recall",
+          "description" =>
+            "Search durable learnings (project and global learnings.jsonl) for facts relevant to a query. Returns ranked matches with ids.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "query" => %{"type" => "string", "description" => "Keywords or a question."},
+              "scope" => %{
+                "type" => "string",
+                "enum" => ["project", "global", "all"],
+                "description" => "Defaults to 'project'. 'all' searches project and global."
+              },
+              "limit" => %{
+                "type" => "integer",
+                "minimum" => 1,
+                "maximum" => 20,
+                "description" => "Maximum results. Defaults to 5."
+              }
+            },
+            "required" => ["query"]
+          }
+        }
+      },
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "forget",
+          "description" =>
+            "Remove a learning by id (from recall) when it is wrong, obsolete, or sensitive. Project learnings can be removed by any session; global ones only by the user.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "id" => %{"type" => "string", "description" => "The id returned by recall/remember."},
+              "reason" => %{
+                "type" => "string",
+                "description" => "Optional, recorded in the audit trail."
+              }
+            },
+            "required" => ["id"]
           }
         }
       }
@@ -671,6 +757,19 @@ defmodule Athanor.Tools do
     end
   end
 
+  def execute("remember", %{"category" => category, "fact" => fact} = args, opts)
+      when is_binary(category) and is_binary(fact) do
+    Memory.remember(args, opts)
+  end
+
+  def execute("recall", %{"query" => query} = args, opts) when is_binary(query) do
+    Memory.recall(args, opts)
+  end
+
+  def execute("forget", %{"id" => id} = args, opts) when is_binary(id) do
+    Memory.forget(args, opts)
+  end
+
   def execute(tool_name, _args, _opts)
       when tool_name in [
              "read_file",
@@ -690,7 +789,10 @@ defmodule Athanor.Tools do
              "set_goal",
              "verify_goal",
              "goal_status",
-             "list_goals"
+             "list_goals",
+             "remember",
+             "recall",
+             "forget"
            ] do
     {:error, "Missing or invalid required arguments for tool #{tool_name}"}
   end

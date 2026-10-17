@@ -1324,4 +1324,56 @@ defmodule Athanor.AgentTest do
       end
     end
   end
+
+  # Captures the system message the agent builds, via the deterministic `llm_fn` seam (§11.2).
+  # `self()` is bound outside the closure: the closure runs in the agent process, so `self()`
+  # inside it would address the agent, not the test.
+  defp capture_system_prompt(cd, opts \\ []) do
+    test = self()
+
+    llm_fn = fn messages, _tools, _agent_pid ->
+      send(test, {:system_prompt, hd(messages).content})
+      {:ok, %{role: "assistant", content: "ok", tool_calls: []}}
+    end
+
+    {:ok, agent} = Agent.start_link([cd: cd, llm_fn: llm_fn] ++ opts)
+    :ok = Agent.prompt(agent, "hello")
+    assert_receive {:system_prompt, sys}
+    sys
+  end
+
+  describe "memory injection (§7.5 M2)" do
+    test "appends project memory after the role prompt, exactly once", %{tmp_dir: tmp_dir} do
+      File.mkdir_p!(Path.join(tmp_dir, ".athanor"))
+      File.write!(Path.join([tmp_dir, ".athanor", "MEMORY.md"]), "## Conventions\n- Use tagged tuples\n")
+
+      sys = capture_system_prompt(tmp_dir)
+
+      assert sys =~ "Use tagged tuples"
+      assert length(String.split(sys, "## Memory")) == 2
+      # the role prompt leads; memory follows it
+      assert String.starts_with?(String.trim(sys), "You are")
+    end
+
+    test "no memory block when neither tier has a MEMORY.md", %{tmp_dir: tmp_dir} do
+      sys = capture_system_prompt(tmp_dir)
+      refute sys =~ "## Memory"
+    end
+
+    test "redacts a secret that was written into MEMORY.md by hand", %{tmp_dir: tmp_dir} do
+      File.mkdir_p!(Path.join(tmp_dir, ".athanor"))
+      File.write!(Path.join([tmp_dir, ".athanor", "MEMORY.md"]), "## Facts\n- key sk-abcdef0123456789abcd\n")
+
+      sys = capture_system_prompt(tmp_dir)
+      refute sys =~ "sk-abcdef0123456789abcd"
+    end
+
+    test "the memory: false init option disables injection for this session", %{tmp_dir: tmp_dir} do
+      File.mkdir_p!(Path.join(tmp_dir, ".athanor"))
+      File.write!(Path.join([tmp_dir, ".athanor", "MEMORY.md"]), "## Convention\n- Use tagged tuples\n")
+
+      sys = capture_system_prompt(tmp_dir, memory: false)
+      refute sys =~ "Use tagged tuples"
+    end
+  end
 end

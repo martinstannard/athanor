@@ -99,7 +99,7 @@ defmodule Athanor.Agent do
 
   require Logger
 
-  alias Athanor.{Bus, Config, GoalManager, LLM, ProjectContext, SessionId, Tools}
+  alias Athanor.{Bus, Config, GoalManager, LLM, Memory, ProjectContext, SessionId, Tools}
   alias Athanor.Store.{Compactor, Tokens}
 
   @default_conductor_prompt """
@@ -629,14 +629,34 @@ defmodule Athanor.Agent do
   # instructions mid-conversation without the transcript recording why. Absent or empty file =
   # no sentinel, no trailing separators: the prompt is byte-identical to the literal.
   defp compose_system_prompt(role_prompt, cd, opts) do
+    role_prompt
+    |> compose_project_context(cd, opts)
+    |> compose_memory(cd, opts)
+  end
+
+  defp compose_project_context(prompt, cd, opts) do
     if project_context_enabled?(opts) do
       case ProjectContext.load(cd) do
-        {:ok, body} -> role_prompt <> "\n\n" <> ProjectContext.sentinel() <> "\n" <> body
-        :none -> role_prompt
+        {:ok, body} -> prompt <> "\n\n" <> ProjectContext.sentinel() <> "\n" <> body
+        :none -> prompt
       end
     else
-      role_prompt
+      prompt
     end
+  end
+
+  # §7.5: exactly one memory block, appended at session start — after the role prompt and after
+  # the project context. The init `:memory` option overrides `Config.memory_enabled?/0` for a
+  # single session, mirroring `:project_context`.
+  defp compose_memory(prompt, cd, opts) do
+    case Memory.system_prompt_section(cd: cd, enabled: memory_enabled?(opts)) do
+      nil -> prompt
+      section -> String.trim_trailing(prompt) <> "\n\n" <> section
+    end
+  end
+
+  defp memory_enabled?(opts) do
+    Keyword.get(opts, :memory, Config.memory_enabled?()) != false
   end
 
   # The init option wins over `ATHANOR_PROJECT_CONTEXT`/`:athanor, :project_context`, so a caller

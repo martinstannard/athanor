@@ -1,9 +1,15 @@
 defmodule Athanor.ToolsTest do
   use ExUnit.Case, async: true
 
+  alias Athanor.Memory.Store
   alias Athanor.Tools
 
   @moduletag :tmp_dir
+
+  defp names(role) do
+    Tools.schemas(role: role)
+    |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
+  end
 
   describe "schemas/0 and schemas/1" do
     test "returns the workspace tool schemas by default" do
@@ -11,7 +17,18 @@ defmodule Athanor.ToolsTest do
         Tools.schemas()
         |> Enum.map(fn %{"type" => "function", "function" => %{"name" => name}} -> name end)
 
-      assert names == ["read_file", "write_file", "edit_file", "bash", "glob", "grep", "report_progress"]
+      assert names == [
+               "read_file",
+               "write_file",
+               "edit_file",
+               "bash",
+               "glob",
+               "grep",
+               "report_progress",
+               "remember",
+               "recall",
+               "forget"
+             ]
     end
 
     test "includes conductor orchestration tools when role: :conductor" do
@@ -212,6 +229,86 @@ defmodule Athanor.ToolsTest do
 
     test "returns error for unknown tool" do
       assert {:error, "Unknown tool: magic_wand"} = Tools.execute("magic_wand", %{})
+    end
+  end
+
+  describe "memory tools (§7.5 M3)" do
+    test "both roles get remember/recall/forget (D2 regression)" do
+      for role <- [:worker, :conductor] do
+        assert "remember" in names(role)
+        assert "recall" in names(role)
+        assert "forget" in names(role)
+      end
+    end
+
+    test "remember writes a learning with the session as its source", %{tmp_dir: tmp_dir} do
+      File.mkdir_p!(Path.join(tmp_dir, ".athanor"))
+
+      assert {:ok, message} =
+               Tools.execute(
+                 "remember",
+                 %{"category" => "gotcha", "fact" => "mix test needs ATHANOR_* env"},
+                 cd: tmp_dir,
+                 session_id: "s1"
+               )
+
+      assert message =~ "Remembered"
+
+      [entry] = Store.read_learnings(Path.join(tmp_dir, ".athanor"))
+      assert entry.text == "mix test needs ATHANOR_* env"
+      assert entry.source["session_id"] == "s1"
+    end
+
+    test "recall finds what remember wrote, and forget removes it", %{tmp_dir: tmp_dir} do
+      File.mkdir_p!(Path.join(tmp_dir, ".athanor"))
+      opts = [cd: tmp_dir, session_id: "s1"]
+
+      {:ok, _} =
+        Tools.execute("remember", %{"category" => "fact", "fact" => "worktrees share memory"}, opts)
+
+      {:ok, found} = Tools.execute("recall", %{"query" => "worktrees"}, opts)
+      assert found =~ "worktrees share memory"
+
+      [entry] = Store.read_learnings(Path.join(tmp_dir, ".athanor"))
+      assert {:ok, _} = Tools.execute("forget", %{"id" => entry.id}, opts)
+
+      {:ok, after_forget} = Tools.execute("recall", %{"query" => "worktrees"}, opts)
+      assert after_forget == "No matching learnings."
+    end
+
+    test "a curated category also lands in MEMORY.md", %{tmp_dir: tmp_dir} do
+      File.mkdir_p!(Path.join(tmp_dir, ".athanor"))
+      opts = [cd: tmp_dir, session_id: "s1"]
+
+      {:ok, _} =
+        Tools.execute("remember", %{"category" => "gotcha", "fact" => "A durable gotcha"}, opts)
+
+      memory = Store.read_memory(Path.join(tmp_dir, ".athanor"))
+      assert memory =~ "## Gotchas"
+      assert memory =~ "- A durable gotcha"
+    end
+
+    test "remember with a missing fact falls through to the argument error", %{tmp_dir: tmp_dir} do
+      assert {:error, message} =
+               Tools.execute("remember", %{"category" => "fact"}, cd: tmp_dir, session_id: "s1")
+
+      assert message =~ "Missing or invalid required arguments"
+    end
+
+    test "a global learning cannot be forgotten by a tool (OQ5)", %{tmp_dir: tmp_dir} do
+      global = Path.join(tmp_dir, "global")
+      opts = [cd: tmp_dir, session_id: "s1", global_dir: global]
+
+      {:ok, _} =
+        Tools.execute(
+          "remember",
+          %{"category" => "preference", "fact" => "Prefer rebase", "scope" => "global"},
+          opts
+        )
+
+      [entry] = Store.read_learnings(global)
+      assert {:error, message} = Tools.execute("forget", %{"id" => entry.id}, opts)
+      assert message =~ "only be forgotten by the user"
     end
   end
 end
