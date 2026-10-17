@@ -62,12 +62,12 @@ defmodule Athanor.StoreTest do
     end
 
     test "no test path escapes the tmp root", %{tmp_dir: dir} do
-      assert String.starts_with?(Store.session_dir("x", root: dir), Path.expand(dir))
-
-      refute String.contains?(
-               Store.session_dir("x", root: dir),
-               System.user_home!() <> "/.athanor"
-             )
+      # Pin the whole path, do not substring-match the home dir. `~/.athanor/worktrees` is the
+      # *default* worktree root, so a checkout living under it contains "/.athanor" in its own
+      # tmp_dir path and any substring heuristic false-positives there — which is what made this
+      # test red in every default worktree (#40). Exact equality is strictly stronger: a helper
+      # that ignored `root:` and resolved to the real `~/.athanor` still yields a different path.
+      assert Store.session_dir("x", root: dir) == Path.join([Path.expand(dir), "sessions", "x"])
     end
   end
 
