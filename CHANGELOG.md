@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add a `/kill <id>` TUI command that removes a running session (a bare `/kill` lists what is running); only the process dies, so the transcript is kept and `/resume` can still offer it. A mid-turn session needs `--force` (#19)
 
 ### Fixed
+- Test suite is red when run from a default worktree (~/.athanor/worktrees) (#40)
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
 
 ### Changed
