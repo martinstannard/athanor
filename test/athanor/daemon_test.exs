@@ -18,8 +18,10 @@ defmodule Athanor.DaemonTest do
   def restore_env(key, value), do: System.put_env(key, value)
 
   test "attaches subscriber relay, relays deck events, and cleans up relay on client exit" do
-    {:ok, main_id, sessions} =
+    {:ok, main_id, sessions, warnings} =
       Daemon.ensure_main_conductor_and_hydrate(Node.self(), main_id: "conductor-daemon-test")
+
+    assert warnings == []
 
     assert main_id == "conductor-daemon-test"
     assert Enum.any?(sessions, &(&1.id == "conductor-daemon-test"))
@@ -397,7 +399,7 @@ defmodule Athanor.DaemonTest do
 
       # `main_id` is "conductor-main", which does not exist on disk: the resumed Conductor is
       # what the client is handed, proving the call routed through resume (plan M4).
-      assert {:ok, ^id, sessions} =
+      assert {:ok, ^id, sessions, warnings} =
                Daemon.ensure_main_conductor_and_hydrate(Node.self(),
                  main_id: "conductor-main",
                  resume: true,
@@ -406,6 +408,7 @@ defmodule Athanor.DaemonTest do
 
       assert Enum.any?(sessions, &(&1.id == id))
       refute Enum.any?(sessions, &(&1.id == "conductor-main"))
+      assert warnings == []
 
       stop_session(id)
     end
@@ -415,7 +418,7 @@ defmodule Athanor.DaemonTest do
          %{tmp_dir: dir} do
       id = "daemon-resume-fallback"
 
-      assert {:ok, ^id, sessions} =
+      assert {:ok, ^id, sessions, warnings} =
                Daemon.ensure_main_conductor_and_hydrate(Node.self(),
                  main_id: id,
                  resume: true,
@@ -424,7 +427,36 @@ defmodule Athanor.DaemonTest do
 
       assert Enum.any?(sessions, &(&1.id == id))
 
+      # Nothing was on disk, so a fresh conductor was started — and the caller is told, rather than
+      # being left to infer it from an empty deck.
+      assert warnings == [{:fresh_main_conductor, id}]
+
       stop_session(id)
+    end
+
+    @tag :tmp_dir
+    test "ensure_main_conductor_and_hydrate/2 reports a session it could not resume", %{
+      tmp_dir: dir
+    } do
+      id = "daemon-unresumable"
+
+      :ok =
+        Athanor.Store.ensure_session([id: id, role: :worker, title: "Broken", cd: dir], root: dir)
+
+      # Unreadable metadata is exactly what puts a session in resume_all's `skipped` list.
+      File.write!(Athanor.Store.meta_path(id, root: dir), "{ not json")
+
+      assert {:ok, main_id, _sessions, warnings} =
+               Daemon.ensure_main_conductor_and_hydrate(Node.self(),
+                 main_id: "conductor-main",
+                 resume: true,
+                 root: dir
+               )
+
+      assert main_id == "conductor-main"
+      assert Enum.any?(warnings, &match?({:resume_skipped, ^id, _reason}, &1))
+
+      stop_session(main_id)
     end
 
     @tag :tmp_dir

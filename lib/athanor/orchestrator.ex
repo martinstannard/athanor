@@ -682,6 +682,13 @@ defmodule Athanor.Orchestrator do
        when kind in ["user", "assistant", "tool"],
        do: [payload]
 
+  # Every other record kind — `resume`, `clear`, `compaction`, `checkpoint`, `status`, `event` — is
+  # **audit**, not conversation, so it is skipped rather than fatal. This clause used to be missing,
+  # which made `persisted_message/1` raise `FunctionClauseError`; `safe_resume/2` turned that into a
+  # `skipped` entry, so a marker appended by one resume could leave a session **permanently**
+  # un-resumable.
+  defp persisted_message(_record), do: []
+
   defp record_seq(%{"seq" => seq}) when is_integer(seq), do: seq
   defp record_seq(_record), do: 0
 

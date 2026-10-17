@@ -141,8 +141,9 @@ defmodule Mix.Tasks.Athanor.Daemon do
   # actionable message rather than surfacing a raw ErlangError from a remote `:erpc` call.
   defp hydrate(target, opts) do
     case Daemon.ensure_main_conductor_and_hydrate(target, opts) do
-      {:ok, main_id, _sessions} ->
+      {:ok, main_id, _sessions, warnings} ->
         Mix.shell().info("Restarted Athanor daemon at #{target} (main conductor: #{main_id}).")
+        print_warnings(warnings)
 
       other ->
         Mix.raise(
@@ -157,6 +158,20 @@ defmodule Mix.Tasks.Athanor.Daemon do
           Exception.message(error) <>
           "\nStart it in the foreground to see the error: `mix athanor.daemon`"
       )
+  end
+
+  # A `--resume` that silently drops sessions looks identical to one that resumed them all.
+  defp print_warnings(warnings) do
+    Enum.each(warnings, fn
+      {:resume_skipped, id, reason} ->
+        Mix.shell().info("  ! could not resume #{id}: #{inspect(reason)}")
+
+      {:fresh_main_conductor, id} ->
+        Mix.shell().info("  ! no stored session could be resumed — started a fresh #{id}")
+
+      other ->
+        Mix.shell().info("  ! #{inspect(other)}")
+    end)
   end
 
   # Issue #27: `Node.connect/1` cannot tell "nothing there" from "there, wrong cookie", so this
@@ -196,8 +211,9 @@ defmodule Mix.Tasks.Athanor.Daemon do
     case Daemon.start_as_daemon() do
       {:ok, node_name} ->
         Mix.Task.run("app.start")
-        {:ok, main_id, _} = Daemon.ensure_main_conductor_and_hydrate(node_name, opts)
+        {:ok, main_id, _, warnings} = Daemon.ensure_main_conductor_and_hydrate(node_name, opts)
         Mix.shell().info("Athanor daemon running on #{node_name} (main conductor: #{main_id})")
+        print_warnings(warnings)
 
         Mix.shell().info("Attach from any terminal with `mix athanor`. Ctrl+C here stops the daemon.")
 

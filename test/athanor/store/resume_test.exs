@@ -479,8 +479,47 @@ defmodule Athanor.Store.ResumeTest do
 
   # -- helpers ------------------------------------------------------------------
 
-  defp message_role(msg), do: Map.get(msg, :role) || Map.get(msg, "role")
+  @tag :tmp_dir
+  test "a non-message record does not make a session unresumable", %{tmp_dir: dir} do
+    # A transcript gains audit records over time — a `resume` marker appended by an earlier resume,
+    # a `status`, a `clear`. They are not conversation. `persisted_message/1` used to raise on them
+    # (no catch-all), `safe_resume/2` turned that into a skip, and because a resume appends its own
+    # marker, a session could end up *permanently* unresumable.
+    id = "resume-audit-marker"
 
+    :ok =
+      Store.ensure_session([id: id, role: :worker, title: "Audited", cd: dir], root: dir)
+
+    sdir = Store.session_dir(id, root: dir)
+
+    records = [
+      {"user", %{"role" => "user", "content" => "hi"}, 1},
+      {"assistant", %{"role" => "assistant", "content" => "hello", "tool_calls" => []}, 2},
+      {"resume", %{}, 3},
+      {"status", %{"status" => "idle"}, 4}
+    ]
+
+    Enum.each(records, fn {kind, payload, seq} ->
+      assert :ok =
+               Transcript.append(
+                 sdir,
+                 Transcript.new_record(kind, payload, seq: seq, session_id: id)
+               )
+    end)
+
+    assert {:ok, ids, skipped} = Orchestrator.resume_all(root: dir)
+    assert id in ids
+    refute Enum.any?(skipped, &(&1.id == id))
+
+    {:ok, pid} = Orchestrator.lookup(id)
+
+    assert Enum.map(Agent.get_state(pid).messages, &message_role/1) ==
+             ["system", "user", "assistant"]
+
+    cleanup([id])
+  end
+
+  defp message_role(msg), do: Map.get(msg, :role) || Map.get(msg, "role")
   defp canonical_one(message), do: message |> JSON.encode!() |> JSON.decode!()
 
   defp strip_system(messages), do: Enum.reject(messages, &(&1["role"] == "system"))

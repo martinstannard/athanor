@@ -437,12 +437,12 @@ defmodule Athanor.Daemon do
   always usable.
   """
   @spec ensure_main_conductor_and_hydrate(node(), keyword()) ::
-          {:ok, String.t(), [map()]} | {:error, term()}
+          {:ok, String.t(), [map()], [term()]} | {:error, term()}
   def ensure_main_conductor_and_hydrate(target_node \\ Node.self(), opts \\ []) do
     main_id = Keyword.get(opts, :main_id, "conductor-main")
 
-    with {:ok, main_id} <- resolve_main_conductor(target_node, main_id, opts) do
-      {:ok, main_id, fetch_full_sessions(target_node)}
+    with {:ok, main_id, warnings} <- resolve_main_conductor(target_node, main_id, opts) do
+      {:ok, main_id, fetch_full_sessions(target_node), warnings}
     end
   end
 
@@ -455,11 +455,21 @@ defmodule Athanor.Daemon do
     end
   end
 
+  # Every arm reports `warnings` — what the caller could not get — because a resume that quietly
+  # drops sessions is indistinguishable from one that resumed everything.
   defp resolve_main_conductor(target_node, main_id, opts) do
     case resume_request(opts) do
-      nil -> {:ok, ensure_fresh_conductor(target_node, main_id, opts)}
-      :all -> resume_all_requested(target_node, main_id, opts)
-      {:session, id} -> resume_session_requested(target_node, id)
+      nil ->
+        {:ok, ensure_fresh_conductor(target_node, main_id, opts), []}
+
+      :all ->
+        resume_all_requested(target_node, main_id, opts)
+
+      {:session, id} ->
+        case resume_session_requested(target_node, id) do
+          {:ok, id} -> {:ok, id, []}
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
 
@@ -479,13 +489,25 @@ defmodule Athanor.Daemon do
   defp put_model(opts, nil), do: opts
   defp put_model(opts, model), do: Keyword.put(opts, :model, model)
 
+  # `skipped` is a list of `%{id: id, reason: reason}`: sessions whose metadata would not load, and
+  # sessions whose rehydration failed. It is **reported**, never swallowed — dropping a session
+  # without saying so looks exactly like a successful resume.
   defp resume_all_requested(target_node, main_id, opts) do
-    {:ok, ids, _skipped} = resume_all(target_node, store_opts(opts))
+    {:ok, ids, skipped} = resume_all(target_node, store_opts(opts))
 
     case resumed_main_id(ids, main_id) do
-      nil -> {:ok, ensure_fresh_conductor(target_node, main_id, opts)}
-      id -> {:ok, id}
+      nil ->
+        {:ok, ensure_fresh_conductor(target_node, main_id, opts),
+         resume_warnings(skipped, {:fresh_main_conductor, main_id})}
+
+      id ->
+        {:ok, id, resume_warnings(skipped, nil)}
     end
+  end
+
+  defp resume_warnings(skipped, extra) do
+    Enum.map(skipped, fn %{id: id, reason: reason} -> {:resume_skipped, id, reason} end) ++
+      List.wrap(extra)
   end
 
   # A session that is already live is *already* resumed — attaching to it is the whole point of

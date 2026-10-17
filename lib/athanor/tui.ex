@@ -341,7 +341,7 @@ defmodule Athanor.TUI do
     # asks for the Conductor it should show and receives its rehydrated history in one round trip
     # (plan §6.3/§6.4). A failed resume degrades to a fresh Conductor with a banner rather than a
     # `MatchError` in the middle of starting the terminal.
-    {main_id, hydrated_sessions, resume_error} = start_sessions(target_node, model, opts)
+    {main_id, hydrated_sessions, resume_warnings} = start_sessions(target_node, model, opts)
 
     term =
       Terminal.start()
@@ -372,10 +372,9 @@ defmodule Athanor.TUI do
     enable_node_monitoring(target_node, mode)
 
     tui =
-      case resume_error do
-        nil -> tui
-        reason -> add_system(tui, resume_error_banner(reason))
-      end
+      Enum.reduce(resume_warnings, tui, fn warning, tui ->
+        add_system(tui, resume_error_banner(warning))
+      end)
 
     try do
       loop(term, tui)
@@ -2009,18 +2008,29 @@ defmodule Athanor.TUI do
     ]
 
     case Daemon.ensure_main_conductor_and_hydrate(target_node, resume_opts) do
-      {:ok, main_id, sessions} ->
-        {main_id, sessions, nil}
+      {:ok, main_id, sessions, warnings} ->
+        {main_id, sessions, warnings}
 
       {:error, reason} ->
-        {:ok, main_id, sessions} =
+        {:ok, main_id, sessions, _warnings} =
           Daemon.ensure_main_conductor_and_hydrate(target_node,
             main_id: "conductor-main",
             model: model
           )
 
-        {main_id, sessions, reason}
+        {main_id, sessions, [reason]}
     end
+  end
+
+  # A resume that drops sessions must say so: "resumed everything" and "resumed what it could" are
+  # otherwise the same screen.
+  defp resume_error_banner({:resume_skipped, id, reason}) do
+    "Could not resume #{id} (#{inspect(reason)}) — it is not on the deck. /resume lists what is " <>
+      "resumable; the rest were restored."
+  end
+
+  defp resume_error_banner({:fresh_main_conductor, id}) do
+    "No stored session could be resumed — started a fresh #{id} instead."
   end
 
   defp resume_error_banner({:resume_failed, id, reason}) do
