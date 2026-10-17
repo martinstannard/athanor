@@ -75,8 +75,7 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 | `Mix.Tasks.Athanor` | Mix task | `mix athanor` — connect to the daemon and start the TUI. |
 | `Mix.Tasks.Athanor.Daemon` | Mix task | `mix athanor.daemon` — run / `--status` / `--stop` / `--restart` the daemon node. |
 
-`lib/athanor.ex` is still the generated placeholder module (`Athanor.hello/0`, doctested) and carries
-no runtime behaviour.
+There is no top-level `Athanor` module: the generated placeholder (`lib/athanor.ex` with `Athanor.hello/0`) was removed, and the application module is `Athanor.Application`.
 
 ---
 
@@ -516,4 +515,5 @@ These cannot be answered from the code alone and are flagged rather than guessed
 3. **~~`mix athanor --local`.~~ _Resolved (design §8.3)._** It is a **supported single-process
    mode** — no daemon, no multi-client mirroring, no detach-safety — intended for CI, one-shot runs
    and agent-loop debugging, and never the default.
-4. **Placeholder module.** `Athanor.hello/0` still exists (and is doctested). Keep or remove?
+4. **~~Placeholder module.~~ _Resolved (2026-10-17)._** `lib/athanor.ex` and its `Athanor.hello/0`
+   placeholder (with its doctest) have been **removed**; there is no top-level `Athanor` module.
