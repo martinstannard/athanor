@@ -169,9 +169,11 @@ Assistant output is rendered through `Athanor.Markdown`, so headings, lists, cod
 
 ## 7. Future Plans
 
-> **Status legend (verified against `lib/` at commit `ce4efea`):** §7.3, §7.5 and §7.8
+> **Status legend (verified against `lib/` at commit `ce4efea`):** §7.3 and §7.8
 > are **planned, not implemented** — no supporting module
-> exists in `lib/`. **§7.1 is implemented** (`Athanor.Worktree`, `Athanor.Worktree.Server`,
+> exists in `lib/`. **§7.5 is implemented** (`Athanor.Memory` plus its `Entry`/`Store`/`Redact`/
+> `Merge`/`Injector`/`Retrieval` sub-modules, the `remember`/`recall`/`forget` tools, and
+> session-start injection). **§7.1 is implemented** (`Athanor.Worktree`, `Athanor.Worktree.Server`,
 > `Athanor.Git`). **§7.2 is implemented** (`Athanor.Goal`, `Athanor.Verifier`,
 > `Athanor.GoalManager` plus conductor `set_goal` / `verify_goal` / `goal_status` /
 > `list_goals` and worker `report_progress`). **§7.4 is implemented ("Resume v1")**: `Athanor.Store` plus its seven
@@ -252,8 +254,23 @@ To ensure Athanor can restart cleanly without losing in-progress work or re-lear
   - When a long-running Conductor approaches its token limit, Athanor compacts older `transcript.jsonl` turns into `HANDOFF.md` while keeping recent turns intact.
   - The check runs **before** a request goes out, never after it returns (#28): a request that is too large *fails*, so a post-turn trigger could never fire on the history that needed it. A session already over budget — including one just resumed, and one sitting in `:error` — is therefore trimmed by its next prompt instead of staying permanently wedged. Resuming rebuilds the live set from the transcript's last `kind: "compaction"` marker rather than replaying the whole log.
 
-### 7.5 Hierarchical Memory System (`Athanor.Memory`) — *planned*
-> Implementation plan: `docs/plans/7.5-hierarchical-memory.md` (status: proposed, not implemented).
+### 7.5 Hierarchical Memory System (`Athanor.Memory`) — *implemented*
+> Implementation plan: `docs/plans/7.5-hierarchical-memory.md` (implemented, M1–M5).
+
+> **Implemented subset** — modules: `Athanor.Memory` (facade: `resolve/1`,
+> `system_prompt_section/1`, `remember/2`, `recall/2`, `forget/2`, `distill/2`, `bullet_id/1`),
+> `Athanor.Memory.{Entry,Store,Redact,Merge,Injector,Retrieval}`. Layout: `<workspace>/.athanor/`
+> (project tier, `<workspace>` found by ascending for `.athanor/`/`.git/`, following a linked
+> worktree's `.git` pointer back to the main repo) and `~/.athanor/memory/` (global tier). Each
+> tier holds a curated `MEMORY.md` (auto-injected) and an append-only `learnings.jsonl` (recall
+> only). Injection is one block appended in `Athanor.Agent`'s `compose_system_prompt/3`, after the
+> role prompt and the project context; the global tier is header-only unless
+> `ATHANOR_MEMORY_GLOBAL_INJECT` is set. Tools `remember`/`recall`/`forget` go to **both** roles.
+> Redaction runs on write and on injection; files are `0600`, tier dirs `0700`;
+> `mix athanor.memory compact` rewrites the log without tombstones.
+> **Deferred:** session scope is not persisted (the schema offers `project`/`global`); no
+> embeddings (keyword scoring only); recall does not search §7.4 transcripts; no `learnings.jsonl`
+> auto-compaction trigger (the mix task is manual).
 A layered memory system so Conductors and Sub-Agents accumulate durable knowledge across sessions without polluting every prompt:
 1. **Workspace / Project Memory (`.athanor/MEMORY.md` & `.athanor/learnings.jsonl`)**:
    - Project-specific facts, architecture notes, recurring gotchas, and user preferences ("how we do things in this repo").

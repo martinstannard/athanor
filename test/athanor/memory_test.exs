@@ -10,6 +10,7 @@ defmodule Athanor.MemoryTest do
   alias Athanor.Memory.Injector
   alias Athanor.Memory.Merge
   alias Athanor.Memory.Redact
+  alias Athanor.Memory.Store
 
   @moduletag :tmp_dir
 
@@ -209,6 +210,42 @@ defmodule Athanor.MemoryTest do
       resolved = Memory.resolve(cd: dir, global_dir: Path.join(dir, "ghome"))
       assert resolved.workspace_root == nil
       assert resolved.project_dir == nil
+    end
+  end
+
+  describe "Memory.distill/2 (§7.5 M4)" do
+    test "records learnings and projects only curated categories into MEMORY.md", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, ".athanor"))
+
+      entries = [
+        %{"category" => "gotcha", "fact" => "A durable gotcha"},
+        %{"category" => "fact", "fact" => "An incidental fact"}
+      ]
+
+      assert {:ok, summary} = Memory.distill(entries, cd: dir)
+      assert summary =~ "Distilled 2"
+
+      memory = Store.read_memory(Path.join(dir, ".athanor"))
+      assert memory =~ "- A durable gotcha"
+      refute memory =~ "An incidental fact"
+    end
+
+    test "is idempotent across runs", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, ".athanor"))
+      entries = [%{"category" => "gotcha", "fact" => "A durable gotcha"}]
+
+      assert {:ok, _first} = Memory.distill(entries, cd: dir)
+      assert {:ok, second} = Memory.distill(entries, cd: dir)
+      assert second =~ "already known"
+
+      memory = Store.read_memory(Path.join(dir, ".athanor"))
+      assert length(String.split(memory, "- A durable gotcha")) == 2
+    end
+
+    test "surfaces a failure rather than reporting success", %{tmp_dir: dir} do
+      # No .git/.athanor above the directory: there is nowhere to persist a project learning.
+      assert {:error, message} = Memory.distill([%{"category" => "fact", "fact" => "x"}], cd: dir)
+      assert message =~ "workspace"
     end
   end
 

@@ -72,8 +72,11 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 | `Athanor.Store.{Session,Transcript,Schema,Tokens}` | modules | Pure formats and helpers: `meta.json` struct/schema, append-only JSONL transcript, version/migration dispatch, token estimation. |
 | `Athanor.Store.{Handoff,Compactor}` | modules | Pure rolling-summary render/write/parse, and the C5-safe compaction policy (user-boundary cut + hysteresis). |
 | `Athanor.Store.Recorder` | `GenServer` | The single writer of `~/.athanor/sessions/**`: subscribes `"deck:events"` and persists messages, status, errors and compactions. |
+| `Athanor.Memory` | module | Hierarchical memory facade (design §7.5): resolves the project/global tiers for a session's `cd`, builds the injected prompt section, and backs the `remember`/`recall`/`forget` tools (`distill/2` batches them for conductors). |
+| `Athanor.Memory.{Entry,Store,Redact,Merge,Injector,Retrieval}` | modules | Pure data + file IO: the record and its dedup hash, `.athanor`/`~/.athanor/memory` read/write with workspace-root discovery (worktree-aware), secret scrubbing, §4.2 precedence, the budgeted prompt block, and keyword ranking. |
 | `Mix.Tasks.Athanor` | Mix task | `mix athanor` — connect to the daemon and start the TUI. |
 | `Mix.Tasks.Athanor.Daemon` | Mix task | `mix athanor.daemon` — run / `--status` / `--stop` / `--restart` the daemon node. |
+| `Mix.Tasks.Athanor.Memory` | Mix task | `mix athanor.memory compact` — rewrite `learnings.jsonl` without tombstones (the only housekeeping verb). |
 
 There is no top-level `Athanor` module: the generated placeholder (`lib/athanor.ex` with `Athanor.hello/0`) was removed, and the application module is `Athanor.Application`.
 
@@ -495,7 +498,7 @@ supporting module exists in `lib/`:
 | 7.2 | Goal-driven autonomy (`Athanor.Goal` / `Verifier` / `GoalManager`) | **Implemented (M1–M6)** — plan at `docs/plans/7.2-goal-driven-autonomy.md`; conductor `set_goal` / `verify_goal` / `goal_status` / `list_goals`, worker `report_progress`. |
 | 7.3 | Watchers / external channels (`Athanor.Watcher`) | Not implemented. |
 | 7.4 | Session history, resume & compaction (`Athanor.Store`) | **Implemented ("Resume v1")** — see §12. Deferred: transcript rotation, provider-`usage`-based token accounting, live migration between nodes, LLM-written `HANDOFF.md` summaries. |
-| 7.5 | Hierarchical memory (`Athanor.Memory`) | Not implemented. No `remember`/`recall` tools. |
+| 7.5 | Hierarchical memory (`Athanor.Memory`) | **Implemented (M1–M5)** — project/global tiers, session-start injection, `remember`/`recall`/`forget` tools, conductor-driven distillation, `mix athanor.memory compact`. Deferred: session scope persistence, embeddings, transcript recall. |
 | 7.6 | `glob`/`grep`, tool guard, MCP client (`Athanor.MCP`) | Not implemented. Tool set is exactly the eight tools in §3. |
 | 7.7 | Persistent daemon & remote attach (`Athanor.Daemon`) | **Partly implemented** — see §9. Not implemented: systemd/auto-install, an `:ssh.daemon/2` subsystem, a standalone `athanor attach` binary; the node name is `athanor_daemon@127.0.0.1` (settled — design §8.4). |
 | 7.8 | Multi-host distributed BEAM clustering | Not implemented. `Athanor.Bus` is a single-node `Registry`; `Athanor.Daemon` connects two nodes but supervises nothing remotely. |

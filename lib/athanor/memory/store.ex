@@ -91,7 +91,11 @@ defmodule Athanor.Memory.Store do
   @spec append_learning(String.t(), Entry.t()) :: :ok | {:error, term()}
   def append_learning(dir, %Entry{} = entry) do
     with :ok <- ensure_dir(dir) do
-      File.write(learnings_path(dir), Entry.to_json(entry) <> "\n", [:append])
+      path = learnings_path(dir)
+
+      with :ok <- File.write(path, Entry.to_json(entry) <> "\n", [:append]) do
+        secure(path)
+      end
     end
   end
 
@@ -114,8 +118,10 @@ defmodule Athanor.Memory.Store do
   @spec upsert_bullet(String.t(), String.t(), String.t()) :: :ok
   def upsert_bullet(dir, section, text) do
     :ok = ensure_dir(dir)
+    path = memory_path(dir)
     content = read_memory(dir) || "# Project Memory\n"
-    File.write!(memory_path(dir), put_bullet(content, section, String.trim(text)))
+    File.write!(path, put_bullet(content, section, String.trim(text)))
+    secure(path)
     :ok
   end
 
@@ -130,7 +136,41 @@ defmodule Athanor.Memory.Store do
     with :ok <- ensure_dir(dir) do
       at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
       line = JSON.encode!(%{"op" => "forget", "id" => id, "at" => at})
-      File.write(learnings_path(dir), line <> "\n", [:append])
+      path = learnings_path(dir)
+
+      with :ok <- File.write(path, line <> "\n", [:append]) do
+        secure(path)
+      end
+    end
+  end
+
+  @doc """
+  Rewrites a tier's `learnings.jsonl` without forgotten or deprecated entries (plan §8.3, OQ7).
+
+  The log is append-only, so a deletion is a tombstone and the file only ever grows. Compaction is
+  an **explicit** housekeeping step (`mix athanor.memory compact`), never something that happens
+  behind a running session. Returns the number of lines dropped.
+  """
+  @spec compact(String.t()) :: {:ok, non_neg_integer()}
+  def compact(dir) do
+    path = learnings_path(dir)
+
+    case File.read(path) do
+      {:error, _reason} ->
+        {:ok, 0}
+
+      {:ok, content} ->
+        lines = String.split(content, "\n", trim: true)
+        {entries, forgotten} = Enum.reduce(lines, {[], MapSet.new()}, &collect/2)
+
+        kept =
+          entries
+          |> Enum.reverse()
+          |> Enum.reject(&(&1.deprecated or MapSet.member?(forgotten, &1.id)))
+
+        File.write!(path, Enum.map_join(kept, "", &(Entry.to_json(&1) <> "\n")))
+        secure(path)
+        {:ok, length(lines) - length(kept)}
     end
   end
 
@@ -157,9 +197,18 @@ defmodule Athanor.Memory.Store do
           |> Enum.reject(&(String.trim(&1) == "- " <> text))
           |> Enum.join("\n")
 
-        File.write!(memory_path(dir), cleaned)
+        path = memory_path(dir)
+        File.write!(path, cleaned)
+        secure(path)
         :ok
     end
+  end
+
+  # Memory may hold project secrets that redaction missed. Files are 0600, the tier directory
+  # 0700 (`ensure_dir/1`) — defence in depth, on top of `Redact` (plan §9.1).
+  defp secure(path) do
+    _ = File.chmod(path, 0o600)
+    :ok
   end
 
   @doc "Creates a tier directory (and parents) with mode `0700`."

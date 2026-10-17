@@ -35,3 +35,7 @@ athanor-*.tar
 
 # Local handover notes: deliberately kept out of git (machine paths, PIDs, daemon internals).
 /docs/handover.md
+
+# §7.5 memory. `MEMORY.md` is curated, redacted, team-valuable knowledge — commit it. The
+# append-only `learnings.jsonl` is unbounded machine-written detail, so it stays local.
+/.athanor/learnings.jsonl

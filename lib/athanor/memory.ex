@@ -114,6 +114,32 @@ defmodule Athanor.Memory do
   end
 
   @doc """
+  Records a batch of learnings ("distillation", design §7.5 #4).
+
+  The conductor drives this after a `[DONE]`: it has the synthesis view, so it decides what is
+  policy rather than noise. Each candidate goes through the same dedup, redaction and projection
+  path as `remember/2` — distillation is not a second write path with its own rules, and it never
+  runs unattended (plan D9).
+
+  `entries` is a list of `%{"category" => …, "fact" => …}` maps (optionally `"scope"`/`"tags"`).
+  Returns a one-line summary.
+  """
+  @spec distill([map()], keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  def distill(entries, opts \\ []) when is_list(entries) do
+    results = Enum.map(entries, &remember(&1, opts))
+    errors = Enum.filter(results, &match?({:error, _}, &1))
+
+    case errors do
+      [] ->
+        {remembered, known} = Enum.split_with(results, fn {:ok, text} -> text =~ "Remembered" end)
+        {:ok, "Distilled #{length(remembered)} learning(s); #{length(known)} already known."}
+
+      [{:error, reason} | _rest] ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
   Searches durable learnings ("`recall`").
 
   `args`: `query` is required; `scope` is `project` (default), `global`, or `all`; `limit`

@@ -12,6 +12,11 @@ defmodule Athanor.MemoryStoreTest do
 
   defp entry(attrs), do: Entry.new(attrs)
 
+  defp mode(path) do
+    {:ok, %File.Stat{mode: mode}} = File.stat(path)
+    Bitwise.band(mode, 0o777)
+  end
+
   describe "learnings.jsonl" do
     test "append then read round-trips through JSON", %{tmp_dir: dir} do
       assert :ok =
@@ -174,6 +179,38 @@ defmodule Athanor.MemoryStoreTest do
       assert File.dir?(target)
       assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
       assert Bitwise.band(mode, 0o777) == 0o700
+    end
+
+    test "written files are 0600 (§9.1)", %{tmp_dir: dir} do
+      :ok = Store.append_learning(dir, entry(%{scope: :project, category: :fact, text: "x"}))
+      :ok = Store.upsert_bullet(dir, "Facts", "y")
+
+      assert mode(Path.join(dir, "learnings.jsonl")) == 0o600
+      assert mode(Path.join(dir, "MEMORY.md")) == 0o600
+    end
+  end
+
+  describe "compaction (plan §8.3, OQ7)" do
+    test "rewrites the log without tombstoned or deprecated entries", %{tmp_dir: dir} do
+      keep = entry(%{scope: :project, category: :fact, text: "keep me"})
+      drop = entry(%{scope: :project, category: :fact, text: "forget me"})
+      :ok = Store.append_learning(dir, keep)
+      :ok = Store.append_learning(dir, drop)
+      :ok = Store.append_tombstone(dir, drop.id)
+
+      assert {:ok, removed} = Store.compact(dir)
+      assert removed == 2
+
+      assert [%Entry{text: "keep me"}] = Store.read_learnings(dir)
+
+      lines =
+        dir |> Path.join("learnings.jsonl") |> File.read!() |> String.split("\n", trim: true)
+
+      assert length(lines) == 1
+    end
+
+    test "compacting an absent log is a no-op", %{tmp_dir: dir} do
+      assert {:ok, 0} = Store.compact(dir)
     end
   end
 end

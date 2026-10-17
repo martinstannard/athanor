@@ -109,6 +109,10 @@ defmodule Athanor.Agent do
   `session_output`, and `send_session`.
   When a background sub-agent finishes, you will automatically receive a
   `[DONE] Sub-agent ...` notification message.
+  When a `[DONE]` arrives, record what generalises: if the sub-agent found a non-obvious root
+  cause, a codebase convention, or a gotcha a future session would otherwise rediscover, call
+  `remember(category, fact)` once per durable learning. Record the durable truth, not the
+  transient task detail, and do not record anything that is already in the workspace `MEMORY.md`.
   """
 
   @default_worker_prompt """

@@ -1375,5 +1375,10 @@ defmodule Athanor.AgentTest do
       sys = capture_system_prompt(tmp_dir, memory: false)
       refute sys =~ "Use tagged tuples"
     end
+
+    test "the conductor prompt tells it to remember durable learnings on [DONE]", %{tmp_dir: tmp_dir} do
+      sys = capture_system_prompt(tmp_dir)
+      assert sys =~ "remember(category, fact)"
+    end
   end
 end
