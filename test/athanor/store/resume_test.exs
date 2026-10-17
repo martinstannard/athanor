@@ -104,8 +104,22 @@ defmodule Athanor.Store.ResumeTest do
     # messages are atom-keyed (built by `Athanor.LLM.finalize_message/1`/the fake `llm_fn`),
     # the resumed ones string-keyed (they came back through JSON), so both sides are put through
     # one canonical JSON round trip before comparison.
-    assert canonical(resumed_conductor) == canonical(conductor_messages)
-    assert canonical(resumed_worker) == canonical(worker_messages)
+    # The system message is deliberately **rebuilt** on resume (see the `initial_messages/2` comment
+    # in `Athanor.Agent`: "the system message is never persisted … if the default prompt changed,
+    # the new one wins"). It therefore legitimately carries session-start context that is not part
+    # of the history: the workspace's `AGENTS.md`, and — since §7.5 — the project's memory block
+    # when the workspace has a `.athanor/MEMORY.md`. Asserting byte-equality on it makes this test
+    # depend on ambient repository state (e.g. memory the running daemon has captured), which is not
+    # what "restores the exact conversation history" means. History is asserted exactly; the prompt
+    # structurally.
+    assert strip_system(canonical(resumed_conductor)) ==
+             strip_system(canonical(conductor_messages))
+
+    assert [%{"role" => "system", "content" => content}] =
+             Enum.filter(canonical(resumed_conductor), &(&1["role"] == "system"))
+
+    assert content =~ "You are an Athanor Conductor"
+    assert strip_system(canonical(resumed_worker)) == strip_system(canonical(worker_messages))
 
     # Checked independently of the whole-list comparison: the tool-call identity survives
     # verbatim.
@@ -468,6 +482,8 @@ defmodule Athanor.Store.ResumeTest do
   defp message_role(msg), do: Map.get(msg, :role) || Map.get(msg, "role")
 
   defp canonical_one(message), do: message |> JSON.encode!() |> JSON.decode!()
+
+  defp strip_system(messages), do: Enum.reject(messages, &(&1["role"] == "system"))
 
   # One canonical (string-keyed) form for both atom-keyed live messages and string-keyed
   # rehydrated ones, so `==` compares values, order and tool-call structure exactly.
