@@ -671,6 +671,22 @@ defmodule Athanor.TUITest do
   # are counted by that escape — splitting the frame on `"\n"` would count zero.
   defp drawn_rows(frame), do: length(:binary.matches(frame, "\e[2K"))
 
+  # Type `text` and return the input state, without submitting it — the `handle_key/2` path a
+  # terminal drives, reused so a `/`-verb test exercises parsing rather than calling the dispatcher
+  # directly.
+  defp typed(tui, text), do: tui |> TUI.handle_key(text) |> elem(1)
+
+  # The frame's rendered rows, with the cursor-move/erase-line framing and SGR sequences removed, so a
+  # test can assert on what a *user* would see — width, wrapping, and which lines are on screen.
+  defp frame_rows(frame) do
+    frame
+    |> String.split("\e[2K")
+    |> Enum.drop(1)
+    |> Enum.map(&strip_ansi/1)
+  end
+
+  defp strip_ansi(text), do: Regex.replace(~r/\e\[[0-9;]*[A-Za-z]/, text, "")
+
   defp delete(tui, 0), do: tui
 
   defp delete(tui, n) do
@@ -1015,6 +1031,232 @@ defmodule Athanor.TUITest do
       assert TUI.render_frame(%{tui | width: 120}) =~ "ctx: 10%"
       # The bar is longer than 80 columns by design; the gauges come first so they survive.
       assert TUI.render_frame(%{tui | width: 80}) =~ "ctx: 10%"
+    end
+  end
+
+  describe "thinking / reasoning rendering (#53)" do
+    test "a reasoning turn renders a collapsed, labelled block distinct from Athanor:" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event({:status, :streaming})
+        |> TUI.handle_agent_event({:thinking_delta, "We need answer"})
+        |> TUI.handle_agent_event({:thinking_delta, " the user."})
+        |> TUI.handle_agent_event({:text_delta, "There are 3 r's."})
+
+      frame = TUI.render_frame(tui)
+
+      # Labelled and visually distinct: its own glyph and header, never `Athanor:`.
+      assert frame =~ "Thinking"
+      assert frame =~ "Ctrl+T expand"
+      # Collapsed by default: the body is not rendered, only the header.
+      refute frame =~ "We need answer"
+      # The assistant text is untouched by the reasoning stream.
+      assert frame =~ "There are 3 r's."
+
+      done = TUI.handle_agent_event(tui, {:turn_complete, "There are 3 r's."})
+      done_frame = TUI.render_frame(done)
+
+      # A frozen block is still collapsed, and the header reports the size.
+      assert done_frame =~ "Thinking"
+      assert done_frame =~ "24 chars"
+      refute done_frame =~ "We need answer"
+    end
+
+    test "the thinking stream never lands in the assistant entry or its buffer" do
+      tui =
+        TUI.new()
+        |> TUI.handle_agent_event({:thinking_delta, "SECRET-REASONING"})
+        |> TUI.handle_agent_event({:text_delta, "public answer"})
+
+      session = tui.sessions[tui.active_id]
+
+      # Two buffers, not one: this is the "do not concatenate a second interleaved stream" rule.
+      assert session.streaming_buffer == "public answer"
+      assert session.thinking_buffer == "SECRET-REASONING"
+
+      done = TUI.handle_agent_event(tui, {:turn_complete, "public answer"})
+      entries = done.sessions[done.active_id].entries
+
+      assert Enum.any?(entries, &match?({:thinking, "SECRET-REASONING", _}, &1))
+      # The *assistant* entry contains exactly the model's answer, never the reasoning.
+      assert Enum.any?(entries, &match?({:assistant, "public answer"}, &1))
+      refute Enum.any?(entries, &match?({:assistant, "SECRET-REASONING" <> _}, &1))
+    end
+
+    test "Ctrl+T expands the most recent thinking block, and collapses it again" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event({:thinking_delta, "weighing the options"})
+        |> TUI.handle_agent_event({:turn_complete, "done"})
+
+      refute TUI.render_frame(tui) =~ "weighing the options"
+
+      {:cont, expanded} = TUI.handle_key(tui, <<20>>)
+      frame = TUI.render_frame(expanded)
+      assert frame =~ "weighing the options"
+      assert frame =~ "Ctrl+T collapse"
+
+      {:cont, collapsed} = TUI.handle_key(expanded, <<20>>)
+      refute TUI.render_frame(collapsed) =~ "weighing the options"
+    end
+
+    test "Ctrl+T works while streaming and toggles the live block" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event({:status, :streaming})
+        |> TUI.handle_agent_event({:thinking_delta, "live reasoning"})
+
+      # Collapsed header only while streaming.
+      refute TUI.render_frame(tui) =~ "live reasoning"
+
+      {:cont, expanded} = TUI.handle_key(tui, <<20>>)
+      assert TUI.render_frame(expanded) =~ "live reasoning"
+
+      # The live flag survives the block being frozen at turn end.
+      done = TUI.handle_agent_event(expanded, {:turn_complete, ""})
+      assert TUI.render_frame(done) =~ "live reasoning"
+    end
+
+    test "Ctrl+T on a session with no thinking is a no-op" do
+      tui = TUI.new()
+      assert {:cont, same} = TUI.handle_key(tui, <<20>>)
+      assert same.sessions == tui.sessions
+    end
+
+    test "Ctrl+T is a control char, so printable keys stay input text" do
+      # The reason the key is Ctrl+T and not a letter: every printable key is prompt text.
+      tui = TUI.new()
+      {:cont, typed} = TUI.handle_key(tui, "t")
+      assert typed.input == "t"
+
+      {:cont, ctrl_t} = TUI.handle_key(tui, <<20>>)
+      assert ctrl_t.input == ""
+    end
+
+    test "a Ctrl+T byte inside a bracketed paste is body text, not a key" do
+      # Issue #34's rule, which #53 must not break: a paste in flight is literal bytes.
+      tui = TUI.new()
+      {:cont, tui} = TUI.handle_key(tui, "\e[200~a\x14b\e[201~")
+      assert tui.input == "a" <> <<20>> <> "b"
+    end
+
+    test "/thinking expands every block, and /thinking off collapses them" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event({:thinking_delta, "first block"})
+        |> TUI.handle_agent_event({:turn_complete, "one"})
+        |> TUI.handle_agent_event({:thinking_delta, "second block"})
+        |> TUI.handle_agent_event({:turn_complete, "two"})
+
+      refute TUI.render_frame(tui) =~ "first block"
+
+      # Both verbs parse through `handle_key/2` (the seam a terminal drives), and the input line is
+      # cleared so a stray newline cannot submit the command as a prompt.
+      assert {:thinking, true, on_input} = TUI.handle_key(typed(tui, "/thinking"), "\r")
+      assert on_input.input == ""
+
+      on = TUI.dispatch_command(Node.self(), {:thinking, true, on_input})
+      assert TUI.thinking_override(on) == true
+      frame = TUI.render_frame(on)
+      assert frame =~ "first block"
+      assert frame =~ "second block"
+
+      assert {:thinking, false, off_input} = TUI.handle_key(typed(on, "/thinking off"), "\r")
+      off = TUI.dispatch_command(Node.self(), {:thinking, false, off_input})
+      assert TUI.thinking_override(off) == false
+      off_frame = TUI.render_frame(off)
+      refute off_frame =~ "first block"
+      # Collapsed is a visible one-line header, never invisible.
+      assert off_frame =~ "Thinking"
+    end
+
+    test "an unknown /thinking-ish verb stays an ordinary prompt" do
+      assert {:submit, "/thinkingx", _} = TUI.handle_key(typed(TUI.new(), "/thinkingx"), "\r")
+    end
+
+    test "the per-block flag survives a global cycle — the override does not rewrite it" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event({:thinking_delta, "per block"})
+        |> TUI.handle_agent_event({:turn_complete, "answer"})
+
+      # Opened per-block with Ctrl+T.
+      {:cont, per_block} = TUI.handle_key(tui, <<20>>)
+      assert TUI.render_frame(per_block) =~ "per block"
+
+      # The override forces it open and closed while it is set…
+      assert TUI.render_frame(TUI.set_thinking_expanded(per_block, true)) =~ "per block"
+      refute TUI.render_frame(TUI.set_thinking_expanded(per_block, false)) =~ "per block"
+
+      # …and clearing the override restores the block's *own* flag rather than flattening it, which is
+      # the whole reason the setting is tri-state.
+      cleared = TUI.set_thinking_expanded(per_block, nil)
+      assert TUI.thinking_override(cleared) == nil
+      assert TUI.render_frame(cleared) =~ "per block"
+    end
+
+    test "Ctrl+T still visibly changes a block while a global override is active" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event({:thinking_delta, "override interactive"})
+        |> TUI.handle_agent_event({:turn_complete, "answer"})
+
+      expanded_everywhere = TUI.set_thinking_expanded(tui, true)
+      assert TUI.render_frame(expanded_everywhere) =~ "override interactive"
+
+      # A key that renders the same frame back would be indistinguishable from a dead key: Ctrl+T
+      # must collapse what is *displayed*, so it clears the override as it flips the block.
+      {:cont, toggled} = TUI.handle_key(expanded_everywhere, <<20>>)
+      refute TUI.render_frame(toggled) =~ "override interactive"
+      assert TUI.thinking_override(toggled) == nil
+    end
+
+    test "an expanded block wraps to the viewport width and stays inside it" do
+      # 60 repetitions of "word " is 300 characters — far wider than the 80-column viewport, so an
+      # unwrapped body would either be clipped by the terminal or push the frame's rows around.
+      long = String.duplicate("word ", 60)
+
+      tui =
+        TUI.new(width: 80, height: 40)
+        |> TUI.handle_agent_event({:thinking_delta, long})
+        |> TUI.handle_agent_event({:turn_complete, ""})
+
+      {:cont, expanded} = TUI.handle_key(tui, <<20>>)
+      rows = frame_rows(TUI.render_frame(expanded))
+
+      body_rows = Enum.filter(rows, &String.contains?(&1, "word"))
+
+      # Wrapped onto several rows, not emitted as one enormous line…
+      assert length(body_rows) > 1
+      # …and no single rendered row exceeds the frame width.
+      assert Enum.all?(rows, &(String.length(&1) <= 80))
+      # The full body is present — wrapping must not silently drop the tail.
+      assert Enum.join(body_rows) =~ "word word"
+      assert Enum.count(body_rows, &String.contains?(&1, "word")) >= 4
+    end
+
+    test "thinking is dropped by /clear along with the rest of the transcript" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.handle_agent_event({:thinking_delta, "reasoning to forget"})
+        |> TUI.handle_agent_event({:turn_complete, "answer"})
+
+      cleared = TUI.handle_agent_event(tui, {:context_cleared, %{}})
+
+      refute TUI.render_frame(cleared) =~ "reasoning to forget"
+      assert cleared.sessions[cleared.active_id].thinking_buffer == nil
+    end
+
+    test "a resumed session carries no thinking (it is not persisted)" do
+      tui =
+        TUI.new(width: 100, height: 24)
+        |> TUI.hydrate_sessions([
+          %{id: "worker-9", title: "w", role: :worker, parent_id: nil, status: :idle, messages: []}
+        ])
+
+      session = tui.sessions["worker-9"]
+      assert session.thinking_buffer == nil
+      refute Enum.any?(session.entries, &match?({:thinking, _, _}, &1))
     end
   end
 

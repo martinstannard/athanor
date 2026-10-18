@@ -189,6 +189,27 @@ defmodule Athanor.Store.RecorderTest do
       assert Recorder.stats(pid).sessions == %{}
       refute File.exists?(Store.session_dir(@id, root: dir))
     end
+
+    # #53: reasoning is display-only. It has no `{:message, _}` published for it (the agent never
+    # records one), and even a stray `{:thinking_delta, _}` event must be dropped — there is no
+    # `kind: "thinking"` in the transcript, so persisting one would put reasoning on disk as a
+    # record no reader understands.
+    test "thinking deltas are not persisted", %{tmp_dir: dir} do
+      pid = start_recorder!(dir)
+      publish_started()
+
+      Bus.publish_message(@id, nil, %{role: "user", content: "count me"})
+
+      Bus.publish_event(@id, nil, {:thinking_delta, "We need answer"})
+      Bus.publish_event(@id, nil, {:thinking_delta, " the user."})
+
+      assert %{records: 1, seq: 1} = session_stats(pid, @id)
+
+      {records, _read_meta} = records(@id, dir)
+      assert [%{"kind" => "user", "seq" => 1}] = records
+
+      refute File.read!(Transcript.path(Store.session_dir(@id, root: dir))) =~ "We need answer"
+    end
   end
 
   describe "subscribe-once (plan C-dup)" do

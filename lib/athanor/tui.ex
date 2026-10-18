@@ -171,6 +171,16 @@ defmodule Athanor.TUI do
     focus: :input,
     sidebar_index: 0,
     tick: 0,
+    # The client-wide thinking override (#53), set by `/thinking` / `/thinking off` and read through
+    # `thinking_override/1`: `true` expands every block, `false` collapses every block, `nil` (the
+    # default) means "no override — use each block's own flag", which is what makes `Ctrl+T` per-block
+    # state meaningful.
+    #
+    # It is a **client** setting, not a daemon one, and deliberately not read from `Athanor.Config`: it
+    # changes how this terminal draws, nothing about the session, so a client that attaches to a running
+    # daemon must not need the daemon's environment to render correctly. A collapsed block is *always*
+    # rendered — as a one-line header — so this hides bodies, never blocks.
+    thinking_expanded?: nil,
     # Daemon connectivity (#25), event-driven: `:net_kernel.monitor_nodes/1` in `run/1` feeds
     # `handle_node_event/2`. `daemon_mode` distinguishes "should be attached" from "--local".
     daemon_mode: :daemon,
@@ -179,12 +189,23 @@ defmodule Athanor.TUI do
     dirty: true
   ]
 
+  @typedoc """
+  Reasoning as its own viewport entry (#53): the text and *this block's* expanded state.
+
+  The third element is the per-message flag `Ctrl+T` flips. The effective rendering combines it with
+  the client-wide `thinking_expanded?` (see `thinking_expanded?/1`), which is why it is stored rather
+  than pre-resolved: the global switch must be able to change a block's appearance without rewriting
+  the entry.
+  """
+  @type thinking_entry :: {:thinking, String.t(), boolean()}
+
   @type entry ::
           {:user, String.t()}
           | {:assistant, String.t()}
           | {:tool, String.t()}
           | {:system, String.t()}
           | {:error, String.t()}
+          | thinking_entry()
 
   @type session_view :: %{
           id: String.t(),
@@ -194,6 +215,8 @@ defmodule Athanor.TUI do
           status: Agent.status(),
           entries: [entry()],
           streaming_buffer: String.t() | nil,
+          thinking_buffer: String.t() | nil,
+          streaming_thinking_expanded?: boolean(),
           prompt_queue_len: non_neg_integer(),
           queue_next: String.t() | nil,
           stats: map() | nil
@@ -225,6 +248,7 @@ defmodule Athanor.TUI do
           scroll_offset: non_neg_integer(),
           focus: focus(),
           sidebar_index: non_neg_integer(),
+          thinking_expanded?: boolean() | nil,
           daemon_mode: :daemon | :local | :fallback,
           daemon_connected?: boolean(),
           daemon_down_since: integer() | nil
@@ -248,9 +272,11 @@ defmodule Athanor.TUI do
       status: :idle,
       entries: [
         {:system,
-         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /kill <id> to remove a running one (its transcript is kept), /stats [all] for token/cost consumption, /clear to reset the active session's context, /clear-queue to drop all stacked prompts, /unqueue to drop the last one. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
+         "Welcome to Athanor. Type a prompt for the Conductor, /spawn <title> :: <prompt> for a sub-agent, /conductor <title> for a new conductor, /theme <name> to restyle, /resume <id> to rehydrate a persisted session, /kill <id> to remove a running one (its transcript is kept), /stats [all] for token/cost consumption, /clear to reset the active session's context, /clear-queue to drop all stacked prompts, /unqueue to drop the last one. A reasoning model's thinking is shown collapsed — Ctrl+T expands the block (or the live one while streaming), and /thinking expands them all. Enter while streaming stacks the prompt for the next turn. Esc always cancels the active turn. Tab focuses the session deck; use j/k or ↑/↓ to move, Enter to select."}
       ],
       streaming_buffer: nil,
+      thinking_buffer: nil,
+      streaming_thinking_expanded?: false,
       prompt_queue_len: 0,
       queue_next: nil,
       stats: nil
@@ -266,6 +292,7 @@ defmodule Athanor.TUI do
       height: Keyword.get(opts, :height, 24),
       sessions: %{active_id => initial_session},
       session_order: [active_id],
+      thinking_expanded?: Keyword.get(opts, :thinking_expanded?),
       daemon_mode: Keyword.get(opts, :daemon_mode, :daemon),
       daemon_connected?: daemon_reachable?(daemon_node)
     }
@@ -305,6 +332,10 @@ defmodule Athanor.TUI do
         status: Map.get(s, :status, :idle),
         entries: entries,
         streaming_buffer: nil,
+        # A rehydrated session carries no thinking: reasoning is never persisted (#53), so a resumed
+        # viewport starts with no thinking blocks at all rather than an empty one.
+        thinking_buffer: nil,
+        streaming_thinking_expanded?: false,
         prompt_queue_len: Map.get(s, :prompt_queue_len, 0),
         queue_next: Map.get(s, :queue_next),
         stats: Map.get(s, :stats)
@@ -841,7 +872,15 @@ defmodule Athanor.TUI do
         _ = send_queue_command(target_node, tui.active_id, :drop_last_prompt)
         drop_last_local_queue_note(tui)
 
-      # Bare `/resume` and `/kill` are pure local listings, so they answer at once.
+      # A client-local view toggle (#53): nothing on the daemon changes, so it does not even need to
+      # be in the RPC tables. The acknowledgement names the new state, because "did that key work?" is
+      # otherwise invisible for a session with no thinking blocks.
+      {:thinking, expanded?, tui} ->
+        tui
+        |> set_thinking_expanded(expanded?)
+        |> add_system(thinking_notice(expanded?))
+
+      # Bare `/resume` and bare `/kill` are mutually exclusive and both answer at once.
       {:resume, nil, tui} ->
         list_resumable_sessions(tui)
 
@@ -967,9 +1006,29 @@ defmodule Athanor.TUI do
     end)
   end
 
+  # Reasoning deltas (#53) accumulate into their **own** buffer. This is the requirement the issue
+  # calls the "second interleaved stream": appending thinking into `streaming_buffer` would splice
+  # the model's private reasoning into the assistant's visible answer, and — since that buffer is
+  # what `{:turn_complete, _}` writes into the transcript — would put it in the viewport as prose
+  # too. Two buffers, two entry kinds, no sharing.
+  #
+  # The event tag is `{:thinking_delta, _}` (not `{:text_delta, _}`), so the coalescing loop, the
+  # `GoalManager` filter and any older client all handle it without special cases.
+  def handle_agent_event(tui, session_id, {:thinking_delta, chunk}) do
+    update_session(tui, session_id, fn s ->
+      current = s.thinking_buffer || ""
+      %{s | thinking_buffer: current <> chunk}
+    end)
+  end
+
   def handle_agent_event(tui, session_id, {:turn_complete, content}) do
     update_session(tui, session_id, fn s ->
       final_text = s.streaming_buffer || content || ""
+
+      # Reasoning becomes its own entry, *before* the assistant text, and its own buffer is cleared.
+      # It is deliberately not merged into `final_text`: the assistant entry must contain exactly what
+      # the model said to the user, which is also exactly what the agent recorded in `messages`.
+      s = flush_thinking_buffer(s)
 
       entries =
         if String.trim(final_text) != "" do
@@ -984,7 +1043,7 @@ defmodule Athanor.TUI do
 
   def handle_agent_event(tui, session_id, {:tool_start, name, raw_args}) do
     update_session(tui, session_id, fn s ->
-      s = flush_session_buffer(s)
+      s = s |> flush_thinking_buffer() |> flush_session_buffer()
       summary = format_tool_args(raw_args)
       %{s | entries: append(s.entries, {:tool, "⚙ #{name}(#{summary}) …"})}
     end)
@@ -1006,14 +1065,14 @@ defmodule Athanor.TUI do
 
   def handle_agent_event(tui, session_id, :cancelled) do
     update_session(tui, session_id, fn s ->
-      s = flush_session_buffer(s)
+      s = s |> flush_thinking_buffer() |> flush_session_buffer()
       %{s | entries: append(s.entries, {:system, "[cancelled]"}), status: :idle}
     end)
   end
 
   def handle_agent_event(tui, session_id, {:error, reason}) do
     update_session(tui, session_id, fn s ->
-      s = flush_session_buffer(s)
+      s = s |> flush_thinking_buffer() |> flush_session_buffer()
       %{s | entries: append(s.entries, {:error, reason}), status: :error}
     end)
   end
@@ -1063,6 +1122,19 @@ defmodule Athanor.TUI do
     buffer = %{body: "", truncated: false}
     receive_paste(%{tui | paste_buffer: buffer}, buffer, rest)
   end
+
+  # Ctrl+T (#53): toggle the thinking block. A **control** character is required — every printable
+  # key is input text, so a letter would be swallowed as a shortcut and could not be typed into a
+  # prompt; Ctrl+T is free (Ctrl+C/D/Q quit, Ctrl+J newlines) and reads as "thinking".
+  #
+  # Placed *after* the two paste clauses on purpose, honouring #34's rule that a paste in flight is
+  # literal bytes: a `0x14` inside a bracketed paste is body text, not a key. Placed *before* the
+  # `focus: :sessions` clause so it works from both the input line and the deck — a reasoning block
+  # is worth reading whichever pane has focus.
+  #
+  # Click-to-toggle is deliberately absent: it needs SGR mouse reporting (issue #22), which is not
+  # enabled and must not be switched on just for this. See `toggle_thinking/1`.
+  def handle_key(tui, <<20>>), do: {:cont, toggle_thinking(tui)}
 
   # --- Session deck navigation (focus: :sessions) ---
   # Delegated wholesale to `handle_deck_key/2` so the deck's key table stays a table (and
@@ -1305,7 +1377,6 @@ defmodule Athanor.TUI do
   @doc """
   Empties the active session's local view of the pending prompt stack — the client half of
   `/clear-queue`.
-
   Pure and public so it can be asserted without a terminal (the agent owns the real queue and
   converges this view through its `{:prompt_queue, _}` event). The in-flight turn is untouched:
   clearing the stack is deliberately *not* a cancel.
@@ -1363,6 +1434,136 @@ defmodule Athanor.TUI do
   @spec clear_local_context(t()) :: t()
   def clear_local_context(tui) do
     update_session(tui, tui.active_id, &cleared_view/1)
+  end
+
+  # -- thinking / reasoning (#53) ------------------------------------------------------------
+  #
+  # The viewport half of the reasoning stream. `Athanor.LLM` accumulates a session's thinking into a
+  # structure that never reaches the wire (see its `thinking/1` and `finalize_message/1`), the Agent
+  # relays it as `{:thinking_delta, _}` without recording it, and this module is the only consumer —
+  # it renders the text as an entry of its own and can be asked to collapse or expand it.
+  #
+  # The whole feature is *display*: nothing here can change a request, and the collapsed header is
+  # always rendered, so thinking is discoverable rather than invisible.
+
+  @doc """
+  Toggles whether thinking renders expanded (#53) — the `Ctrl+T` handler.
+
+  Two targets, deliberately different:
+
+    * **While a reasoning block is still streaming** the live one is toggled, because that is the
+      block being written and therefore the one a user pressing `Ctrl+T` mid-stream is looking at.
+    * **Otherwise the most recent frozen block is toggled** — "the block I was just reading", once
+      the assistant's text has moved past it.
+
+  Flipping always inverts the *displayed* state, clearing a global override if one is set: a key that
+  rendered the same frame back would be indistinguishable from a dead key.
+
+  A session with no thinking at all is a no-op returning the state unchanged. Public and pure so a
+  test can assert the behaviour without a terminal — the same seam `clear_local_queue/1` and
+  `clear_local_context/1` provide.
+  """
+  @spec toggle_thinking(t()) :: t()
+  def toggle_thinking(%__MODULE__{} = tui) do
+    update_session(tui, tui.active_id, fn s ->
+      if is_binary(s.thinking_buffer) and s.thinking_buffer != "" do
+        %{s | streaming_thinking_expanded?: not live_thinking_expanded?(tui, s)}
+      else
+        flip_last_thinking_entry(tui, s)
+      end
+    end)
+    |> clear_override_if_toggled(tui)
+  end
+
+  # Flipping a block always clears the override, because the override is what would otherwise win on
+  # the next render and hide the flip.
+  defp clear_override_if_toggled(%__MODULE__{} = updated, %__MODULE__{} = original) do
+    if thinking_override(original) == nil do
+      updated
+    else
+      %{updated | thinking_expanded?: nil}
+    end
+  end
+
+  @doc """
+  Sets the global "show/hide all thinking" override (#53): `true` expands every block, `false`
+  collapses every block, `nil` clears the override so each block renders at its per-message flag
+  again.
+
+  This is `/thinking` / `/thinking off`, and it is the global accessor the issue's acceptance
+  criteria ask for. It is an **override**, not a rewrite: per-message flags are left exactly as
+  `Ctrl+T` set them, so clearing the override restores what the user had opened individually instead
+  of flattening that state. Hence tri-state — "collapse all" and "no override" are different, and a
+  boolean cannot express both.
+
+  It applies to the live streaming block too, so `/thinking` mid-stream expands what is being written.
+  """
+  @spec set_thinking_expanded(t(), boolean() | nil) :: t()
+  def set_thinking_expanded(%__MODULE__{} = tui, expanded?)
+      when is_boolean(expanded?) or is_nil(expanded?) do
+    tui = if is_nil(expanded?), do: tui, else: Map.put(tui, :thinking_expanded?, expanded?)
+
+    update_session(tui, tui.active_id, fn s ->
+      case expanded? do
+        nil -> s
+        value -> %{s | streaming_thinking_expanded?: value}
+      end
+    end)
+  end
+
+  @doc """
+  The global thinking override (#53): `true`, `false`, or `nil` for "no override — use each block's
+  own flag".
+  """
+  @spec thinking_override(t()) :: boolean() | nil
+  def thinking_override(%__MODULE__{thinking_expanded?: value}) when is_boolean(value), do: value
+  def thinking_override(%__MODULE__{}), do: nil
+
+  @doc """
+  Whether a *frozen* thinking entry renders expanded (#53), given both switches.
+
+  A non-`nil` global override wins — that is what "show/hide all" means — and otherwise the block's
+  own per-message flag decides. Exposed so the renderer and its tests agree on one definition rather
+  than each re-deriving it.
+  """
+  @spec thinking_expanded?(t(), thinking_entry()) :: boolean()
+  def thinking_expanded?(%__MODULE__{} = tui, {:thinking, _text, per_entry?}) do
+    case thinking_override(tui) do
+      nil -> per_entry? == true
+      override -> override
+    end
+  end
+
+  # The live block is not an entry yet, so its effective state is its own flag under the same override
+  # rule.
+  defp live_thinking_expanded?(tui, session) do
+    case thinking_override(tui) do
+      nil -> session.streaming_thinking_expanded? == true
+      override -> override
+    end
+  end
+
+  # Flips the most recent *frozen* entry.
+  #
+  # When a global override is active, flipping only the per-entry flag would be invisible — the
+  # override still wins on the next render, so the key would look dead. `Ctrl+T` therefore clears the
+  # override and sets the entry to the inverse of what is currently *displayed*: the key always
+  # changes what the user sees, which is the only contract that makes it usable.
+  defp flip_last_thinking_entry(tui, session) do
+    override = thinking_override(tui)
+    reversed = Enum.reverse(session.entries)
+
+    case Enum.split_while(reversed, &(not match?({:thinking, _, _}, &1))) do
+      {_before, []} ->
+        session
+
+      {before, [{:thinking, text, per_entry?} | after_]} ->
+        displayed? = if is_nil(override), do: per_entry? == true, else: override
+        entry = {:thinking, text, not displayed?}
+        # The list is rebuilt from its reversed form: `Enum.reverse/2` prepends the newer prefix
+        # (`after_`) and then the flipped block onto the untouched tail, so nothing is appended.
+        %{session | entries: Enum.reverse(after_, [entry | Enum.reverse(before)])}
+    end
   end
 
   @doc """
@@ -1448,10 +1649,17 @@ defmodule Athanor.TUI do
       session
       | entries: [{:system, @clear_notice}],
         streaming_buffer: nil,
+        thinking_buffer: nil,
+        streaming_thinking_expanded?: false,
         prompt_queue_len: 0,
         queue_next: nil
     }
   end
+
+  # The `/thinking` acknowledgement. It reports what the switch now is, and — because collapsed
+  # headers are always drawn — makes clear that "off" hides bodies rather than the blocks.
+  defp thinking_notice(true), do: "Thinking expanded — every block is open (Ctrl+T toggles one)."
+  defp thinking_notice(false), do: "Thinking collapsed — headers only (Ctrl+T expands one)."
 
   # The whole-line "clear" verbs are matched as their own function heads: `/clear` discards the
   # active session's **whole conversation context** in place, `/clear-queue` only forgets the
@@ -1461,6 +1669,11 @@ defmodule Athanor.TUI do
   defp slash_command(tui, "/clear"), do: {:clear_context, %{tui | input: ""}}
   defp slash_command(tui, "/clear-queue"), do: {:clear_queue, %{tui | input: ""}}
   defp slash_command(tui, "/unqueue"), do: {:drop_queued, %{tui | input: ""}}
+  # `/thinking` (#53) expands every thinking block in the viewport; `/thinking off` collapses them.
+  # Listed longer-first like `/stats all`, though both are exact matches. A client-local view toggle,
+  # so it needs no daemon round trip; `/thinkingx` is not a verb and stays an ordinary prompt.
+  defp slash_command(tui, "/thinking off"), do: {:thinking, false, %{tui | input: ""}}
+  defp slash_command(tui, "/thinking"), do: {:thinking, true, %{tui | input: ""}}
   # `/stats all` must be matched before a bare `/stats` prefix could ever be considered; these are
   # exact-string clauses, so the longer form is simply listed first for clarity.
   defp slash_command(tui, "/stats all"), do: {:stats, :all, %{tui | input: ""}}
@@ -1832,7 +2045,7 @@ defmodule Athanor.TUI do
     right =
       case tui.focus do
         :sessions -> "j/k or ↑/↓: move │ Enter: select │ Tab: back "
-        :input -> "Tab: deck │ ↑/↓: scroll │ /theme │ /clear │ /quit "
+        :input -> "Tab: deck │ ↑/↓: scroll │ Ctrl+T: thinking │ /theme │ /quit "
       end
 
     gap = max(1, width - String.length(left) - String.length(right))
@@ -1978,15 +2191,19 @@ defmodule Athanor.TUI do
     session =
       Map.get(tui.sessions, tui.active_id, %{
         entries: [],
-        streaming_buffer: nil
+        streaming_buffer: nil,
+        thinking_buffer: nil
       })
 
+    # Entries, then the two live streams. Reasoning is appended as its own entry kind rather than
+    # concatenated into the assistant text: `◍ THINKING` is not a thing the model said to the user,
+    # and merging them would put private reasoning in the viewport's `Athanor:` block (and, since
+    # `{:turn_complete, _}` writes that same buffer into the transcript, into the record of the
+    # answer). Each buffer keeps its own block, so they interleave in the order they arrived.
     all_entries =
-      case session.streaming_buffer do
-        nil -> session.entries
-        "" -> session.entries
-        buf -> append(session.entries, {:assistant, buf <> "▍"})
-      end
+      session.entries
+      |> Kernel.++(live_stream_entries(tui, session))
+      |> Enum.map(&resolve_thinking_entry(tui, &1))
 
     wrapped_lines =
       Enum.flat_map(all_entries, fn entry ->
@@ -2002,6 +2219,37 @@ defmodule Athanor.TUI do
     padding_count = max(0, viewport_height - length(visible))
     visible ++ List.duplicate("", padding_count)
   end
+
+  # The not-yet-frozen halves of a live turn: thinking first (it is what the model produces first),
+  # then the assistant's visible text with the streaming cursor. Either may be absent, and both are
+  # absent between turns — which is the common case and renders exactly as before #53.
+  defp live_stream_entries(tui, session) do
+    thinking =
+      case session.thinking_buffer do
+        buf when is_binary(buf) and buf != "" ->
+          [{:thinking, buf <> "▍", live_thinking_expanded?(tui, session)}]
+
+        _other ->
+          []
+      end
+
+    assistant =
+      case session.streaming_buffer do
+        buf when is_binary(buf) and buf != "" -> [{:assistant, buf <> "▍"}]
+        _other -> []
+      end
+
+    thinking ++ assistant
+  end
+
+  # Resolves the two switches (the client-wide override and the block's own flag) into the one value
+  # the renderer needs, at the point of rendering. Resolving here rather than at write time is what
+  # lets `/thinking` restyle every existing block without rewriting a single entry.
+  defp resolve_thinking_entry(tui, {:thinking, text, _per_entry?} = entry) do
+    {:thinking, text, thinking_expanded?(tui, entry)}
+  end
+
+  defp resolve_thinking_entry(_tui, other), do: other
 
   defp format_entry_lines({:user, text}, max_w, theme) do
     style =
@@ -2042,6 +2290,42 @@ defmodule Athanor.TUI do
     |> Enum.map(fn line -> "   " <> Style.render_to_string(style, line) end)
   end
 
+  # A thinking block (#53), in one of two shapes:
+  #
+  #   * **collapsed** — a single header line naming the block and its size. Always rendered, so
+  #     thinking is discoverable rather than invisible; it is the *body* that is hidden.
+  #   * **expanded** — the header, then the wrapped body, dim and italic, indented under the header so
+  #     it reads as one block.
+  #
+  # Wrapping goes through the same `wrap_text/2` the `user`/`system` entries use and is bounded by the
+  # viewport width the caller passed, so #22's viewport and scroll maths are reused rather than
+  # duplicated: a thinking block is just another sequence of lines inside the same total.
+  #
+  # Visually distinct from `Athanor:` on purpose — a different glyph (`◍`), a different colour role
+  # (`:muted`), italic body, and the size in the header — so reasoning can never be mistaken for the
+  # model's answer.
+  defp format_entry_lines({:thinking, text, expanded?}, max_w, theme) do
+    header_style =
+      Style.ansi256() |> Style.foreground(Theme.colour(theme, :muted)) |> Style.bold()
+
+    body_style =
+      Style.ansi256() |> Style.foreground(Theme.colour(theme, :muted)) |> Style.italic()
+
+    header = Style.render_to_string(header_style, " ◍ " <> thinking_header(text, expanded?))
+
+    if expanded? do
+      body =
+        text
+        |> thinking_text()
+        |> wrap_text(max(5, max_w - 2))
+        |> Enum.map(fn line -> "   " <> Style.render_to_string(body_style, line) end)
+
+      [header | body] ++ [""]
+    else
+      [header, ""]
+    end
+  end
+
   defp format_entry_lines({:system, text}, max_w, theme) do
     style =
       Style.ansi256() |> Style.foreground(Theme.colour(theme, :system)) |> Style.italic()
@@ -2059,6 +2343,32 @@ defmodule Athanor.TUI do
     |> wrap_text(max(5, max_w - 2))
     |> Enum.map(fn line -> " " <> Style.render_to_string(style, line) end)
     |> Kernel.++([""])
+  end
+
+  # The header text: a label, a size, and the affordance. The size is a character count rather than
+  # an elapsed time because it is the only number known without a clock on the render path (and
+  # rendering must stay cheap — see the coalescing note above). The key hint is in the header, not
+  # only in the welcome banner, so a first-time reader of a collapsed block knows it can be opened.
+  defp thinking_header(text, expanded?) do
+    size = text |> thinking_text() |> String.length()
+
+    hint = if expanded?, do: "Ctrl+T collapse", else: "Ctrl+T expand"
+
+    "Thinking · #{format_chars(size)} chars · #{hint}"
+  end
+
+  # The streaming cursor is presentation, not content: it is stripped before counting and wrapping so
+  # a collapsed header's size does not tick by one while the final token trickles in.
+  defp thinking_text(text) do
+    text |> String.replace_suffix("▍", "") |> String.trim()
+  end
+
+  # `1240` → `1.2k`, so a long reasoning block does not make the header itself wrap. Under a thousand
+  # the exact count is more useful than a rounded one.
+  defp format_chars(count) when count < 1_000, do: Integer.to_string(count)
+
+  defp format_chars(count) do
+    "#{Float.round(count / 1000, 1)}k"
   end
 
   defp wrap_text(text, width) when width > 0 do
@@ -2347,6 +2657,8 @@ defmodule Athanor.TUI do
         status: Map.get(meta, :status, :idle),
         entries: [],
         streaming_buffer: nil,
+        thinking_buffer: nil,
+        streaming_thinking_expanded?: false,
         prompt_queue_len: 0,
         queue_next: nil,
         stats: nil
@@ -2394,6 +2706,17 @@ defmodule Athanor.TUI do
 
   defp flush_session_buffer(%{streaming_buffer: buf} = s) do
     %{s | entries: append(s.entries, {:assistant, buf}), streaming_buffer: nil}
+  end
+
+  # Reasoning takes the *same* boundary as the assistant text but writes its own entry kind (#53):
+  # frozen at turn end (and at a tool call, where the assistant's prose is frozen too), carrying the
+  # live block's expanded flag so `Ctrl+T` mid-stream is not thrown away when the block lands.
+  defp flush_thinking_buffer(%{thinking_buffer: nil} = s), do: s
+  defp flush_thinking_buffer(%{thinking_buffer: ""} = s), do: %{s | thinking_buffer: nil}
+
+  defp flush_thinking_buffer(%{thinking_buffer: buf} = s) do
+    entry = {:thinking, buf, s.streaming_thinking_expanded? == true}
+    %{s | entries: append(s.entries, entry), thinking_buffer: nil}
   end
 
   defp replace_last_tool_entry(session, replacement) do
