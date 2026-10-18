@@ -1,8 +1,17 @@
 defmodule Athanor.Config do
   @moduledoc """
-  Configuration helper for Athanor's LLM provider (OpenCode Go) and runtime settings.
+  Configuration helper for Athanor's LLM providers (OpenCode Go, Claude) and runtime settings.
+
+  Two providers can drive a session (§`provider/0`): OpenCode Go over HTTP (`:opencode`, the
+  default) and Claude through the Claude Code CLI (`:claude`). Everything else in this module is
+  provider-independent.
   """
 
+  require Logger
+
+  @default_provider :opencode
+  @default_claude_cli "claude"
+  @default_claude_config_dir "~/.claude"
   @default_base_url "https://opencode.ai/zen/go/v1"
   @default_model "deepseek-v4.1-flash"
   @default_theme :default
@@ -71,8 +80,96 @@ defmodule Athanor.Config do
   end
 
   @doc """
+  Which LLM backend drives a session: `:opencode` (default) or `:claude`.
+
+  Resolved from `ATHANOR_PROVIDER`, then `:athanor, :provider`, then `:#{@default_provider}`.
+  Matching is case-insensitive and trims surrounding whitespace.
+
+  ## Unknown values
+
+  An unrecognised value is **not** accepted silently: it is logged (`Logger.warning/1`) and
+  treated as `:#{@default_provider}`. Falling back rather than raising is deliberate — this is
+  read on the hot path of every session start, including from a detached daemon where a raise
+  would surface as a mystery start-up failure with the message lost to a log nobody is watching.
+  The warning is written to <home>/logs/athanor.log (see `Athanor.Log`), which is exactly where
+  a user debugging "why did it use OpenCode?" should look.
+  """
+  @spec provider() :: :opencode | :claude
+  def provider do
+    raw =
+      System.get_env("ATHANOR_PROVIDER") ||
+        Application.get_env(:athanor, :provider, @default_provider)
+
+    case normalise_provider(raw) do
+      {:ok, provider} ->
+        provider
+
+      :error ->
+        # `inspect/1`, never the value's `to_string/1`: the input is arbitrary user text.
+        Logger.warning(
+          "[athanor] unknown ATHANOR_PROVIDER #{inspect(raw)}; " <>
+            "expected \"opencode\" or \"claude\" — falling back to #{@default_provider}"
+        )
+
+        @default_provider
+    end
+  end
+
+  defp normalise_provider(raw) when raw in [:opencode, :claude], do: {:ok, raw}
+
+  defp normalise_provider(raw) when is_binary(raw) do
+    case raw |> String.trim() |> String.downcase() do
+      "opencode" -> {:ok, :opencode}
+      "opencode-go" -> {:ok, :opencode}
+      "claude" -> {:ok, :claude}
+      "claude-oauth" -> {:ok, :claude}
+      _other -> :error
+    end
+  end
+
+  defp normalise_provider(_raw), do: :error
+
+  @doc """
+  Executable used for the Claude provider (default `"#{@default_claude_cli}"`).
+
+  Resolved from `ATHANOR_CLAUDE_CLI`, then `:athanor, :claude_cli_path`. A bare command name is
+  left as-is for `PATH` lookup; an absolute or `~`-rooted path is expanded.
+  """
+  @spec claude_cli_path() :: String.t()
+  def claude_cli_path do
+    (System.get_env("ATHANOR_CLAUDE_CLI") ||
+       Application.get_env(:athanor, :claude_cli_path, @default_claude_cli))
+    |> expand_if_path()
+  end
+
+  @doc """
+  `CLAUDE_CONFIG_DIR` for the Claude provider — which login the CLI authenticates with.
+
+  Resolved from `ATHANOR_CLAUDE_CONFIG_DIR`, then `:athanor, :claude_config_dir`, then
+  `"#{@default_claude_config_dir}"`. Point this at a directory whose Claude login uses the
+  **subscription** (`claude.ai` OAuth), e.g. `~/.claude_personal`.
+
+  Always `Path.expand/1`ed. The value is a *directory path*, never a credential: the token
+  itself lives inside that directory and is never read, copied or logged by Athanor (design
+  §7.4 C5).
+  """
+  @spec claude_config_dir() :: String.t()
+  def claude_config_dir do
+    (System.get_env("ATHANOR_CLAUDE_CONFIG_DIR") ||
+       Application.get_env(:athanor, :claude_config_dir, @default_claude_config_dir))
+    |> Path.expand()
+  end
+
+  defp expand_if_path(name) do
+    if String.contains?(name, "/"), do: Path.expand(name), else: name
+  end
+
+  @doc """
   Returns the model identifier to use with OpenCode Go.
   Strips a leading `"opencode-go/"` prefix if present.
+
+  This is the **OpenCode** model id. It is not sent to the Claude provider, whose model is a
+  Claude alias/name (`claude_model/0`).
   """
   @spec model() :: String.t()
   def model do
@@ -81,6 +178,29 @@ defmodule Athanor.Config do
         Application.get_env(:athanor, :model, @default_model)
 
     String.replace_prefix(raw, "opencode-go/", "")
+  end
+
+  @doc """
+  The Claude model for the `:claude` provider, or `nil` to use the CLI's own default.
+
+  Read from `ATHANOR_CLAUDE_MODEL`, then `:athanor, :claude_model`. `nil` (the default) is the
+  recommended setting: the subscription login already carries a model selection, and the CLI's
+  default follows it. Deliberately separate from `model/0` so that an OpenCode id
+  (`#{@default_model}`) can never be handed to the Claude CLI as `--model`.
+  """
+  @spec claude_model() :: String.t() | nil
+  def claude_model do
+    case System.get_env("ATHANOR_CLAUDE_MODEL") ||
+           Application.get_env(:athanor, :claude_model) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _other ->
+        nil
+    end
   end
 
   @doc """
