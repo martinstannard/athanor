@@ -1,7 +1,7 @@
 defmodule Athanor.AgentTest do
   use ExUnit.Case, async: true
 
-  alias Athanor.{Agent, Bus}
+  alias Athanor.{Agent, Bus, GoalManager}
   alias Athanor.Store.{Compactor, Tokens}
 
   @moduletag :tmp_dir
@@ -1069,6 +1069,162 @@ defmodule Athanor.AgentTest do
     end
   end
 
+  # --- goal-plane delivery and completion (#49, #50) ------------------------------
+
+  describe "a goal nudge is delivered out-of-band (#49) and a resolved goal no longer mutes its worker (#50)" do
+    test "a nudge reaches a :streaming goal worker at its next tool-round boundary", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      id = "worker-nudge-#{System.unique_integer([:positive])}"
+      llm_fn = test_driven_llm_fn(self())
+
+      # `goal_id` is the #44 exemption: this session takes no conversational mid-round injection at
+      # all, which is exactly why the nudge needs a path of its own.
+      {:ok, agent} = Agent.start_link(subscriber: self(), id: id, cd: tmp_dir, llm_fn: llm_fn, goal_id: "goal_nudge_1")
+
+      assert :ok = Agent.prompt(agent, "work the goal")
+      assert_receive {:llm_messages, round1, _}
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+
+      # The manager's control-plane command: not `{:enqueue_prompt, _}`.
+      text = "[GOAL NUDGE 1/3] Goal goal_nudge_1 has not reported progress for 60s."
+      Bus.send_command(id, {:goal_nudge, text})
+
+      # Delivered: consumed at the round boundary and appended to the working set, so the model reads
+      # it on the very next request — without the task being cancelled.
+      assert_receive {:agent_event, {:nudge_delivered, ^text}}, 2_000
+      assert_receive {:llm_messages, round2, sent}, 2_000
+      assert List.last(sent).content == text
+
+      state = Agent.get_state(agent)
+      assert state.nudges_delivered == 1
+      assert state.control_queue_len == 0
+      # Never a stacked "user objective": the conversational queue is untouched, so #44's invariant
+      # (the worker's target cannot be rewritten mid-flight) holds.
+      assert state.prompt_queue_len == 0
+
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "on it", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "on it"}}, 2_000
+    end
+
+    test "a nudge lands while a queued user instruction still waits for the task boundary", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      id = "worker-both-#{System.unique_integer([:positive])}"
+      llm_fn = test_driven_llm_fn(self())
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), id: id, cd: tmp_dir, llm_fn: llm_fn, goal_id: "goal_both_1")
+
+      assert :ok = Agent.prompt(agent, "work the goal")
+      assert_receive {:llm_messages, round1, _}
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+
+      nudge = "[GOAL NUDGE 1/3] Goal goal_both_1 has not reported progress for 60s."
+      assert :ok = Agent.enqueue_prompt(agent, "a different objective")
+      Bus.send_command(id, {:goal_nudge, nudge})
+
+      # The distinction the two fixes rest on: the control-plane reminder is delivered at the round
+      # boundary, the conversational objective is not (#44), and both are visible in the state.
+      assert_receive {:llm_messages, round2, sent}, 2_000
+      assert List.last(sent).content == nudge
+      refute Enum.any?(sent, &(field(&1, "content") == "a different objective"))
+
+      state = Agent.get_state(agent)
+      assert state.prompt_queue_len == 1
+      assert state.control_queue_len == 0
+
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "ok", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "ok"}}, 2_000
+    end
+
+    test "a worker whose goal already resolved still surfaces its real completion to the parent", %{
+      tmp_dir: tmp_dir
+    } do
+      # #50's second half, reproduced without any timing: the goal has reached a terminal state
+      # (it closed at t=0 on a verifier that passed against partial work), the manager is gone, and
+      # the worker then really finishes. Under the old `resolved? -> :ok` clause the parent was
+      # notified of nothing.
+      id = "worker-resolved-#{System.unique_integer([:positive])}"
+      goal_id = "goal-resolved-#{System.unique_integer([:positive])}"
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      mark_goal_resolved!(goal_id)
+      assert GoalManager.resolved?(goal_id)
+      refute GoalManager.registered?(goal_id)
+
+      Bus.subscribe("conductor:#{parent_id}:children")
+
+      llm_fn = fn _messages, _tools, _agent_pid ->
+        {:ok,
+         %{
+           role: "assistant",
+           content: "did the work\n===ATHANOR_DONE=== status=ok summary=finished the real work",
+           tool_calls: []
+         }}
+      end
+
+      # `notify_parent_on_done: nil` on purpose: a session that never set the flag must still report.
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          id: id,
+          cd: tmp_dir,
+          llm_fn: llm_fn,
+          goal_id: goal_id,
+          parent_id: parent_id,
+          notify_parent_on_done: nil
+        )
+
+      assert :ok = Agent.prompt(agent, "work the goal")
+
+      assert_receive {:agent_event, ^id, {:child_done, report}}, 2_000
+      assert report.child_id == id
+      assert report.status == "ok"
+      assert report.summary == "finished the real work"
+
+      # A resolved goal still silences the *claim* (the goal's own verdict already spoke).
+      refute_received {:agent_event, ^id, {:goal_candidate_done, _}}
+    end
+  end
+
   # --- #30: a tool intent that arrived as text ------------------------------------
 
   describe "a turn whose tool intent arrived as text (#30)" do
@@ -1746,6 +1902,17 @@ defmodule Athanor.AgentTest do
     after
       0 -> :ok
     end
+  end
+
+  # Puts `goal_id` in `Athanor.GoalManager`'s resolved-goal table without starting a manager: the
+  # state a worker observes after its goal closed or escalated. The table is a process-global ETS
+  # table (it outlives a manager by design — see `GoalManager.init_resolved_table/0`), so the entry
+  # is removed on exit rather than leaked into another test.
+  defp mark_goal_resolved!(goal_id) do
+    GoalManager.init_resolved_table()
+    :ets.insert(:athanor_resolved_goals, {goal_id, :closed})
+    on_exit(fn -> :ets.delete(:athanor_resolved_goals, goal_id) end)
+    :ok
   end
 
   defp flush_user_message_events do
