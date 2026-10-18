@@ -696,7 +696,7 @@ defmodule Athanor.GoalManagerTest do
       await_death(pid)
     end
 
-    test "a claim-bearing turn does not reset the budget, a plain turn does (#48/#50)" do
+    test "a turn boundary is activity, not progress: it never clears the budget (#48/#50)" do
       %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
         start_goal!(
           stall_after_ms: 10,
@@ -710,18 +710,66 @@ defmodule Athanor.GoalManagerTest do
       send(pid, :verify_tick)
       assert %{nudge_count: 1} = await(goal_id, &(&1.nudge_count == 1))
 
-      # The agent emits both events for a claim turn; the sentinel makes it a claim, and a claim is
-      # not progress, so the budget is untouched.
+      # A bare completed turn is the *answer* to the nudge, and the answer changed nothing: the
+      # verifier is still contradicted. Counting it as progress would make the count return to zero
+      # on every answer, so `nudge_count >= max_nudges` could never be reached and escalation would
+      # be unreachable dead code — a worker that keeps talking while never moving the verifier would
+      # spin forever. The clock still moves, which is why this is not a stall either.
+      Bus.publish_event(worker_id, nil, {:turn_complete, "still working on it"})
+      Process.sleep(20)
+      assert %{nudge_count: 1} = await_status(goal_id)
+
+      # Nor does a claim-bearing turn (the agent emits both events for that one turn): a re-asserted
+      # claim the verifier contradicts is the unproductive tick itself.
       Bus.publish_event(worker_id, nil, {:turn_complete, "done\n===ATHANOR_DONE=== status=ok summary=x"})
       Process.sleep(20)
       assert %{nudge_count: 1} = await_status(goal_id)
 
-      # A plain completed turn *is* progress: the counter goes back to zero.
-      Bus.publish_event(worker_id, nil, {:turn_complete, "still working on it"})
+      # Only unambiguous worker-asserted progress clears the debt.
+      Process.sleep(15)
+      assert :ok = GoalManager.report_progress(worker_id, summary: "a bounded step, done")
       assert %{nudge_count: 0} = await(goal_id, &(&1.nudge_count == 0))
 
-      _ = goal_id
       assert Process.alive?(pid)
+    end
+
+    test "a worker that answers every nudge without progress still escalates (liveness, #48)" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      # The failure mode the budget must not have: nudge -> worker answers -> tick -> nudge -> …
+      # Each answer is a turn with no receipt and no passing verifier, so nothing the worker does can
+      # defer the escalation indefinitely. max_nudges is 1, so the second unproductive tick escalates.
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          stall_after_ms: 0,
+          max_nudges: 1,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: still broken"}}
+          end
+        )
+
+      Bus.subscribe("conductor:#{parent_id}:goals")
+      Bus.subscribe("agent:#{parent_id}:inbox")
+
+      # Tick 1 -> nudge, and the worker "answers" it with a turn that claims nothing real.
+      send(pid, :verify_tick)
+      assert %{nudge_count: 1} = await(goal_id, &(&1.nudge_count == 1))
+      Bus.publish_event(worker_id, nil, {:turn_complete, "on it"})
+      Process.sleep(20)
+      assert %{nudge_count: 1, status: :active} = await_status(goal_id)
+
+      # Tick 2 -> the answer did not clear the debt, so the budget is exhausted and it escalates.
+      send(pid, :verify_tick)
+
+      assert_receive {:goal_event, ^goal_id,
+                      {:goal_escalated, %Goal{status: :escalated, nudge_count: 1}, %Result{verdict: :contradicted},
+                       :max_nudges_exceeded}},
+                     1_000
+
+      assert_receive {:bus_command, {:enqueue_prompt, escalation}}, 1_000
+      assert escalation =~ "exit 1: still broken"
+      await_death(pid)
     end
 
     test "escalation reports nudges actually delivered, not merely sent (#49d)" do
