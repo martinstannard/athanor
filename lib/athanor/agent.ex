@@ -650,7 +650,7 @@ defmodule Athanor.Agent do
         state = set_status(state, :idle)
         notify(state, {:turn_complete, assistant_msg.content})
         maybe_publish_child_done(state, assistant_msg.content)
-        {:noreply, drain_prompt_queue(state)}
+        {:noreply, continue_after_turn(state)}
 
       tool_calls when is_list(tool_calls) ->
         {:noreply, start_tool_execution(state, tool_calls)}
@@ -716,7 +716,7 @@ defmodule Athanor.Agent do
       |> set_status(:error)
 
     notify(state, {:error, "Turn timed out in #{phase} after #{state.turn_timeout_ms}ms"})
-    {:noreply, drain_prompt_queue(state)}
+    {:noreply, continue_after_turn(state)}
   end
 
   # A stale timer from a task that already completed (the `disarm` raced it): ignore.
@@ -1182,18 +1182,30 @@ defmodule Athanor.Agent do
   # itself with `{:control_queue, %{len: n}}`, so `prompt_queue_len` keeps meaning "stacked user
   # prompts" (which the TUI renders and `clear_prompt_queue/1` empties — neither may touch a nudge).
   defp do_drain_control(%{status: status} = state) when status in [:idle, :error] do
-    state = append_one_control_prompt(state)
-
     if :queue.is_empty(state.control_queue) do
-      # Nothing in flight to append to: the nudge needs a turn of its own (there is no `current_task`
-      # to continue), but *only* the nudge — the conversational queue keeps its own rules.
-      start_llm_turn(state)
-    else
       state
+    else
+      # Nothing in flight to append to, so the nudge needs a turn of its own — but *only* the nudge;
+      # the conversational queue keeps its own rules and starts nothing here.
+      state |> append_one_control_prompt() |> start_llm_turn()
     end
   end
 
   defp do_drain_control(state), do: state
+
+  # A completed task is a boundary too (#49), and a prose-only worker never makes a tool call: if the
+  # control queue were drained only at tool-round boundaries, a nudge to such a worker would simply
+  # be stranded one boundary later — the bug this fix exists to remove. The control plane takes
+  # precedence over a stacked user prompt: the nudge is about the goal already in flight, and feeding
+  # the queued objective first would answer the nudge out of context. With no nudge pending this is
+  # exactly the old `drain_prompt_queue/1` behaviour.
+  defp continue_after_turn(state) do
+    if :queue.is_empty(state.control_queue) do
+      drain_prompt_queue(state)
+    else
+      do_drain_control(state)
+    end
+  end
 
   # -- mid-task pickup (#44) ---------------------------------------------------------------
 

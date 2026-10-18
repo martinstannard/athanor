@@ -1175,6 +1175,37 @@ defmodule Athanor.AgentTest do
       assert_receive {:agent_event, {:turn_complete, "ok"}}, 2_000
     end
 
+    test "a nudge sent after the worker's last turn still reaches it (#49)", %{tmp_dir: tmp_dir} do
+      # The other half of #49's reachability problem: a prose-only worker never makes a tool call, so
+      # there is no tool-round boundary for a nudge to ride on. With nothing in flight the control
+      # plane starts the turn the reminder needs, instead of stranding it one boundary later.
+      id = "worker-late-#{System.unique_integer([:positive])}"
+      llm_fn = test_driven_llm_fn(self())
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), id: id, cd: tmp_dir, llm_fn: llm_fn, goal_id: "goal_late_1")
+
+      assert :ok = Agent.prompt(agent, "work the goal")
+      assert_receive {:llm_messages, task, _}
+
+      send(task, {:reply, {:ok, %{role: "assistant", content: "still thinking", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "still thinking"}}, 2_000
+
+      text = "[GOAL NUDGE 1/3] Goal goal_late_1 has not reported progress for 60s."
+      Bus.send_command(id, {:goal_nudge, text})
+
+      assert_receive {:llm_messages, next, sent}, 2_000
+      assert List.last(sent).content == text
+      assert List.last(sent).role == "user"
+
+      state = Agent.get_state(agent)
+      assert state.nudges_delivered == 1
+      # Still nothing conversational waiting behind it.
+      assert state.prompt_queue_len == 0
+
+      send(next, {:reply, {:ok, %{role: "assistant", content: "on it", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "on it"}}, 2_000
+    end
+
     test "a worker whose goal already resolved still surfaces its real completion to the parent", %{
       tmp_dir: tmp_dir
     } do

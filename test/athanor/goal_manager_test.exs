@@ -652,6 +652,78 @@ defmodule Athanor.GoalManagerTest do
       assert Process.alive?(pid)
     end
 
+    test "a repeatedly contradicted claim still exhausts the budget (M5 preserved, #50)" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      # `stall_after_ms` is far out of reach here, so the *claim* path is the only trigger in play:
+      # the worker says done, the verifier disagrees, and doing that max_nudges times must still
+      # escalate. Resetting the budget on a claim would make this loop run forever — the escalation
+      # contract silently retired, which is exactly what an over-eager "reset on any activity"
+      # reading of #48 (b) would do.
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          stall_after_ms: 60_000,
+          max_nudges: 2,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: still broken"}}
+          end
+        )
+
+      Bus.subscribe("goal:#{goal_id}:events")
+      Bus.subscribe("agent:#{parent_id}:inbox")
+
+      claim = fn ->
+        Bus.publish_event(worker_id, nil, {:goal_candidate_done, %{status: "ok", summary: "trust me"}})
+      end
+
+      claim.()
+      assert_receive {:goal_event, ^goal_id, {:goal_nudged, %Goal{nudge_count: 1}, nudge_1}}, 1_000
+      assert nudge_1 =~ "[GOAL NUDGE 1/2]"
+
+      claim.()
+      assert_receive {:goal_event, ^goal_id, {:goal_nudged, %Goal{nudge_count: 2}, _nudge_2}}, 1_000
+
+      claim.()
+
+      assert_receive {:goal_event, ^goal_id,
+                      {:goal_escalated, %Goal{status: :escalated, nudge_count: 2}, %Result{verdict: :contradicted},
+                       :max_nudges_exceeded}},
+                     1_000
+
+      assert_receive {:bus_command, {:enqueue_prompt, escalation}}, 1_000
+      assert escalation =~ "exit 1: still broken"
+      await_death(pid)
+    end
+
+    test "a claim-bearing turn does not reset the budget, a plain turn does (#48/#50)" do
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          stall_after_ms: 10,
+          max_nudges: 3,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1"}}
+          end
+        )
+
+      Process.sleep(15)
+      send(pid, :verify_tick)
+      assert %{nudge_count: 1} = await(goal_id, &(&1.nudge_count == 1))
+
+      # The agent emits both events for a claim turn; the sentinel makes it a claim, and a claim is
+      # not progress, so the budget is untouched.
+      Bus.publish_event(worker_id, nil, {:turn_complete, "done\n===ATHANOR_DONE=== status=ok summary=x"})
+      Process.sleep(20)
+      assert %{nudge_count: 1} = await_status(goal_id)
+
+      # A plain completed turn *is* progress: the counter goes back to zero.
+      Bus.publish_event(worker_id, nil, {:turn_complete, "still working on it"})
+      assert %{nudge_count: 0} = await(goal_id, &(&1.nudge_count == 0))
+
+      _ = goal_id
+      assert Process.alive?(pid)
+    end
+
     test "escalation reports nudges actually delivered, not merely sent (#49d)" do
       parent_id = "conductor-#{System.unique_integer([:positive])}"
 
