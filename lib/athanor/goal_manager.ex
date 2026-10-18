@@ -251,6 +251,11 @@ defmodule Athanor.GoalManager do
           last_verify_at: nil,
           last_verifier_result: nil,
           worker_status: nil,
+          # Nudges *delivered* versus `goal.nudge_count` nudges *sent* (#49d). Kept apart on purpose:
+          # the escalation text used to claim "Nudges sent: 3" when zero were consumable, which made a
+          # total delivery failure look like a disobedient worker. Delivery is reported by the agent
+          # through `{:nudge_delivered, _}` when it consumes a control-plane nudge.
+          nudges_delivered: 0,
           history: []
         }
 
@@ -280,7 +285,10 @@ defmodule Athanor.GoalManager do
   def handle_call({:report_progress, %Receipt{} = receipt}, _from, state) do
     goal = Goal.with_receipt(state.goal, receipt)
     stamped = List.last(goal.receipts)
-    state = state |> Map.put(:goal, goal) |> note({:receipt, stamped.seq})
+
+    # A receipt is demonstrated progress, so it resets the *consecutive*-tick budget along with the
+    # stall clock (#48 (b)). `refresh_progress/1` is the one place that does both.
+    state = state |> Map.put(:goal, goal) |> refresh_progress() |> note({:receipt, stamped.seq})
     # Publish the *stamped* receipt: the sequence number is the goal's to assign, and a subscriber
     # seeing `seq: 0` would not know where it belonged.
     publish(state, {:goal_receipt, stamped})
@@ -306,11 +314,31 @@ defmodule Athanor.GoalManager do
     Process.demonitor(ref, [:flush])
     state = record_result(state, result)
 
-    # The one place a goal can close, holding the one thing that permits it (§5.6, C7).
-    if Result.verified?(state.last_verifier_result) do
-      close(state, state.last_verifier_result)
-    else
-      after_unverified(state)
+    # The one place a goal can close (§5.6, C7) — and it takes **two** independent facts: the
+    # Verifier's `:verified` verdict *and* the worker's own `===ATHANOR_DONE===` claim (#50).
+    #
+    # C1 states "a claim is not a verdict": the worker's sentinel alone never closes a goal. This is
+    # that sentence's mirror — **a verdict does not substitute for a claim**. A shell verifier of the
+    # intended `mix check`-shaped kind is polled from t=0 and answers "is the tree green *right
+    # now*?", which is `true` before the feature's own work has started. Closing on that verdict
+    # alone kills the goal mid-implementation, and the worker's later genuine completion then lands
+    # on a resolved goal and is swallowed (see `Athanor.Agent.maybe_publish_child_done/2`): the work
+    # is done and nobody is told. Requiring the claim makes "finished" something the worker must
+    # assert and the Verifier must confirm.
+    cond do
+      Result.verified?(state.last_verifier_result) and state.candidate_done? ->
+        close(state, state.last_verifier_result)
+
+      Result.verified?(state.last_verifier_result) ->
+        # A passing verifier is *positive* evidence, so it must never reach `after_unverified/1`:
+        # nudging or escalating a goal whose verifier just passed would nag a worker into
+        # "finishing" work that is already finished, and the mirror-bug fix would have introduced a
+        # second way to kill a healthy goal. Record the result and keep waiting for the claim; the
+        # worker's `{:goal_candidate_done, _}` (handled above) is the only thing that moves this.
+        {:noreply, note(state, :verified_awaiting_claim)}
+
+      true ->
+        after_unverified(state)
     end
   end
 
@@ -330,6 +358,12 @@ defmodule Athanor.GoalManager do
   # `{:goal_candidate_done, report}` above (§5.2 step 4), so we do not double-trigger verification.
   def handle_info({:agent_event, worker_id, {:turn_complete, _content}}, %{goal: %{worker_id: worker_id}} = state) do
     {:noreply, refresh_progress(state)}
+  end
+
+  # The agent consumed a nudge from its control plane (#49a/#49d). Delivery is reported separately
+  # from the send in `nudge/1`, so `escalate/2` can say what actually happened.
+  def handle_info({:agent_event, worker_id, {:nudge_delivered, _text}}, %{goal: %{worker_id: worker_id}} = state) do
+    {:noreply, %{state | nudges_delivered: state.nudges_delivered + 1}}
   end
 
   def handle_info({:agent_event, worker_id, event}, %{goal: %{worker_id: worker_id}} = state) do
@@ -417,18 +451,34 @@ defmodule Athanor.GoalManager do
   # Stall detection (§5.4). `last_verifier_result` is `nil` until the first check answers, and
   # dereferencing it unguarded is how the first draft killed its own manager on the first tick —
   # which, being `:temporary`, loses the goal entirely (C6).
+  #
+  # The `or contradicted?` disjunct is **gone** (#48). It let a *failing* verifier bypass the worker
+  # liveness guard, so a worker in the middle of `:streaming` — the healthiest state there is —
+  # counted as idle merely because its end-state check had not passed yet. For a `mix check`-shaped
+  # verifier that state is the *expected* one from t=0 until the last commit, so the manager nudged
+  # on every tick and burned the whole budget in ~90s, escalating an actively-working goal.
+  #
+  # A failing verdict is information about the *work*, never evidence about the worker's activity.
+  # The only way to be stalled here is to be quiet: no liveness at all, or a worker that is
+  # demonstrably idle/errored. Activity resets `last_progress_at` (`refresh_progress/1`, on a
+  # receipt or a completed turn), so what the clock measures is now genuinely "no progress since
+  # anything last happened".
   defp stalled?(state) do
     goal = state.goal
     progress_at = goal.last_progress_at || Goal.now_ms()
-    contradicted? = match?(%Result{verdict: :contradicted}, state.last_verifier_result)
 
     goal.status in [:active, :verifying] and
       Goal.now_ms() - progress_at >= goal.stall_after_ms and
-      (state.worker_status in [nil, :idle, :error] or contradicted?)
+      state.worker_status in [nil, :idle, :error]
   end
 
   defp refresh_progress(state) do
-    %{state | goal: %{state.goal | last_progress_at: Goal.now_ms()}}
+    # `nudge_count: 0` is #48 (b): the budget measures *consecutive* unproductive ticks, not
+    # lifetime nudges. Demonstrated progress — a `report_progress` receipt, a completed turn, or a
+    # claim — means the goal is moving; whatever was nudged before has been answered, so the worker
+    # deserves a fresh budget. Without this reset the counter was monotonic, so any later stall in
+    # an hours-long goal escalated immediately with zero warning.
+    %{state | goal: %{state.goal | last_progress_at: Goal.now_ms(), nudge_count: 0}}
   end
 
   # -- nudges & escalation (§5.4–§5.5) -------------------------------------------------------
@@ -466,7 +516,14 @@ defmodule Athanor.GoalManager do
     updated_goal = %{goal | nudge_count: nudge_count, last_progress_at: Goal.now_ms()}
     state = state |> Map.put(:goal, updated_goal) |> note({:nudged, nudge_count})
 
-    Bus.send_command(goal.worker_id, {:enqueue_prompt, text})
+    # Control-plane, not conversational (#49a). `{:enqueue_prompt, text}` appended this to the
+    # worker's `prompt_queue`, which for a goal-attached session is drained only at a *task* boundary
+    # (`mid_turn_injection?/1` is false whenever `goal_id` is set, #44) — i.e. precisely never while
+    # the worker is stalled mid-task, which is the only time a nudge is sent. `{:goal_nudge, text}`
+    # goes to the agent's control queue and is appended at the next tool-round boundary instead, so
+    # the reminder can actually arrive while the task is still running. The user objective is
+    # untouched, so #44's "the worker's target is stable for the life of the goal" invariant holds.
+    Bus.send_command(goal.worker_id, {:goal_nudge, text})
     publish(state, {:goal_nudged, updated_goal, text})
     {:noreply, state}
   end
@@ -474,8 +531,20 @@ defmodule Athanor.GoalManager do
   defp escalate(state, reason) do
     state = state |> cancel_timer() |> terminate_goal(:escalated) |> note({:escalated, reason})
     goal = state.goal
-    text = escalation_text(goal, state.last_verifier_result, state.worker_status, reason)
 
+    text =
+      escalation_text(
+        goal,
+        state.last_verifier_result,
+        state.worker_status,
+        reason,
+        state.nudges_delivered
+      )
+
+    # A terminal goal is never nudged again, and never has anything enqueued onto its worker (#48's
+    # last criterion): the goal is gone, so a "[GOAL ESCALATED]" prompt would tell the worker about a
+    # goal that no longer exists. The escalation is *information for the parent*, and the parent is
+    # the only recipient.
     if is_binary(goal.parent_id) do
       Bus.send_command(goal.parent_id, {:enqueue_prompt, text})
     end
@@ -512,7 +581,7 @@ defmodule Athanor.GoalManager do
       "\nYou cannot close this goal — the Verifier must confirm it."
   end
 
-  defp escalation_text(goal, result, worker_status, reason) do
+  defp escalation_text(goal, result, worker_status, reason, nudges_delivered) do
     title_part = if is_binary(goal.title), do: " ('#{goal.title}')", else: ""
 
     verifier_desc =
@@ -525,9 +594,20 @@ defmodule Athanor.GoalManager do
           "not yet run"
       end
 
+    # #49d: "sent" and "delivered" are different numbers, and conflating them made a total delivery
+    # failure read as a disobedient worker. When nothing was delivered, say so explicitly — that is
+    # the actionable case (the remedy never reached the worker), as opposed to the worker having been
+    # told and not acting.
+    delivery =
+      if nudges_delivered == 0 do
+        "Nudges sent: #{goal.nudge_count}, delivered: 0 — the worker never consumed a nudge."
+      else
+        "Nudges sent: #{goal.nudge_count}, delivered: #{nudges_delivered}."
+      end
+
     "[GOAL ESCALATED] Goal #{goal.id}#{title_part} exceeded max_nudges (#{goal.max_nudges}) without verification (#{reason}).\n" <>
       "Verifier: #{verifier_desc}.\n" <>
-      "Nudges sent: #{goal.nudge_count}. Last worker status: #{worker_status || :unknown}. Requires Conductor/user intervention."
+      "#{delivery} Last worker status: #{worker_status || :unknown}. Requires Conductor/user intervention."
   end
 
   defp lookup_worker_pid(worker_id) do
