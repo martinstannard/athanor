@@ -97,3 +97,32 @@ a loop that keeps returning.
    Fixed by returning the state explicitly from `notify_prompt_queue/1`; the regression test
    stacks a prompt onto a busy agent and requires the turn to complete afterwards.
    (Same family as #1–#6: a value that is not the state reaching the state slot.)
+
+## Later find (2026-10-16, while implementing #54 item 1)
+
+8. **Bounding the TUI's RPCs was necessary but not sufficient: the loop was still *inside* them.**
+   Fix #1 above gave every TUI→daemon call a timeout, so a wedge no longer froze the UI *forever* —
+   but `Athanor.TUI.dispatch/3` still ran `{:submit, _}`, `{:enqueue, _}` and `{:cancel, _}` through
+   `Daemon.rpc/4` synchronously, and the loop is the only process reading keys or rendering. A daemon
+   that was merely slow (a big `launch_subagent`, a loaded scheduler, a stopped node) therefore
+   parked the UI for the whole timeout: Esc looked dead, typing did nothing, and nothing on screen
+   said why. The failure mode is identical to #1's, only shorter — and the bound itself is invisible
+   to the user, so "bounded" was not the property that mattered. The property that mattered is that
+   the loop is never *waiting*.
+
+   Fixed by splitting the verbs by whether they actually need the answer:
+   `Athanor.Daemon.cast/4` (`:erpc.cast/4` remotely, a direct `apply/3` locally, where the real
+   result — including `{:error, :not_found}` — is still returned) for the one-way ones, and a
+   `Task` + `{:rpc_result, tag, result}` message for the reply-bearing ones, so the result lands in
+   order against the state as it is *then*. `/clear`'s tag carries the session id for exactly that
+   reason: the reply can outlive the selection it was typed against.
+
+   The regression test is the interesting part, because the wedge cannot be produced inside one VM:
+   a local call is a direct `apply/3`, and a call to a node that does not exist fails *instantly*
+   (`:noconnection` arrives over the closed connection, so there is no window in which the call is
+   pending — verified). The only faithful `:erpc` wedge is a peer that is **connected but not
+   running**, which `SIGSTOP` gives deterministically: the distribution connection stays up (and
+   `Node.list/0` still lists the node) while its schedulers never answer.
+   `Athanor.Test.WedgePeer` owns that fixture, and `test/athanor/tui_wedge_test.exs` asserts the
+   dispatch returns in under 500 ms against a frozen peer and that a *follow-up key* is still
+   handled and rendered immediately afterwards.

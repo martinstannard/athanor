@@ -93,16 +93,26 @@ defmodule Athanor.TUI do
 
   ## Responsiveness
 
-  Two guards keep the single TUI loop responsive under load, because a frozen loop is
+  Three guards keep the single TUI loop responsive under load, because a frozen loop is
   indistinguishable from a wedged daemon:
 
     * **Event coalescing.** A streaming turn delivers one `{:text_delta, _}` per token and
       `render_frame/1` re-renders the whole transcript per frame; rendering per token starves
       input, so a token burst made Esc feel dead mid-stream. The loop folds every already-queued
       agent event into the state before the next render, collapsing a burst into one frame.
-    * **Bounded RPC.** Every daemon call goes through `Athanor.Daemon.rpc/4`, which passes
-      `Athanor.Config.rpc_timeout_ms/0` to `:erpc.call/5`. Without it `:erpc.call/4` defaults to
-      `:infinity`, so a wedged daemon would block the loop forever.
+    * **No RPC on the loop (#54).** The loop is the only process reading keys or rendering, so it
+      must never be *inside* a remote call — even a bounded one, because a wedge then looks
+      exactly like a frozen UI. Fire-and-forget verbs (`Enter`/prompt submit, the queue commands
+      and `Esc`'s cancel) are delivered one-way through `Athanor.Daemon.cast/4`
+      (`:erpc.cast` against a remote daemon, a direct call locally), and reply-bearing verbs
+      (`/spawn`, `/conductor`, `/kill`, `/resume`, `/clear`) run in a `Task` whose result the loop
+      applies as a later message, so no key press is ever queued behind a daemon reply. See
+      `dispatch_command/2` and `rpc_async/3`.
+    * **Bounded RPC.** Every *awaited* daemon call goes through `Athanor.Daemon.rpc/4`, which
+      passes `Athanor.Config.rpc_timeout_ms/0` to `:erpc.call/5`, so the `Task` above cannot hang
+      either. Without it `:erpc.call/4` defaults to `:infinity`, a wedged daemon would never
+      answer, and the failure would never be reported; with it the same
+      `[<verb>] daemon did not respond …` note appears — just later, and without the freeze.
   """
 
   alias Athanor.{Agent, Bus, Config, Daemon, Markdown, Store, Theme}
@@ -432,6 +442,12 @@ defmodule Athanor.TUI do
       {:agent_event, event} ->
         tui = handle_agent_event(tui, tui.active_id, event)
         loop(term, drain_pending_events(tui))
+
+      # The outcome of a reply-bearing verb that was handed to a `Task` (#54). Applied here, as an
+      # ordinary later message, so the result lands against the state as it is now — and in order
+      # with every other event — instead of blocking the loop that dispatched it.
+      {:rpc_result, tag, result} ->
+        loop(term, handle_rpc_result(tui, tag, result))
     after
       # The loop must wake on its own for the throbber to move. `tick/1` is a no-op unless
       # something is busy, so an idle TUI keeps `dirty: false` and skips the write too.
@@ -594,45 +610,87 @@ defmodule Athanor.TUI do
   # Runs one `handle_key/2` command. Kept out of `loop/2` so the loop stays a loop (Credo's
   # complexity budget) and the command table reads as a table.
   #
-  # Every daemon RPC here is now bounded (`Athanor.Config.rpc_timeout_ms/0`) and may return
-  # `{:error, :rpc_timeout | :rpc_failed}`, so the loop can never be blocked forever by a wedged
-  # daemon — and a failure is reported in the transcript instead of vanishing. See
-  # `docs/wedge-findings.md`.
+  # Nothing on this path waits for the daemon any more (#54). The loop is the only process reading
+  # keys or rendering, so being *inside* a remote call — however well bounded — is exactly what
+  # made a loaded or wedged daemon look like a frozen UI. Every command now either returns a new
+  # state immediately or hands the daemon work to a `Task` (`rpc_async/3`); a reply-bearing verb's
+  # outcome arrives later as a `{:rpc_result, tag, result}` message the loop folds in.
   defp dispatch(term, target_node, command) do
     case command do
-      {:quit, _tui} ->
-        :ok
+      {:quit, _tui} -> :ok
+      other -> loop(term, dispatch_command(target_node, other))
+    end
+  end
 
+  # Applies one command to `tui` **without entering the loop**, so the non-blocking dispatch of
+  # #54 can be asserted without a terminal — the same seam `clear_local_context/1` and
+  # `remove_local_session/2` already provide. `dispatch/3` is the loop-facing wrapper.
+  @doc false
+  @spec dispatch_command(node(), term()) :: t()
+  def dispatch_command(target_node, command) do
+    case command do
+      # `Enter`/prompt submit and Esc's cancel are **one-way** (#54). `send_session/2` and
+      # `cancel_session/1` on the daemon only look the session up and broadcast on the bus, so
+      # their reply was never used — it was only ever waited for. `Daemon.cast_*` sends the command
+      # without awaiting it, so Esc is again the "stop the line" gesture it claims to be rather
+      # than a round trip that can queue behind a wedged daemon.
+      #
+      # The local-target case still reports `{:error, :not_found}`: `Daemon.cast/4` short-circuits
+      # to a direct call (there is no distribution round trip to avoid) and returns its real
+      # result, which `rpc_note/3` turns into the same note as before. Remotely, `:erpc.cast`
+      # replies with nothing, so the agent's own events are the authority on what landed.
       {:submit, prompt, tui} ->
-        tui =
-          rpc_note(tui, Daemon.send_session(target_node, tui.active_id, prompt), "send prompt")
+        rpc_note(tui, Daemon.cast_send_session(target_node, tui.active_id, prompt), "send prompt")
 
-        loop(term, tui)
-
-      # Stacked prompt: same transport as `{:submit, _}` — `send_session/2` already routes through
-      # `{:enqueue_prompt, _}`, and the agent queues when busy — but the TUI bumps its own pending
-      # count immediately so the `⧗ N queued` indicator is right before the round trip lands.
+      # Stacked prompt: same one-way transport as `{:submit, _}` — the agent queues when busy — but
+      # the TUI bumps its own pending count immediately so the `⧗ N queued` indicator is right
+      # before the round trip lands.
       {:enqueue, prompt, tui} ->
         tui =
-          rpc_note(tui, Daemon.send_session(target_node, tui.active_id, prompt), "queue prompt")
+          rpc_note(
+            tui,
+            Daemon.cast_send_session(target_node, tui.active_id, prompt),
+            "queue prompt"
+          )
 
-        loop(term, optimistic_enqueue(tui, prompt))
+        optimistic_enqueue(tui, prompt)
 
       {:cancel, tui} ->
-        tui = rpc_note(tui, Daemon.cancel_session(target_node, tui.active_id), "cancel")
-        loop(term, tui)
+        rpc_note(tui, Daemon.cast_cancel_session(target_node, tui.active_id), "cancel")
 
       # `/clear`: reset the ACTIVE session's context on the agent, then (on success) drop the
       # local viewport transcript too — a server-side context that is gone must not keep
-      # rendering, or the user sees stale history that no longer exists. See `clear_context/2`.
+      # rendering, or the user sees stale history that no longer exists. Both halves have to agree
+      # on *which* session, and the reply can no longer arrive before the next key press, so the
+      # id is captured here and the local clearing names it explicitly (`handle_rpc_result/3`).
       {:clear_context, tui} ->
-        loop(term, clear_context(target_node, tui))
+        session_id = tui.active_id
 
-      {:cont, tui} ->
-        loop(term, tui)
+        rpc_async(tui, {:clear_context, session_id}, fn ->
+          Daemon.clear_context(target_node, session_id)
+        end)
 
       other ->
-        dispatch_session(term, target_node, other)
+        dispatch_awaited(target_node, other)
+    end
+  end
+
+  # The verbs that need a reply — and so run off the loop — kept in their own table so neither this
+  # nor `dispatch_command/2` exceeds the complexity budget.
+  defp dispatch_awaited(target_node, command) do
+    case command do
+      {:clear_context, tui} ->
+        session_id = tui.active_id
+
+        rpc_async(tui, {:clear_context, session_id}, fn ->
+          Daemon.clear_context(target_node, session_id)
+        end)
+
+      {:cont, tui} ->
+        tui
+
+      other ->
+        dispatch_session(target_node, other)
     end
   end
 
@@ -647,46 +705,45 @@ defmodule Athanor.TUI do
     do: add_system(tui, "[#{what}] daemon did not respond (#{inspect(reason)}); is it wedged?")
 
   defp rpc_note(tui, _other, _what), do: tui
-  # The `{:spawn_*}`, `{:theme, _}` and `{:resume, _}` commands each rebuild the TUI state before
-  # continuing; kept in their own table so neither this nor `dispatch/3` exceeds the complexity
-  # budget.
+
+  # Runs a **reply-bearing** daemon call off the loop (#54), returning the state unchanged so the
+  # caller can continue into the next key at once. The result arrives as a
+  # `{:rpc_result, tag, result}` message, which `loop/2` applies through `handle_rpc_result/3` —
+  # ordered against every other event, and against the state as it is *then*, not as it was when
+  # the verb was typed.
   #
-  # The spawn commands no longer pattern-match the RPC result with `{:ok, _, _} = …`: a bounded
-  # RPC can now fail, and an unconditional match would crash the TUI loop on exactly the wedge
-  # these fixes exist to survive.
-  defp dispatch_session(term, target_node, command) do
-    case command do
-      {:stats, scope, tui} ->
-        loop(term, stats_command(tui, scope))
+  # `Daemon.rpc/4` (which every one of these wrappers uses) is bounded by
+  # `Athanor.Config.rpc_timeout_ms/0`, so a wedged daemon cannot leave the `Task` pending forever:
+  # it comes back as `{:error, :rpc_timeout}` and is reported as the same
+  # `[<verb>] daemon did not respond …` note the synchronous path used to produce — only later, and
+  # without the freeze. A closure that raises anyway (a local direct call can, a remote one cannot)
+  # is reported the same way instead of taking the TUI down with it.
+  defp rpc_async(tui, tag, fun) do
+    loop_pid = self()
 
-      {:clear_queue, tui} ->
-        _ = send_queue_command(target_node, tui.active_id, :clear_prompt_queue)
-        loop(term, clear_local_queue(tui))
+    spawn(fn ->
+      result =
+        try do
+          fun.()
+        rescue
+          _error -> {:error, :rpc_failed}
+        end
 
-      {:drop_queued, tui} ->
-        _ = send_queue_command(target_node, tui.active_id, :drop_last_prompt)
-        loop(term, drop_last_local_queue_note(tui))
+      send(loop_pid, {:rpc_result, tag, result})
+    end)
 
-      {:spawn_subagent, title, prompt, tui} ->
-        parent_id = resolve_parent_conductor(tui)
-        loop(term, spawn_subagent(target_node, tui, parent_id, title, prompt))
-
-      {:spawn_conductor, title, tui} ->
-        loop(term, start_conductor(target_node, tui, title))
-
-      {:theme, name, tui} ->
-        loop(term, apply_theme(tui, name))
-
-      {:resume, id, tui} ->
-        loop(term, handle_resume(tui, target_node, id))
-
-      {:kill, id, force?, tui} ->
-        loop(term, handle_kill(tui, target_node, id, force?))
-    end
+    tui
   end
 
-  defp spawn_subagent(target_node, tui, parent_id, title, prompt) do
-    case Daemon.launch_subagent(target_node, parent_id, title, prompt) do
+  # Folds one async RPC outcome into the state. Public (`@doc false`) because it is the seam a test
+  # asserts the non-blocking dispatch's *other* half through: `dispatch_command/2` returns the state
+  # immediately and this is what a later `{:rpc_result, tag, result}` message runs, so the pair can
+  # be driven end to end without a terminal. The single place a reply-bearing verb's result is
+  # interpreted, and pure for that reason.
+  @doc false
+  @spec handle_rpc_result(t(), term(), term()) :: t()
+  def handle_rpc_result(tui, {:spawn_subagent, title, parent_id}, result) do
+    case result do
       {:ok, child_id, _pid} ->
         ensure_session(tui, child_id, %{title: title, role: :worker, parent_id: parent_id})
 
@@ -695,8 +752,8 @@ defmodule Athanor.TUI do
     end
   end
 
-  defp start_conductor(target_node, tui, title) do
-    case Daemon.start_conductor(target_node, title: title, model: tui.model) do
+  def handle_rpc_result(tui, {:spawn_conductor, title}, result) do
+    case result do
       {:ok, cond_id, _pid} ->
         tui
         |> ensure_session(cond_id, %{title: title, role: :conductor, parent_id: nil})
@@ -704,6 +761,143 @@ defmodule Athanor.TUI do
 
       {:error, reason} ->
         add_system(tui, "Could not start conductor '#{title}': #{inspect(reason)}")
+    end
+  end
+
+  def handle_rpc_result(tui, {:resume, id}, result) do
+    case result do
+      {:ok, sessions} ->
+        tui
+        |> ensure_session(id, %{})
+        |> Map.put(:active_id, id)
+        |> Map.put(:scroll_offset, 0)
+        |> hydrate_sessions(sessions)
+
+      {:error, reason} ->
+        add_system(tui, "Could not resume #{id}: #{inspect(reason)}")
+    end
+  end
+
+  def handle_rpc_result(tui, {:kill, id, force?}, result) do
+    case result do
+      {:ok, _removed} ->
+        tui |> remove_local_session(id) |> note_removed(id, force?)
+
+      {:error, :busy} ->
+        add_system(
+          tui,
+          "#{id} is mid-turn; /kill #{id} --force to terminate it (its transcript is kept)."
+        )
+
+      {:error, :not_found} ->
+        add_system(tui, "No such session: #{id}")
+
+      {:error, reason} ->
+        add_system(tui, "Could not kill #{id}: #{inspect(reason)}")
+    end
+  end
+
+  # Names the session explicitly: the reply may land after the user has moved the selection, and
+  # the context that was reset is the one that was active when `/clear` was typed. `session_id` is
+  # what the tag carried, not `tui.active_id`, which is why it is passed rather than assumed.
+  def handle_rpc_result(tui, {:clear_context, session_id}, :ok) do
+    if session_id == tui.active_id do
+      clear_local_context(tui)
+    else
+      update_session(tui, session_id, &cleared_view/1)
+    end
+  end
+
+  def handle_rpc_result(tui, {:clear_context, _session_id}, other) do
+    rpc_note(tui, other, "clear context")
+  end
+
+  # An outcome for a verb this build does not know (or one whose tag never got a handler): the
+  # state is left alone rather than crashing the loop on a message it cannot interpret.
+  def handle_rpc_result(tui, _tag, _result), do: tui
+
+  # The `{:spawn_*}`, `{:theme, _}` and `{:resume, _}` commands each rebuild the TUI state before
+  # continuing; kept in their own table so neither this nor its siblings exceeds the complexity
+  # budget.
+  #
+  # The `{:spawn_*}` commands no longer pattern-match the RPC result with `{:ok, _, _} = …`: that
+  # work now happens in `handle_rpc_result/3` against a result that may be a failure — a bounded RPC
+  # can time out, and an unconditional match would crash the loop on exactly the wedge these fixes
+  # exist to survive.
+  #
+  # Each reply-bearing verb is handed to `rpc_async/3`; `/stats` is deliberately *not*, because it
+  # is RPC-free (it reads the stats the agent already published once per turn, #26) and so has
+  # nothing to wait for.
+  defp dispatch_session(target_node, command) do
+    case command do
+      {:stats, scope, tui} ->
+        stats_command(tui, scope)
+
+      {:clear_queue, tui} ->
+        _ = send_queue_command(target_node, tui.active_id, :clear_prompt_queue)
+        clear_local_queue(tui)
+
+      {:drop_queued, tui} ->
+        _ = send_queue_command(target_node, tui.active_id, :drop_last_prompt)
+        drop_last_local_queue_note(tui)
+
+      # Bare `/resume` and `/kill` are pure local listings, so they answer at once.
+      {:resume, nil, tui} ->
+        list_resumable_sessions(tui)
+
+      {:kill, nil, _force?, tui} ->
+        list_killable_sessions(tui)
+
+      {:theme, name, tui} ->
+        apply_theme(tui, name)
+
+      other ->
+        dispatch_remote_session(target_node, other)
+    end
+  end
+
+  # The verbs that actually need the daemon, each handed to `rpc_async/3` so the loop never waits.
+  defp dispatch_remote_session(target_node, command) do
+    case command do
+      {:spawn_subagent, title, prompt, tui} ->
+        parent_id = resolve_parent_conductor(tui)
+
+        rpc_async(tui, {:spawn_subagent, title, parent_id}, fn ->
+          Daemon.launch_subagent(target_node, parent_id, title, prompt)
+        end)
+
+      {:spawn_conductor, title, tui} ->
+        model = tui.model
+
+        rpc_async(tui, {:spawn_conductor, title}, fn ->
+          Daemon.start_conductor(target_node, title: title, model: model)
+        end)
+
+      {:resume, id, tui} ->
+        rpc_async(tui, {:resume, id}, fn -> resume_and_fetch(target_node, id) end)
+
+      {:kill, id, force?, tui} ->
+        rpc_async(tui, {:kill, id, force?}, fn ->
+          Daemon.remove_session(target_node, id, force: force?)
+        end)
+    end
+  end
+
+  # The daemon half of `/resume <id>`: rehydrate the session, then fetch the transcript for its
+  # viewport. Both are daemon round trips, so both live in the `Task` — the second is the one that
+  # actually pulls the history across (plan §6.4), and doing it on the loop would have kept the
+  # freeze for the slowest part of the verb.
+  defp resume_and_fetch(target_node, id) do
+    case Daemon.resume_session(target_node, id) do
+      {:ok, resumed_id, _pid} when resumed_id == id ->
+        sessions = target_node |> Daemon.fetch_full_sessions() |> Enum.filter(&(&1.id == id))
+        {:ok, sessions}
+
+      {:ok, other_id, _pid} ->
+        {:error, {:unexpected_session_id, other_id}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1097,18 +1291,14 @@ defmodule Athanor.TUI do
 
   # `/clear-queue` and `/unqueue` both mutate the agent-owned queue, so the remote half must be
   # published on the *owning* node's PubSub (the agent subscribes there): a daemon-attached client
-  # RPCs `Bus.send_command/2` on the daemon, a local client short-circuits. Bounded like every other
-  # RPC (`Athanor.Config.rpc_timeout_ms/0`): an unbounded `:erpc.call/4` would freeze the TUI loop if
-  # the daemon hung between rendering and this call.
+  # casts `Bus.send_command/2` at the daemon, a local client short-circuits. **One-way** like the
+  # other bus verbs (#54): the command is a broadcast the agent acts on, and the reply — which the
+  # sync path discarded anyway — is not worth the loop waiting for.
   defp send_queue_command(target_node, session_id, command) do
-    if target_node == Node.self() do
-      Bus.send_command(session_id, command)
-    else
-      _ = Daemon.rpc(target_node, Bus, :send_command, [session_id, command])
-      :ok
-    end
+    Daemon.cast(target_node, Bus, :send_command, [session_id, command])
+    :ok
   rescue
-    # A client must never die because the daemon hung up between rendering and the RPC.
+    # A client must never die because the daemon hung up between rendering and the cast.
     _ -> :ok
   end
 
@@ -1165,10 +1355,10 @@ defmodule Athanor.TUI do
   Empties the active session's local viewport transcript — the client half of `/clear`
   (issue #31).
 
-  Called by `dispatch/3` after a *successful* `Athanor.Daemon.clear_context/2`, and shared with
-  the agent's own `{:context_cleared, _}` event through `cleared_view/1`, so the issuing client
-  and every attached peer converge on the same view. Public and pure because it is easy to assert
-  without a terminal.
+  Applied by `handle_rpc_result/3` after a *successful* `Athanor.Daemon.clear_context/2`, and
+  shared with the agent's own `{:context_cleared, _}` event through `cleared_view/1`, so the
+  issuing client and every attached peer converge on the same view. Public and pure because it is
+  easy to assert without a terminal.
   """
   @spec clear_local_context(t()) :: t()
   def clear_local_context(tui) do
@@ -1179,8 +1369,8 @@ defmodule Athanor.TUI do
   Drops one session from the local deck: its viewport, its entry in `session_order`, and — when it
   was the active one — the active selection, which moves to the nearest remaining session.
 
-  Pure, and called by `dispatch/3` for `{:kill, …}` **only after** `Athanor.Daemon.remove_session/3`
-  reports success, so the deck never forgets a session that is still running on the daemon. The
+  Pure, and applied for `{:kill, …}` **only after** `Athanor.Daemon.remove_session/3` reports
+  success, so the deck never forgets a session that is still running on the daemon. The
   killed session's *transcript* is untouched here (§10.9 T5): it lives on disk and `/resume` can
   still offer it — this only forgets the live view.
   """
@@ -1216,18 +1406,6 @@ defmodule Athanor.TUI do
       nil -> tui.active_id
       %{id: id} -> id
       id -> id
-    end
-  end
-
-  # `/clear`: ask the daemon to reset the ACTIVE session's context, and drop the local viewport
-  # transcript **only when that succeeds**. A failed (unreachable or wedged) daemon must not leave
-  # the user looking at an empty viewport for a context that is still live server-side; the
-  # failure is reported through `rpc_note/3` instead. Bounded like every other RPC
-  # (`Athanor.Daemon.rpc/4`), never a bare `:erpc.call/4`.
-  defp clear_context(target_node, tui) do
-    case Daemon.clear_context(target_node, tui.active_id) do
-      :ok -> clear_local_context(tui)
-      other -> rpc_note(tui, other, "clear context")
     end
   end
 
@@ -2116,52 +2294,15 @@ defmodule Athanor.TUI do
   defp describe_daemon_error(:daemon_not_ready), do: "daemon is still starting up"
   defp describe_daemon_error(other), do: inspect(other)
 
-  # `/resume` with no id: list what is on disk. With an id: rehydrate it on the daemon and
-  # rebuild its viewport through the existing `hydrate_sessions/2` +
-  # `Daemon.messages_to_tui_entries/1` path — deliberately no new rendering (plan §6.4).
-  defp handle_resume(tui, _target_node, nil), do: list_resumable_sessions(tui)
-
-  defp handle_resume(tui, target_node, id) do
-    case Daemon.resume_session(target_node, id) do
-      {:ok, ^id, _pid} ->
-        sessions = target_node |> Daemon.fetch_full_sessions() |> Enum.filter(&(&1.id == id))
-
-        tui
-        |> ensure_session(id, %{})
-        |> Map.put(:active_id, id)
-        |> Map.put(:scroll_offset, 0)
-        |> hydrate_sessions(sessions)
-
-      {:error, reason} ->
-        add_system(tui, "Could not resume #{id}: #{inspect(reason)}")
-    end
-  end
-
-  # `/kill` with no id: list the sessions the deck currently knows are running. With an id: ask the
-  # daemon to remove it (design §10.3) and, **only on success**, drop it from the local deck. The
-  # local removal is shared with nothing else and is pure (`remove_local_session/2`) so it can be
-  # asserted without a terminal, exactly like `clear_local_context/1`.
-  defp handle_kill(tui, _target_node, nil, _force?), do: list_killable_sessions(tui)
-
-  defp handle_kill(tui, target_node, id, force?) do
-    case Daemon.remove_session(target_node, id, force: force?) do
-      {:ok, _} ->
-        tui |> remove_local_session(id) |> note_removed(id, force?)
-
-      {:error, :busy} ->
-        add_system(
-          tui,
-          "#{id} is mid-turn; /kill #{id} --force to terminate it (its transcript is kept)."
-        )
-
-      {:error, :not_found} ->
-        add_system(tui, "No such session: #{id}")
-
-      {:error, reason} ->
-        add_system(tui, "Could not kill #{id}: #{inspect(reason)}")
-    end
-  end
-
+  # `/resume` with no id is handled in the command table (it is a pure local listing); this is the
+  # **daemon half** of `/resume <id>`, so it can run in the `Task` that `dispatch_session/2` starts
+  # (#54). It rehydrates the session, then fetches its transcript so the joiner's viewport can be
+  # rebuilt through the existing `hydrate_sessions/2` + `Daemon.messages_to_tui_entries/1` path —
+  # deliberately no new rendering (plan §6.4). The id is checked rather than bound: a daemon that
+  # answered with a different session must be an error, not a silent viewport swap.
+  # The local half of `/kill <id>`: the daemon has confirmed the process is gone, so the deck drops
+  # it. Shared with nothing else and pure (`remove_local_session/2`), so it can be asserted without
+  # a terminal, exactly like `clear_local_context/1`.
   defp note_removed(tui, id, force?) do
     suffix = if force?, do: " (forced, mid-turn)", else: ""
     add_system(tui, "Removed #{id}#{suffix} — its transcript is kept; /resume can offer it again.")

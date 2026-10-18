@@ -31,6 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
 
 ### Changed
+- The TUI no longer makes any *awaited* daemon call on its input/render loop (#54). `Enter`/prompt submit, the queue verbs and `Esc`'s cancel are delivered one-way through the new `Athanor.Daemon.cast/4` (`:erpc.cast/4` against a remote daemon, a direct call locally); the reply-bearing verbs (`/spawn`, `/conductor`, `/kill`, `/resume`, `/clear`) run in a `Task` whose result the loop applies as a later message. Bounding those calls was not enough — a loaded or wedged daemon still parked the only process that reads keys or renders, which is indistinguishable from a frozen UI
 - `/.athanor/` (harness memory for a checkout) is gitignored as runtime state; commit a curated `MEMORY.md` with `git add -f` (#46)
 - `learnings.jsonl` compacts itself past 256 KB (`ATHANOR_MEMORY_COMPACT_BYTES`) (#41)
 - TUI header: show daemon connectivity (#25)

@@ -610,6 +610,57 @@ defmodule Athanor.Daemon do
   end
 
   @doc """
+  One-way (fire-and-forget) counterpart of `rpc/4` (#54 item 1).
+
+  Against a remote node this is `:erpc.cast/4`: the request is sent and **no reply is awaited**, so
+  the caller cannot be stalled by a loaded or wedged daemon (the cost `rpc/4` pays even with its
+  bound), which matters because the only caller is the single TUI loop. Against this node it is the
+  same direct `apply/3` `rpc/4` makes — a cheap in-VM call with no distribution round trip —
+  whose result *is* returned, so a local caller still sees `{:error, :not_found}`.
+  (`:erpc.cast/4` returns `:ok` for a remote target: there is no reply to report, and a
+  transport failure is therefore invisible here rather than reported — use `rpc/4` when the
+  failure needs to be surfaced.)
+
+  Only for verbs whose reply carries nothing the caller acts on — the `Athanor.Bus`-broadcast
+  verbs `send_session/2`, `cancel_session/1` and `Athanor.Bus.send_command/2`. See
+  `cast_send_session/3` and `cast_cancel_session/2`.
+  """
+  @spec cast(node(), module(), atom(), [term()]) :: term()
+  def cast(node, module, function, args) do
+    if node == Node.self() do
+      apply(module, function, args)
+    else
+      :erpc.cast(node, module, function, args)
+    end
+  end
+
+  @doc """
+  Sends a prompt (or a stacked prompt) to a session **without waiting for a reply** (#54 item 1).
+
+  `send_session/2` on the daemon only looks the session up and broadcasts `{:enqueue_prompt, _}` on
+  the bus, so the reply it computed was thrown away — while the wait for it cost the TUI loop a
+  full round trip (up to `Athanor.Config.rpc_timeout_ms/0`) before it could read another key.
+  `{:error, :not_found}` is reported for a **local** target (see `cast/4`); for a remote one the
+  agent's own `{:user_message, _}` / `{:prompt_queue, _}` events are the authority on what landed.
+  """
+  @spec cast_send_session(node(), String.t(), String.t()) :: term()
+  def cast_send_session(target_node, session_id, prompt) do
+    cast(target_node, Orchestrator, :send_session, [session_id, prompt])
+  end
+
+  @doc """
+  Cancels a session's active turn **without waiting for a reply** (#54 item 1).
+
+  This is the `Esc` path: the stop-the-line gesture must not queue behind a daemon round trip. Like
+  `send_session/2`, the daemon-side `cancel_session/1` only broadcasts `:cancel`, so nothing was
+  gained by awaiting it.
+  """
+  @spec cast_cancel_session(node(), String.t()) :: term()
+  def cast_cancel_session(target_node, session_id) do
+    cast(target_node, Orchestrator, :cancel_session, [session_id])
+  end
+
+  @doc """
   Resets one session's conversation context in place on `target_node` (design §7.4, §10.6).
 
   Thin bounded `rpc/4` wrapper over `Athanor.Orchestrator.clear_context/1` — the `/clear` verb. The
