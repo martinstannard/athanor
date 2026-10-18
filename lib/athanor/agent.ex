@@ -98,6 +98,23 @@ defmodule Athanor.Agent do
   whatever the flag says. The stacked prompt is not dropped — it drains at the next task boundary,
   exactly as it did before this feature, and the TUI indicator keeps showing it meanwhile.
 
+  ### The control plane (#49)
+
+  `Athanor.GoalManager`'s nudges do **not** travel on the conversational queue. They arrive as
+  `{:goal_nudge, text}` and fill a separate `control_queue`, drained at the next tool-round boundary
+  (or at once when nothing is in flight, and at a task boundary too — a prose-only worker never makes
+  a tool call) by `append_one_control_prompt/1`. The reason is #49: a nudge sent as a queued prompt to
+  a goal-attached session can never arrive, because the drain that would carry it is suppressed by
+  the goal exemption above — the remedy queued behind the very condition it had to cure. A nudge is a
+  reminder about the objective already in flight, not a new instruction, so it needs no exemption:
+  `mid_turn_injection?/1` is deliberately not consulted for it, and #44's invariant ("no *user* text
+  can rewrite a goal worker's target mid-flight") therefore still holds. Consumed nudges are counted
+  (`nudges_delivered`) and mirrored back to the manager as `{:nudge_delivered, _}`, so an escalation
+  can say what was delivered rather than only what was sent. `cancel/1` deliberately leaves the
+  control queue alone: its "stop everything" gesture is about the conversational work, and a nudge
+  stays relevant because the goal it refers to survives the cancel — it is simply delivered on the
+  next turn the session runs, rather than starting one of its own.
+
   **Cancel clears the queue.** `cancel/1` (Esc in the TUI) is a stop-the-line gesture: it kills the
   in-flight turn *and* discards every queued prompt, publishing `{:prompt_queue, %{len: 0}}`.
   Retaining the queue would start the very next stacked prompt the moment the killed turn unwound —
@@ -227,6 +244,13 @@ defmodule Athanor.Agent do
     compacted?: false,
     messages: [],
     prompt_queue: :queue.new(),
+    # Control-plane instructions (#49a) — see `append_one_control_prompt/1`. Deliberately NOT
+    # `prompt_queue`: a nudge is machine-to-machine and must not wait behind the conversational
+    # queue, nor be readable as a new user objective (#44's invariant).
+    control_queue: :queue.new(),
+    # How many goal nudges this session actually consumed (#49d). Reported at escalation so
+    # "nudged 3 times and it never listened" is distinguishable from "never nudged at all".
+    nudges_delivered: 0,
     watchdog: nil
   ]
 
@@ -539,6 +563,11 @@ defmodule Athanor.Agent do
       turn_count: state.turn_count,
       goal_id: state.goal_id,
       prompt_queue_len: prompt_queue_len(state),
+      # Control-plane state (#49): how many goal nudges this session consumed, and how many are
+      # still waiting for a round boundary. Visible so "the worker was never told" is a fact a live
+      # `:sys.get_state`/`Tool.get_state` read can settle, not an inference.
+      nudges_delivered: state.nudges_delivered,
+      control_queue_len: :queue.len(state.control_queue),
       stats: public_stats(state)
     }
 
@@ -577,6 +606,17 @@ defmodule Athanor.Agent do
 
   def handle_info({:bus_command, {:enqueue_prompt, text}}, state) do
     {:noreply, do_enqueue_prompt(state, text)}
+  end
+
+  # The control-plane delivery path (#49a): an ``Athanor.GoalManager`` nudge, as opposed to a
+  # conversational follow-up. It never touches `prompt_queue`/`messages` mid-task and is consumed at
+  # the next tool-round boundary through `append_one_control_prompt/1`, because a stalled worker by
+  # definition may not reach a task boundary for a long time (the nudge used to sit behind the very
+  # condition it had to cure).
+  def handle_info({:bus_command, {:goal_nudge, text}}, state) when is_binary(text) do
+    state = %{state | control_queue: :queue.in(text, state.control_queue)}
+    notify(state, {:control_queue, %{len: :queue.len(state.control_queue)}})
+    {:noreply, do_drain_control(state)}
   end
 
   def handle_info({:bus_command, :clear_prompt_queue}, state) do
@@ -627,7 +667,7 @@ defmodule Athanor.Agent do
         state = set_status(state, :idle)
         notify(state, {:turn_complete, assistant_msg.content})
         maybe_publish_child_done(state, assistant_msg.content)
-        {:noreply, drain_prompt_queue(state)}
+        {:noreply, continue_after_turn(state)}
 
       tool_calls when is_list(tool_calls) ->
         {:noreply, start_tool_execution(state, tool_calls)}
@@ -663,7 +703,11 @@ defmodule Athanor.Agent do
       # the next request goes out — injection, not interruption. This is after `record_messages/2`
       # on purpose and must stay there: appending a `user` message between an assistant
       # `tool_calls` and its `tool` answers is the malformed history the API rejects (#29's class).
-      {:noreply, state |> drain_one_queued_prompt() |> start_llm_turn()}
+      #
+      # The control-plane drain comes first and is *not* gated by `mid_turn_injection?/1`: a goal
+      # worker opts out of conversational mid-round injection (#44) but must still receive the
+      # manager's nudges (#49).
+      {:noreply, state |> append_one_control_prompt() |> drain_one_queued_prompt() |> start_llm_turn()}
     end
   end
 
@@ -689,7 +733,7 @@ defmodule Athanor.Agent do
       |> set_status(:error)
 
     notify(state, {:error, "Turn timed out in #{phase} after #{state.turn_timeout_ms}ms"})
-    {:noreply, drain_prompt_queue(state)}
+    {:noreply, continue_after_turn(state)}
   end
 
   # A stale timer from a task that already completed (the `disarm` raced it): ignore.
@@ -1082,6 +1126,104 @@ defmodule Athanor.Agent do
     end
   end
 
+  # -- control plane (#49a) ----------------------------------------------------------------
+
+  # The delivery path for `Athanor.GoalManager` nudges, deliberately **not** the conversational
+  # prompt queue.
+  #
+  # Issue #49: `nudge/1` used `{:enqueue_prompt, text}`, which is `do_enqueue_prompt/2`, which for a
+  # mid-task session only appends to `state.prompt_queue` — and a queued prompt drains at a boundary,
+  # gated by `mid_turn_injection?/1`, which is **unconditionally false for any session with a live
+  # `goal_id`** (#44's decision, below). So the remedy was queued behind the very condition it was
+  # meant to cure: observed live, three consecutive `[GOAL NUDGE n/3]` texts sat unconsumed in a goal
+  # worker's queue for 25+ minutes while it streamed.
+  #
+  # Option (a) from the issue, chosen over (b)/(c):
+  #
+  #   * not (b) "drain the prompt queue mid-round too" — that reverts #44's suppression, which was a
+  #     deliberate decision: injecting a new **user objective** into a goal worker mid-task could
+  #     send it chasing a different objective while the verifier keeps judging the original;
+  #   * not (c) "interrupt the turn (Esc-like)" — that throws away in-flight work, which is far worse
+  #     than a delayed reminder.
+  #
+  # A nudge is **control-plane**: a reminder about the objective already in flight, not a new
+  # instruction. So it gets its own queue, its own message shape (the text is fixed and trusted, not
+  # a user's words — `[GOAL NUDGE …]` is machine-generated), and its own drain point
+  # (`append_one_control_prompt/1`, from the tool-round boundary). #44's invariant is untouched: the
+  # conversational queue still waits for the task boundary, so no *user* text can redirect a goal
+  # worker mid-flight.
+  #
+  # This is not a second, class-discriminating definition of `mid_turn_injection?/1` competing with
+  # it — it is a separate path that does not consult it at all.
+  # The control queue is not a channel for new instructions: only the manager's own
+  # `{:goal_nudge, _}` command fills it, and the text it carries is generated by
+  # `Athanor.GoalManager.nudge_text/4` — a reminder about the objective already in flight. That is
+  # why draining it does not consult `mid_turn_injection?/1` (#44): nothing here can redirect a
+  # worker onto a different objective, which is the invariant #44 protects.
+  defp append_one_control_prompt(state) do
+    case :queue.out(state.control_queue) do
+      {{:value, text}, rest} ->
+        state = %{state | control_queue: rest, nudges_delivered: state.nudges_delivered + 1}
+        notify(state, {:control_queue, %{len: :queue.len(rest)}})
+        # Same write path as any other append (`record_messages/2`), so the nudged round is persisted
+        # and a resumed session sees the history it actually ran. `{:nudge_delivered, text}` is how
+        # `Athanor.GoalManager` — subscribed to this worker's events — learns the nudge was *consumed*
+        # rather than merely sent (#49d); `{:user_message, _}` would be a lie, because no user wrote
+        # this.
+        state =
+          state
+          |> record_messages(%{role: "user", content: text})
+          |> announce_nudge_delivered(text)
+
+        state
+
+      {:empty, _} ->
+        state
+    end
+  end
+
+  # Returns the **state**, not `notify/2`'s `:ok` — the exact trap `notify_prompt_queue/1`'s comment
+  # records below: a piped helper that ends on the notification sets the GenServer's state to the atom
+  # `:ok`, after which every later message fails to match and the session is silently dead.
+  defp announce_nudge_delivered(state, text) do
+    notify(state, {:nudge_delivered, text})
+    state
+  end
+
+  # A nudge arriving while the session is between turns is delivered at once, so the common case
+  # (an idle-then-nudged worker) does not wait for a round boundary that is never coming. While a
+  # turn *is* in flight there is nothing to continue — the nudge waits in the control queue and is
+  # appended at the next tool-round boundary by the `{:tools_result, …}` handler.
+  #
+  # No prompt-queue bookkeeping is done here: the control queue is separate state and announces
+  # itself with `{:control_queue, %{len: n}}`, so `prompt_queue_len` keeps meaning "stacked user
+  # prompts" (which the TUI renders and `clear_prompt_queue/1` empties — neither may touch a nudge).
+  defp do_drain_control(%{status: status} = state) when status in [:idle, :error] do
+    if :queue.is_empty(state.control_queue) do
+      state
+    else
+      # Nothing in flight to append to, so the nudge needs a turn of its own — but *only* the nudge;
+      # the conversational queue keeps its own rules and starts nothing here.
+      state |> append_one_control_prompt() |> start_llm_turn()
+    end
+  end
+
+  defp do_drain_control(state), do: state
+
+  # A completed task is a boundary too (#49), and a prose-only worker never makes a tool call: if the
+  # control queue were drained only at tool-round boundaries, a nudge to such a worker would simply
+  # be stranded one boundary later — the bug this fix exists to remove. The control plane takes
+  # precedence over a stacked user prompt: the nudge is about the goal already in flight, and feeding
+  # the queued objective first would answer the nudge out of context. With no nudge pending this is
+  # exactly the old `drain_prompt_queue/1` behaviour.
+  defp continue_after_turn(state) do
+    if :queue.is_empty(state.control_queue) do
+      drain_prompt_queue(state)
+    else
+      do_drain_control(state)
+    end
+  end
+
   # -- mid-task pickup (#44) ---------------------------------------------------------------
 
   # The `{:tools_result, …}` half of the queue drain: append **at most one** queued prompt as a
@@ -1248,10 +1390,24 @@ defmodule Athanor.Agent do
 
       report ->
         cond do
-          GoalManager.registered?(goal_id) -> notify(state, {:goal_candidate_done, report})
-          GoalManager.resolved?(goal_id) -> :ok
-          state.notify_parent_on_done and is_binary(state.parent_id) -> notify(state, {:child_done, report})
-          true -> :ok
+          GoalManager.registered?(goal_id) ->
+            # A claim, not a verdict (C1): the manager verifies and decides.
+            notify(state, {:goal_candidate_done, report})
+
+          GoalManager.resolved?(goal_id) ->
+            # #50: a *resolved* goal (closed or escalated) must not mute this worker. Observed live:
+            # a set_goal verifier that passed against partial work closed the goal at t=0, the worker
+            # streamed on for 25+ minutes and really finished — and the parent was notified of
+            # nothing, because this clause returned `:ok` *before* the parent-notify clause below.
+            # Silencing the claim is right (the goal's own verdict already spoke); silencing the
+            # worker's real completion is not. `notify_parent_on_done` cannot gate this either: it
+            # is `false`/`nil` for plenty of goal-attached sessions (a session whose goal was
+            # attached by `set_goal` rather than spawned with one), so the only thing that could
+            # still carry the news would be dropped.
+            notify_parent_done(state, report)
+
+          true ->
+            notify_parent_done(state, report)
         end
     end
   end
@@ -1268,6 +1424,24 @@ defmodule Athanor.Agent do
   end
 
   defp maybe_publish_child_done(_state, _content), do: :ok
+
+  # The parent-facing completion. Emitted whenever a parent exists and nobody explicitly opted out —
+  # `false` is the only silencing value. `nil` (the field's default when `:notify_parent_on_done` was
+  # never passed) means "no preference", and treating it as "stay quiet" is exactly how a real
+  # completion goes unreported; a goal-attached session routinely has this unset, so the fix for #50
+  # cannot lean on `true` being there. Kept as one helper so the three ways a worker can become done
+  # (a live goal's claim, a *resolved* goal whose worker really finished, or no goal at all) cannot
+  # drift in what they report.
+  defp notify_parent_done(%{parent_id: parent_id} = state, report)
+       when is_binary(parent_id) do
+    if state.notify_parent_on_done == false do
+      :ok
+    else
+      notify(state, {:child_done, report})
+    end
+  end
+
+  defp notify_parent_done(_state, _report), do: :ok
 
   # The one shape both paths publish, derived from the *same* sentinel the conductor's handler has
   # always understood — no new grammar (plan §4.4).
@@ -1457,6 +1631,7 @@ defmodule Athanor.Agent do
       status: state.status,
       session_id: state.session_id,
       prompt_queue_len: prompt_queue_len(state),
+      nudges_delivered: state.nudges_delivered,
       stats: public_stats(state)
     }
   end
