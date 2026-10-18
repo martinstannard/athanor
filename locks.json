@@ -1,13 +1,6 @@
 {
   "version": 1,
-  "locks": {
-    "23": {
-      "agent_id": "conductor-main",
-      "branch": "feat/23-agent-skills",
-      "claimed_at": "2026-10-18T01:26:51.763835110Z",
-      "signed_by": "conductor-main"
-    }
-  },
+  "locks": {},
   "settings": {
     "stale_lock_timeout_minutes": 60
   }
