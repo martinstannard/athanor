@@ -21,6 +21,21 @@ defmodule Athanor.Memory do
   **Session scope is not persisted in phase 1.** The tool schema offers `project` and `global`
   only; an in-memory session tier is a later milestone (plan OQ11). Secrets are scrubbed on write
   and again on injection (`Athanor.Memory.Redact`).
+
+  ## Tier resolution and `root:`
+
+  Every function here takes the same options and resolves every tier through one place
+  (`tier_dir/2`), so `remember`, `recall`, `forget`, `distill` and `resolve` cannot disagree about
+  where a tier lives:
+
+    * default and `:cd` — the project tier ascends from the session's working directory to its
+      workspace root (a §7.1 worktree resolves to the repository it was branched from, so memory is
+      shared, not forked); the global tier is `Config.memory_global_dir/0`.
+    * `:root` — authoritative and literal (issue #51): the project tier is `<root>/.athanor` and
+      the global tier `<root>/memory`, with **no ascent**. A caller that scopes a call to a scratch
+      directory therefore reads and writes that directory alone, instead of silently escaping into
+      the ambient checkout the way a bare `workspace_root/1` ascent from a `:root`-less `cd` would.
+    * `:global_dir` — overrides the global tier alone; wins over `:root`.
   """
 
   alias Athanor.Config
@@ -54,6 +69,9 @@ defmodule Athanor.Memory do
 
     * `:cd` — the session's working directory (defaults to the current directory). A §7.1
       worktree resolves to the repository it was branched from, so memory is shared, not forked.
+    * `:root` — the Store root, taken **literally**: the project tier is `<root>/.athanor` with no
+      ascent, and the global tier is `<root>/memory`. Authoritative over `:cd`, so a caller that
+      scopes a call to a scratch directory reads that directory alone (issue #51).
     * `:global_dir` — overrides the global tier root (tests and §7.7 daemon deployments).
 
   Never touches the filesystem beyond reading directory entries, and never creates `.athanor/`
@@ -61,13 +79,23 @@ defmodule Athanor.Memory do
   """
   @spec resolve(keyword()) :: resolved()
   def resolve(opts \\ []) do
-    cd = opts |> Keyword.get(:cd, File.cwd!()) |> Path.expand()
+    case scoped_root(opts) do
+      {:ok, root} ->
+        %{
+          workspace_root: root,
+          project_dir: existing_project_dir(root),
+          global_dir: global_tier_dir(opts)
+        }
 
-    %{
-      workspace_root: Store.workspace_root(cd),
-      project_dir: Store.project_dir(cd),
-      global_dir: Keyword.get(opts, :global_dir, Config.memory_global_dir())
-    }
+      :unscoped ->
+        cd = opts |> Keyword.get(:cd, File.cwd!()) |> Path.expand()
+
+        %{
+          workspace_root: Store.workspace_root(cd),
+          project_dir: Store.project_dir(cd),
+          global_dir: global_tier_dir(opts)
+        }
+    end
   end
 
   @doc """
@@ -325,14 +353,51 @@ defmodule Athanor.Memory do
 
   # -- shared helpers --------------------------------------------------------
 
+  # Issue #51: `:root` is the Store root and is authoritative — a caller that scopes itself to a
+  # scratch directory must not reach the ambient checkout. It is taken *literally* rather than fed
+  # through `Store.workspace_root/1`: that function ascends (and follows worktree `.git` files),
+  # which is exactly the escape the option exists to prevent.
   defp tier_dir(:project, opts) do
+    case scoped_root(opts) do
+      {:ok, root} -> {:ok, Path.join(root, ".athanor")}
+      :unscoped -> ascending_project_dir(opts)
+    end
+  end
+
+  defp tier_dir(:global, opts), do: {:ok, global_tier_dir(opts)}
+
+  defp ascending_project_dir(opts) do
     case Store.workspace_root(Keyword.get(opts, :cd, File.cwd!())) do
       nil -> {:error, "Not inside a workspace (no .git or .athanor above this directory)."}
       root -> {:ok, Path.join(root, ".athanor")}
     end
   end
 
-  defp tier_dir(:global, opts), do: {:ok, Keyword.get(opts, :global_dir, Config.memory_global_dir())}
+  # `:global_dir` is the narrower knob and still wins over `:root`, so existing callers keep their
+  # exact behaviour; `:root` only fills the gap they used to leave to `Config.home/0`.
+  defp global_tier_dir(opts) do
+    Keyword.get_lazy(opts, :global_dir, fn ->
+      case scoped_root(opts) do
+        {:ok, root} -> Path.join(root, "memory")
+        :unscoped -> Config.memory_global_dir()
+      end
+    end)
+  end
+
+  defp scoped_root(opts) do
+    case Keyword.get(opts, :root) do
+      root when is_binary(root) and root != "" -> {:ok, Path.expand(root)}
+      _other -> :unscoped
+    end
+  end
+
+  # Read-only discovery must not create `.athanor/`, matching `Store.project_dir/1` (plan risk 9):
+  # a `:root` with no memory directory yet resolves to `nil`, not to a path that would be created on
+  # the next read.
+  defp existing_project_dir(root) do
+    athanor = Path.join(root, ".athanor")
+    if File.dir?(athanor), do: athanor, else: nil
+  end
 
   defp sanitize(fact) do
     limit = Config.memory_fact_max_chars()
