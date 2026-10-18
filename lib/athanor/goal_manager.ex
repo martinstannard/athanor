@@ -336,9 +336,14 @@ defmodule Athanor.GoalManager do
         # A passing verifier is *positive* evidence, so it must never reach `after_unverified/1`:
         # nudging or escalating a goal whose verifier just passed would nag a worker into
         # "finishing" work that is already finished, and the mirror-bug fix would have introduced a
-        # second way to kill a healthy goal. Record the result and keep waiting for the claim; the
-        # worker's `{:goal_candidate_done, _}` (handled above) is the only thing that moves this.
-        {:noreply, note(state, :verified_awaiting_claim)}
+        # second way to kill a healthy goal. Record the result, restore the nudge budget — a
+        # `:verified` verdict is progress by the only definition that matters here, confirmation on
+        # evidence the worker does not control, so a later regression into `:contradicted` must start
+        # from a fresh budget rather than escalating on the spot — and keep waiting for the claim.
+        # The *clock* is deliberately untouched: a verified-but-unclaimed goal whose worker then goes
+        # silent is still a hang, and refreshing `last_progress_at` on every tick would hide it
+        # forever. The worker's `{:goal_candidate_done, _}` (handled above) is what moves this state.
+        {:noreply, state |> reset_budget() |> note(:verified_awaiting_claim)}
 
       true ->
         after_unverified(state)
@@ -357,25 +362,23 @@ defmodule Athanor.GoalManager do
     {:noreply, state |> Map.put(:candidate_done?, true) |> refresh_activity() |> verify_unless_busy()}
   end
 
-  # A conversational turn refreshes the stall clock; sentinel-bearing turns arrive via
-  # `{:goal_candidate_done, report}` above (§5.2 step 4), so we do not double-trigger verification.
+  # A completed conversational turn is **activity, not progress**: it refreshes the stall clock and
+  # leaves the nudge budget alone. Sentinel-bearing turns arrive via `{:goal_candidate_done, report}`
+  # above (§5.2 step 4), so we do not double-trigger verification.
   #
-  # A turn that *carried the completion sentinel* is a claim, not progress, and so does not reset the
-  # nudge budget: a claim the verifier then contradicts is exactly the unproductive tick the budget
-  # counts, and the agent emits both events for that one turn. Resetting on it made the loop
-  # "claim -> verify -> contradicted -> nudge -> claim again" run forever without ever reaching
-  # `max_nudges`, silently retiring the M5 escalation contract. The sentinel grammar has one
-  # definition, so it is read from the module that owns it (`Athanor.Agent.parse_done_sentinel/1`)
-  # rather than re-matched here.
-  def handle_info({:agent_event, worker_id, {:turn_complete, content}}, %{goal: %{worker_id: worker_id}} = state) do
-    state =
-      if is_binary(content) and Athanor.Agent.parse_done_sentinel(content) != :none do
-        refresh_activity(state)
-      else
-        refresh_progress(state)
-      end
-
-    {:noreply, state}
+  # Why the budget is NOT reset here, though #48's option (b) names `{:turn_complete, _}` as progress:
+  # the nudge *causes* the turn. Counting a turn as progress makes the two parties take turns being
+  # satisfied — the manager nudges, the worker answers, the count returns to zero, so
+  # `nudge_count >= max_nudges` is never reached and `nudge_or_escalate/1`'s escalation branch becomes
+  # unreachable **dead code**. A worker that keeps talking while never moving the verifier would spin
+  # forever, and the manager's job is precisely to tell that from progress. #48's binding criterion is
+  # "max_nudges consecutive *unproductive* ticks still escalate (the M5 contract is preserved, only the
+  # trigger is corrected)", and the acceptance criterion is the contract that wins over the option's
+  # looser wording. A turn that merely re-asserts a contradicted claim is the worker *answering* the
+  # nudge, and the answer failed — so it is not progress either way; the clock still moves, which is
+  # what keeps the manager from nudging at every tick.
+  def handle_info({:agent_event, worker_id, {:turn_complete, _content}}, %{goal: %{worker_id: worker_id}} = state) do
+    {:noreply, refresh_activity(state)}
   end
 
   # The agent consumed a nudge from its control plane (#49a/#49d). Delivery is reported separately
@@ -490,25 +493,31 @@ defmodule Athanor.GoalManager do
       state.worker_status in [nil, :idle, :error]
   end
 
-  # Demonstrated progress, and the one place the stall clock moves. It resets `nudge_count` too
-  # (#48 (b)): the budget measures *consecutive* unproductive ticks, not lifetime nudges, so
-  # whatever was nudged before has been answered and a later stall — hours into a long goal — must
-  # still be survivable at the configured `max_nudges`. Before this the counter was monotonic and
-  # any later stall escalated on the spot with zero warning.
+  # Demonstrated progress, and the one place the stall clock moves *and* the nudge budget resets
+  # (#48 (b)): the budget measures *consecutive* unproductive ticks, not lifetime nudges, so a later
+  # stall — hours into a long goal — must still be survivable at the configured `max_nudges`. Before
+  # the reset the counter was monotonic and any later stall escalated on the spot with zero warning.
   #
-  # Callers are the two things #48 names as progress: a `report_progress` receipt and a completed
-  # conversational turn. `refresh_activity/1` is the weaker variant for a *claim* — see below.
+  # Only two callers, both unambiguous: a `report_progress` receipt (the worker asserting a bounded
+  # step it took) and a `:verified` verifier result (the goal is met on evidence the worker does not
+  # control). Everything weaker — a bare turn, a claim — goes through `refresh_activity/1`.
   defp refresh_progress(state) do
     %{state | goal: %{state.goal | last_progress_at: Goal.now_ms(), nudge_count: 0}}
   end
 
-  # The worker is talking, so it is not stalled — but a `===ATHANOR_DONE===` claim is not progress
-  # (#50/C1: it is a claim, and the verifier may well contradict it). Resetting the budget here
-  # would make "claim done, verifier says no, claim again, …" an infinite nudge loop that never
-  # escalates, which is exactly the M5 sequence the escalation contract exists for: a *contradicted
-  # claim* is the unproductive tick. So the claim refreshes the clock and nothing else.
+  # The worker is alive and talking, so it is not stalled — the clock moves, and nothing else does.
+  # Neither a bare turn boundary nor a `===ATHANOR_DONE===` claim resets the budget: the nudge
+  # *provokes* the turn (so counting one is the dead-code loop described above), and a claim the
+  # verifier then contradicts is exactly the unproductive tick M5 exists to escalate
+  # (#50/C1: a claim is not a verdict, and re-asserting one is not progress).
   defp refresh_activity(state) do
     %{state | goal: %{state.goal | last_progress_at: Goal.now_ms()}}
+  end
+
+  # Budget only, clock untouched: see the `:verified_awaiting_claim` branch — a confirmed result
+  # clears the debt, but it is not a substitute for the worker still being alive.
+  defp reset_budget(state) do
+    %{state | goal: %{state.goal | nudge_count: 0}}
   end
 
   # -- nudges & escalation (§5.4–§5.5) -------------------------------------------------------
