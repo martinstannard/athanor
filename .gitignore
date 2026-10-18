@@ -1,5 +1,10 @@
 # The directory Mix will write compiled artifacts to.
 /_build/
+# No trailing slash, deliberately: `/deps/` and `/_build/` match a *directory* only, so a
+# `deps`/`_build` **symlink** (a common worktree bootstrap — see issue #39 / OQ-W5) is not
+# ignored, `git check-ignore` exits 1, and `git add -A` silently stages a symlink pointing at
+# another checkout's absolute path. These patterns catch the symlink form too (#44 follow-up).
+/_build
 
 # Per-session isolated build dirs (MIX_BUILD_PATH=_build.<name>) used to keep
 # concurrent agent sessions from fighting over one _build.
@@ -10,6 +15,7 @@
 
 # The directory Mix downloads your dependencies sources to.
 /deps/
+/deps
 
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
