@@ -149,6 +149,40 @@ Next to it is a **context gauge** (issue #43): `ctx: 42%`, the active session's 
 - **`/conductor <title>`**: Launch a new root-level peer Conductor session.
 - **`/quit`, `/exit`, `/detach`, `Ctrl+C`, `Ctrl+D` or `Ctrl+Q`**: Detach the TUI client, restore the alternate screen, and leave the daemon's Conductors and Sub-Agents running (see §7.7).
 - **`/stats`** (active session) and **`/stats all`** (every session plus a total): turns, tool calls by name, language-model tokens (prompt / completion / cached / reasoning, from the provider's real `usage` block), context occupancy (estimated, and labelled so) and an **estimated** cost. Prices are USD per million tokens from `ATHANOR_PRICES` / `:athanor, :prices` (`Athanor.Pricing`); there is no built-in price table, so an unpriced model renders `—` rather than a fabricated number (issue #26).
+- **`Ctrl+T`**: Expand or collapse a reasoning model's thinking block (issue #53). While a block is still streaming the *live* one toggles; otherwise the most recent frozen block does. It always inverts what is currently on screen — including clearing a global override (§ below) — so the key can never look dead.
+- **`/thinking`** / **`/thinking off`**: The global show/hide-all-thinking override (issue #53). It is **tri-state** (`true` / `false` / `nil`), not a boolean: `nil` is "no override, use each block's own flag", which is what lets `Ctrl+T`'s per-block state survive a global cycle instead of being flattened. A non-`nil` override wins for every block.
+
+### Reasoning / thinking stream (issue #53)
+
+A reasoning model sends its thinking alongside the answer, on its own keys. Observed on the live
+endpoint: every reasoning-capable model emits `reasoning_content` as ordinary string deltas on some
+chunks; Kimi K3 additionally sends `reasoning` plus a structured `reasoning_details` array carrying
+**the same text** (so reading both would double it); `claude-*` is refused outright
+(`ModelProtocolUnsupported`). **No request flag is involved** — reasoning streams with no
+`include_reasoning`/`reasoning` parameter at all, so the parser opts *out*, not in.
+
+- **Two accumulators, not one.** `Athanor.LLM` keeps thinking in a `thinking` field, separate from
+  `content`, and emits `{:llm_thinking_delta, _}`; the agent relays it as `{:thinking_delta, _}`
+  and does nothing else with it.
+- **It cannot reach the wire, by construction.** `finalize_message/1` builds the assistant message
+  from a fixed field set with no reasoning field, so there is nothing to strip: thinking is
+  structurally absent from `state.messages`, and therefore from the next request
+  (`format_messages/1`), the compaction input and `Tokens.estimate_messages/1`. It is also never
+  published as a `{:message, _}`, so the Recorder never persists it and a resumed session carries no
+  thinking. This is why a chatty reasoner cannot inflate the context gauge or trigger compaction on
+  text the provider never receives.
+- **Rendered as its own entry kind** (`{:thinking, text, expanded?}`), never concatenated into the
+  assistant entry: `Athanor:` must contain exactly what the model said to the user. Collapsed is a
+  one-line header — `◍ Thinking · 1.2k chars · Ctrl+T expand` — in the `:muted` role; expanded adds
+  a wrapped, italic body indented under it. A collapsed block is still **rendered**, so thinking is
+  discoverable rather than invisible, and the glyph/role/size deliberately differ from `Athanor:` so
+  reasoning can never be mistaken for the answer. The header carries the key hint, not just the
+  welcome banner.
+- **Two live buffers** (`thinking_buffer`, `streaming_buffer`), each frozen at the same boundary
+  (turn end, tool call, cancel, error) into its own entry kind, so the two interleaved streams
+  arrive in order without being merged.
+- **Left out:** click-to-toggle needs SGR mouse reporting, which is not enabled (issue #22); thinking
+  is not persisted (§7.4 stores no `kind: "thinking"` record) and not searchable by `recall`.
 
 ---
 
