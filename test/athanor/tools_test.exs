@@ -27,7 +27,8 @@ defmodule Athanor.ToolsTest do
                "report_progress",
                "remember",
                "recall",
-               "forget"
+               "forget",
+               "skill"
              ]
     end
 

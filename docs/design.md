@@ -184,10 +184,12 @@ Next to it is a **context gauge** (issue #43): `ctx: 42%`, the active session's 
 > `list_goals` and worker `report_progress`). **§7.4 is implemented ("Resume v1")**: `Athanor.Store` plus its seven
 > sub-modules persist, resume and compact sessions (see the *Implemented subset* note under §7.4);
 > deferred are transcript rotation, provider-`usage`-based token accounting, live migration
-> between nodes, and LLM-written `HANDOFF.md` summaries. §7.6 is **partly implemented**: `glob` and
-> `grep` shipped (`Athanor.Tools.{Glob,Grep,Ignore}`); the tool guard and the MCP client do not
-> exist. §7.7 is **partly implemented** as `Athanor.Daemon`. Each heading below is annotated
-> accordingly.
+> between nodes, and LLM-written `HANDOFF.md` summaries. §7.6 is **partly implemented**: `glob`,
+> `grep` (`Athanor.Tools.{Glob,Grep,Ignore}`) and the tool guard (`Athanor.ToolGuard`) shipped; the
+> MCP client does not exist. §7.7 is **partly implemented** as `Athanor.Daemon`. §7.9 (Agent Skills,
+> issue #23) is **implemented** (`Athanor.Skills`, `Athanor.Skills.Frontmatter`,
+> `Athanor.Tools.Skill`, the `skill` tool, and the conductor-only catalogue injection). Each heading
+> below is annotated accordingly.
 
 ### 7.1 Git Worktree Isolation (`Athanor.Worktree`) — *implemented*
 - When a Conductor spawns multiple coding sub-agents in parallel, editing the same working directory causes git index and file conflicts. A worktree gives each worker its own checkout, and since `:cd` is the only isolation seam Athanor has, isolation is exactly "set the worker's `cd`".
@@ -336,6 +338,29 @@ So you can SSH into the machine from anywhere, run `athanor`, and immediately at
 > `Athanor.Bus` is backed by a node-local `Registry`, so events do not cross nodes today.
 > `Athanor.Daemon` connects two nodes (`Node.connect/1` + `:erpc`) but supervises nothing remotely.
 - Because `Athanor.Bus` and `Athanor.Agent` use standard Erlang message passing, multiple Athanor daemons across machines (e.g., `host-a`, `host-b`, `host-c`) can join an Erlang cluster (`Node.connect/1`) and supervise/inspect sub-agents running on remote hosts from a single TUI.
+
+### 7.9 Agent Skills (`Athanor.Skills`) — *implemented* (issue #23)
+A "skill" is a directory containing a `SKILL.md` with YAML frontmatter (`name`, `description`) plus
+optional assets — the open convention shared by Claude Code, opencode and agent-deck. It is a
+**local prompt/instruction bundle**: markdown the model reads, not code Athanor executes. This is a
+capability layer of its own, distinct from §7.5 Memory (learned facts) and §7.6 MCP (external tool
+servers); see `Athanor.Skills`'s moduledoc and `docs/architecture.md` §13.
+- **Roots:** an ordered, configurable list (`ATHANOR_SKILL_PATHS`, default `~/.agents/skills` then
+  `~/work/skills/.agents/skills`). A root may name the repository that holds a `.agents/skills`
+  tree. Entries are commonly **symlinks** into another root, so discovery resolves them and
+  de-duplicates by name; collisions are resolved **later root wins** (workspace over global) with the
+  loser recorded in `:shadowed` and the winner's `source_root` reported.
+- **Exposure is catalogue + on-demand, never bodies up front** (the §7.5 anti-pollution rule): a
+  conductor's system prompt carries one line per skill (name + description), and the `skill(name)`
+  tool returns one `SKILL.md` body when the model asks. Both roles get the tool; only conductors get
+  the catalogue. `disable-model-invocation: true` hides a skill from the catalogue.
+- **Frontmatter is read partially and defensively:** `name`/`description` (plain, quoted or block
+  scalars) and the invocability flag. `allowed-tools`/`mcpServers` are **never interpreted** — wiring
+  MCP servers is §7.6's job — and a `SKILL.md` without frontmatter is skipped rather than guessed at.
+- **Scope decisions:** global (`~/.agents/skills`) and workspace-local roots are both supported, with
+  workspace overriding global; the catalogue is injected **once at session start** (like §7.5's
+  single injection) and stored in `state.system_prompt`, so `/clear` rebuilds it; a skill body is
+  loadable **mid-session** via the tool. `ATHANOR_SKILLS=0` disables the whole layer.
 
 ---
 

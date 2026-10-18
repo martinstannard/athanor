@@ -117,6 +117,25 @@ defmodule Athanor.Agent do
   `state.system_prompt`; `/clear` rebuilds from that same text rather than re-reading the file,
   so the session's conventions do not change underfoot (see `ProjectContext`).
 
+  ## Skills (#23)
+
+  A conductor's system prompt also carries the **skill catalogue** — one line per locally installed
+  Agent Skill (name + description, `Athanor.Skills.catalogue/1`), appended after the memory block.
+  Bodies are deliberately **not** injected: a machine with 45 skills must not pay for 45 `SKILL.md`
+  documents on every request, so the catalogue only advertises, and the `skill(name)` tool
+  (`Athanor.Tools.Skill`) is how one body enters the conversation when the model asks for it.
+
+  **Conductors only.** A conductor decides which skill a workstream needs and can name it in a
+  worker's prompt, so a worker does not need a second copy; the `skill` tool is offered to *both*
+  roles, because a worker told to follow a skill must be able to read it. Disable per session with
+  `skills: false` (or `skill_paths: [...]` to point at other roots), globally with
+  `ATHANOR_SKILLS=0` / `ATHANOR_SKILL_PATHS`.
+
+  Skills are a **local prompt/instruction layer**, distinct from §7.5 Memory (learned facts,
+  `remember`/`recall`) and §7.6 MCP (external tool servers): see `Athanor.Skills`'s moduledoc for
+  the boundary. Like `AGENTS.md`, the catalogue is read **once** at init and lives in
+  `state.system_prompt`, so `/clear` rebuilds it rather than re-scanning the disk.
+
   ## Context reset (`:clear_context`)
 
   `/clear` in the TUI (and `clear_context/1` here) wipes a session's conversation context **in
@@ -144,7 +163,7 @@ defmodule Athanor.Agent do
 
   require Logger
 
-  alias Athanor.{Bus, Config, GoalManager, LLM, Memory, ProjectContext, SessionId, ToolGuard, Tools}
+  alias Athanor.{Bus, Config, GoalManager, LLM, Memory, ProjectContext, SessionId, Skills, ToolGuard, Tools}
   alias Athanor.Store.{Compactor, Tokens}
 
   @default_conductor_prompt """
@@ -192,6 +211,7 @@ defmodule Athanor.Agent do
     :goal_objective,
     :turn_timeout_ms,
     :mid_turn_queue,
+    :skill_opts,
     status: :idle,
     turn_count: 0,
     # Per-session consumption totals for `/stats` (#26). In-process and cheap: folded from the
@@ -385,10 +405,13 @@ defmodule Athanor.Agent do
     model = Keyword.get(opts, :model, Config.model())
     cd = Keyword.get(opts, :cd, File.cwd!())
 
+    skill_opts = skill_opts(opts)
+
     system_prompt =
       compose_system_prompt(
         Keyword.get(opts, :system_prompt, default_prompt) |> goal_preamble(opts),
         cd,
+        role,
         opts
       )
 
@@ -431,6 +454,7 @@ defmodule Athanor.Agent do
         max_turns: max_turns,
         notify_parent_on_done: notify_parent,
         turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, Config.turn_timeout_ms()),
+        skill_opts: skill_opts,
         goal_id: Keyword.get(opts, :goal_id),
         goal_objective: Keyword.get(opts, :goal_objective),
         mid_turn_queue: Keyword.get(opts, :mid_turn_queue, Config.mid_turn_queue?()),
@@ -713,10 +737,11 @@ defmodule Athanor.Agent do
   # only on a new session or a daemon restart. Re-reading on every `/clear` would swap the
   # instructions mid-conversation without the transcript recording why. Absent or empty file =
   # no sentinel, no trailing separators: the prompt is byte-identical to the literal.
-  defp compose_system_prompt(role_prompt, cd, opts) do
+  defp compose_system_prompt(role_prompt, cd, role, opts) do
     role_prompt
     |> compose_project_context(cd, opts)
     |> compose_memory(cd, opts)
+    |> compose_skills(role, opts)
   end
 
   defp compose_project_context(prompt, cd, opts) do
@@ -749,6 +774,31 @@ defmodule Athanor.Agent do
   # default.
   defp project_context_enabled?(opts) do
     Keyword.get(opts, :project_context, Config.project_context_enabled?()) != false
+  end
+
+  # #23: the skill catalogue, conductors only (see the moduledoc). It is the *last* block, after
+  # memory: role, then the repo's conventions, then what this session has learned, then what
+  # instruction bundles exist. `nil` when skills are off or no root holds any skill, so the prompt
+  # gains no trailing separators.
+  defp compose_skills(prompt, :conductor, opts) do
+    case Skills.catalogue(skill_opts(opts)) do
+      nil -> prompt
+      catalogue -> String.trim_trailing(prompt) <> "\n\n" <> catalogue
+    end
+  end
+
+  defp compose_skills(prompt, _role, _opts), do: prompt
+
+  # The per-session skill settings, resolved once at init: the init options win over
+  # `ATHANOR_SKILLS`/`ATHANOR_SKILL_PATHS`, so a caller (or a test) can point a session at its own
+  # roots without touching process-global state. The same list travels with every tool call
+  # (`start_tool_execution/2`), so the catalogue the model was shown and the `skill` tool it can
+  # call always agree.
+  defp skill_opts(opts) do
+    [
+      enabled: Keyword.get(opts, :skills, Config.skills_enabled?()) != false,
+      paths: Keyword.get(opts, :skill_paths, Config.skill_paths())
+    ]
   end
 
   # Builds the initial working set: a freshly derived `system` message followed by any
@@ -1129,10 +1179,16 @@ defmodule Athanor.Agent do
     # worker: schema gating keeps those tools out of a worker's prompt, but a model can still name
     # a tool it was never offered, and refusing then has to be a decision, not an accident.
     role = state.role
+    # The session's skill roots travel too (#23): the `skill` tool must resolve a name against
+    # exactly the roots whose catalogue was injected, not whatever the process-global config says
+    # by the time the tool runs.
+    skill_opts = state.skill_opts
 
     {pid, ref} =
       spawn_monitor(fn ->
-        tool_messages = Enum.map(tool_calls, &run_tool(&1, agent_pid, cd, session_id, role))
+        tool_messages =
+          Enum.map(tool_calls, &run_tool(&1, agent_pid, cd, session_id, role, skill_opts))
+
         send(agent_pid, {:tools_result, tool_messages})
       end)
 
@@ -1141,14 +1197,19 @@ defmodule Athanor.Agent do
     |> arm_watchdog("tool_execution")
   end
 
-  defp run_tool(tc, agent_pid, cd, session_id, role) do
+  defp run_tool(tc, agent_pid, cd, session_id, role, skill_opts) do
     name = tc.function.name
     raw_args = tc.function.arguments
 
     send(agent_pid, {:tool_event, {:tool_start, name, raw_args}})
 
     output =
-      case Tools.execute(name, raw_args, cd: cd, session_id: session_id, role: role) do
+      case Tools.execute(name, raw_args,
+             cd: cd,
+             session_id: session_id,
+             role: role,
+             skill_opts: skill_opts
+           ) do
         {:ok, res} ->
           send(agent_pid, {:tool_event, {:tool_end, name, {:ok, res}}})
           res
