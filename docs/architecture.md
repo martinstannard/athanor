@@ -59,7 +59,7 @@ combined with `Application.get_env(:athanor, …)` and environment variables.
 | `Athanor.Orchestrator` | module | The only writer of agent child specs: spawn / lookup / list / read / prompt / cancel sessions. |
 | `Athanor.Bus` | module | PubSub helpers over `Athanor.PubSub`: `subscribe/1`, `unsubscribe/1`, `broadcast/2`, `publish_event/3`, `send_command/2`. |
 | `Athanor.Git` | module | The only place Athanor shells out to git: no shell, bounded by `Config.worktree_git_timeout_ms/0`, structured exit code, and `GIT_DIR`/`GIT_INDEX_FILE` cleared so `cd:` decides the repository (§7.1). |
-| `Athanor.Worktree` | struct + module | Worktree isolation: read side (`repository?/1`, `clean?/1`, `list/1`, `root_for/2`) plus `add/2`/`remove/2` with the clean-tree, branch and safe-delete rules (§7.1). |
+| `Athanor.Worktree` | struct + module | Worktree isolation: read side (`repository?/1`, `clean?/1`, `list/1`, `root_for/2`) plus `add/2`/`remove/2` with the clean-tree, branch and safe-delete rules (§7.1). `add/2` also seeds a **worktree-local `_build`** (`build_dir/1`, self-ignoring), so `mix` compiles privately by default and two workers cannot corrupt each other's `.beam` files (#47). |
 | `Athanor.Worktree.Server` | `GenServer` | Serialises every worktree mutation, tracks `session_id → worktree` (rebuilt from git + a sidecar on restart), and publishes `worktree_*` events on `deck:events` (§7.1). |
 | `Athanor.Tools` | module | LLM tool JSON Schemas (`schemas/1`) and the local execution engine (`execute/3`). |
 | `Athanor.LLM` | module | Stateless OpenCode Go (`opencode-go`) SSE streaming client. |

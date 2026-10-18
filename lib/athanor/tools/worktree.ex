@@ -152,7 +152,11 @@ defmodule Athanor.Tools.Worktree do
 
     "Worktree ready at #{worktree.path} (#{where}, base #{short_sha(worktree.base_sha)}). " <>
       "Files, searches and commands run against that directory. A fresh worktree has no `deps/` " <>
-      "or `_build/` — run `mix deps.get` there once before building or testing."
+      "or `_build/` — run `mix deps.get` there once before building or testing. " <>
+      "Its `_build` is worktree-local and already seeded, so a plain `mix ...` compiles privately: " <>
+      "build with that directory and NEVER symlink `_build` into another checkout — two workers " <>
+      "sharing one `_build` silently corrupt each other's .beam files, which makes a \"verified\" " <>
+      "verdict untrustworthy. `deps` MAY be symlinked (read-only, safe to share); `_build` may not."
   end
 
   defp line(entry, owners) do

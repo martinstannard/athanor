@@ -2007,6 +2007,10 @@ defmodule Athanor.AgentTest do
   # Captures the system message the agent builds, via the deterministic `llm_fn` seam (§11.2).
   # `self()` is bound outside the closure: the closure runs in the agent process, so `self()`
   # inside it would address the agent, not the test.
+  #
+  # Collapsing runs of whitespace to one space keeps assertions on *phrases* honest: the prompt is
+  # hard-wrapped for its own readability, so a phrase that happens to straddle a line break would
+  # otherwise not match, and a test that fails on wrapping pressure is a test that gets deleted.
   defp capture_system_prompt(cd, opts \\ []) do
     test = self()
 
@@ -2018,8 +2022,10 @@ defmodule Athanor.AgentTest do
     {:ok, agent} = Agent.start_link([cd: cd, llm_fn: llm_fn] ++ opts)
     :ok = Agent.prompt(agent, "hello")
     assert_receive {:system_prompt, sys}
-    sys
+    one_line(sys)
   end
+
+  defp one_line(text), do: String.replace(text, ~r/\s+/, " ")
 
   # A directory with no `.athanor/` or `.git/` anywhere above it. ExUnit's `:tmp_dir` is inside the
   # checkout, so ascending from it reaches the repo's own `.athanor/`; anything asserting *no*
@@ -2077,6 +2083,23 @@ defmodule Athanor.AgentTest do
     test "the worker prompt tells it to fetch deps in a fresh worktree (§7.1 OQ-W5, #39)", %{tmp_dir: tmp_dir} do
       sys = capture_system_prompt(tmp_dir, parent_id: "conductor-x")
       assert sys =~ "mix deps.get"
+    end
+
+    test "the worker prompt states the private-_build rule (#47)", %{tmp_dir: tmp_dir} do
+      # Pinned deliberately, exactly like #39's deps line: this rule lives in prose, and prose is
+      # what a well-meaning edit deletes. Two workers sharing one `_build` corrupt each other's
+      # `.beam` files *silently*, so the sentence the model is told must not drift out of the prompt.
+      sys = capture_system_prompt(tmp_dir, parent_id: "conductor-x") |> one_line()
+
+      assert sys =~ "WORKTREE-LOCAL `_build`"
+      assert sys =~ "NEVER symlink `_build` into another checkout"
+      # The *why* is what makes the rule stick.
+      assert sys =~ "silently corrupt each other's .beam files"
+      # And a `deps` symlink stays legitimate: without this, the rule reads as "symlinks are bad"
+      # and a worker loses the cheap, safe half of the bootstrap.
+      assert sys =~ "`deps` MAY be symlinked"
+      # The safe path is the one that needs no flag, which is what makes it the likely path.
+      assert sys =~ "a fresh worktree is already seeded with one"
     end
   end
 

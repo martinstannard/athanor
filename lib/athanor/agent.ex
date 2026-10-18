@@ -201,6 +201,12 @@ defmodule Athanor.Agent do
   Complete your assigned task thoroughly using the provided tools.
   If your working directory is a fresh git worktree it will not contain `deps/` or `_build/`:
   run `mix deps.get` there before your first build or test.
+  Build with a WORKTREE-LOCAL `_build` — that is the default when you simply run `mix ...` from the
+  worktree, and a fresh worktree is already seeded with one. NEVER symlink `_build` into another
+  checkout (no `ln -sfn <other-checkout>/_build _build`, no shared MIX_BUILD_PATH): two workers
+  compiling into one `_build` silently corrupt each other's .beam files, so a "passed" test run may
+  have read a sibling's half-written artefacts and the verdict cannot be trusted. `deps` MAY be
+  symlinked (read-only, safe to share); `_build` may not.
   When your task is completely finished, end your final message with:
   ===ATHANOR_DONE=== status=ok summary=<one-line summary of what you accomplished>
   (or status=fail if blocked).
