@@ -43,15 +43,16 @@ defmodule Athanor.Agent do
 
   A prompt that arrives while a turn is in flight is **never dropped**: `enqueue_prompt/2` — and
   the `{:enqueue_prompt, text}` bus command that `Athanor.Orchestrator.send_session/2` and the TUI
-  use — appends it to `state.prompt_queue`, and `drain_prompt_queue/1` starts exactly **one**
-  queued prompt (FIFO) each time a turn reaches its terminal boundary. `prompt/2` is the
-  synchronous counterpart and answers `{:error, :busy}` instead of queueing.
+  use — appends it to `state.prompt_queue`, and exactly **one** queued prompt (FIFO) is drained at
+  each boundary the turn reaches — the task's end (`drain_prompt_queue/1`) or a tool round's end
+  (`drain_one_queued_prompt/1`, #44, below). `prompt/2` is the synchronous counterpart and answers
+  `{:error, :busy}` instead of queueing.
 
   Every queue mutation publishes `{:prompt_queue, %{len: n, next: prompt | nil}}`, so a client can
   render the pending depth without polling; the depth is also carried by `get_state/1` and
   `snapshot_meta/1` as `:prompt_queue_len`. A queued prompt is persisted only once it *begins* a
-  turn (`begin_user_turn/2` -> `record_messages/1`), which keeps §7.4's transcript exactly equal to
-  the conversation that actually happened.
+  turn (`begin_user_turn/2` -> `record_messages/1`, or the mid-round append) which keeps §7.4's
+  transcript exactly equal to the conversation that actually happened.
 
   ### Mid-task pickup at a tool-round boundary (#44)
 
@@ -238,8 +239,14 @@ defmodule Athanor.Agent do
   end
 
   @doc """
-  Enqueues a message over PubSub (or via GenServer cast) to be processed immediately
-  if `:idle`, or as soon as the current turn finishes.
+  Enqueues a message over PubSub (or via GenServer cast) to be processed immediately if `:idle`, or
+  at the next boundary of the current turn otherwise.
+
+  A busy session picks the prompt up at the next **tool-round** boundary — appended to the current
+  conversation as a `user` message so the model sees it from the next round on, without the turn
+  being cancelled (`drain_one_queued_prompt/1`, issue #44) — or, if that is disabled
+  (`ATHANOR_MID_TURN_QUEUE=0`) or the session has a live goal, at the end of the task, where it
+  starts a turn of its own. Either way the prompt is never dropped.
   """
   @spec enqueue_prompt(GenServer.server() | String.t(), String.t()) :: :ok
   def enqueue_prompt(agent_id, text) when is_binary(agent_id) and is_binary(text) do
