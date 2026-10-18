@@ -3,9 +3,15 @@ defmodule Athanor.GoalManagerTest do
   # on the shared Bus topics.
   use ExUnit.Case, async: false
 
-  alias Athanor.{Bus, Goal, GoalManager}
+  alias Athanor.{Agent, Bus, Config, Goal, GoalManager}
   alias Athanor.Goal.Receipt
   alias Athanor.Verifier.Result
+
+  # The public resolved-goal table (#55), read directly — as `Athanor.AgentTest` does — so a test can
+  # assert what is actually in it, not only what one lookup says.
+  @resolved_table :athanor_resolved_goals
+  @retention_env "ATHANOR_GOAL_RESOLVED_RETENTION_MS"
+  @retention_key :goal_resolved_retention_ms
 
   setup do
     # Ticks are driven deterministically (`Process.send(pid, :verify_tick)`) or at 20 ms; nothing
@@ -804,6 +810,170 @@ defmodule Athanor.GoalManagerTest do
 
       _ = goal_id
       await_death(pid)
+    end
+  end
+
+  # #55: the resolved-goal table must age, and must never forget the recent past while it does.
+  describe "the resolved-goal table is aged, not append-only (#55)" do
+    test "a record is stamped with the time it resolved at, and the sweep keeps it inside the window" do
+      neutralise_retention()
+
+      # The documented default, asserted rather than assumed: a window that is too short turns #50's
+      # "already accounted for" back into "misread as a fresh claim".
+      assert Config.goal_resolved_retention_ms() == 3_600_000
+
+      %{goal_id: goal_id} = start_goal!()
+      # `try/after` cannot see a do-block binding, so the clean-up is registered here instead: the
+      # table is process-global and outlives the manager, so a leftover record would leak into
+      # another test.
+      on_exit(fn -> :ets.delete(@resolved_table, goal_id) end)
+      assert :ok = GoalManager.cancel(goal_id)
+
+      # The new shape, and the stamp is the table's own rather than the caller's.
+      assert [{^goal_id, :cancelled, resolved_at_ms}] = :ets.lookup(@resolved_table, goal_id)
+      assert is_integer(resolved_at_ms)
+
+      # A sweep run now must not touch a goal that resolved a moment ago: this is the #50 invariant
+      # the pruning scheme is not allowed to trade away.
+      assert GoalManager.sweep_resolved() == 0
+      assert GoalManager.resolved?(goal_id)
+
+      # The same sweep, with the clock moved past the window: the same record ages out.
+      window = Config.goal_resolved_retention_ms()
+      assert GoalManager.sweep_resolved(Goal.now_ms() + window + 1) >= 1
+      refute GoalManager.resolved?(goal_id)
+    end
+
+    test "N resolved goals age out; the table is bounded by the window, not by N" do
+      # A window far longer than this test's own loop, so nothing expires merely because resolving
+      # 30 goals took a few milliseconds: aging is done by moving the sweep clock, not by racing it.
+      set_retention_ms(60_000)
+      window = Config.goal_resolved_retention_ms()
+
+      ids =
+        for _ <- 1..30 do
+          %{goal_id: goal_id} = start_goal!()
+          assert :ok = GoalManager.cancel(goal_id)
+          goal_id
+        end
+
+      on_exit(fn -> Enum.each(ids, &:ets.delete(@resolved_table, &1)) end)
+
+      # The recent past first: all 30 are still accounted for, which is what a late worker needs.
+      before = :ets.info(@resolved_table, :size)
+      assert before >= 30
+      assert Enum.all?(ids, &GoalManager.resolved?/1)
+
+      # Now age them. `sweep_resolved/1`'s `now` is the documented seam for exactly this; the records
+      # are unchanged, only the clock moved.
+      dropped = GoalManager.sweep_resolved(Goal.now_ms() + window + 1)
+
+      assert dropped >= 30
+      assert Enum.all?(ids, &(GoalManager.resolved?(&1) == false))
+      # Stronger than "fewer than N": the table holds exactly what survived the window, so it is
+      # bounded by the window rather than by how many goals were ever resolved.
+      assert :ets.info(@resolved_table, :size) == before - dropped
+    end
+
+    test "the periodic tick is the sweep clock, so a long-lived daemon ages its own table" do
+      # 1 ms: the same code path the one-hour default takes, only observable inside a test.
+      set_retention_ms(1)
+
+      %{goal_id: stale_id} = start_goal!()
+      on_exit(fn -> :ets.delete(@resolved_table, stale_id) end)
+      assert :ok = GoalManager.cancel(stale_id)
+      assert GoalManager.resolved?(stale_id)
+
+      # A goal manager owns exactly one periodic timer (`:verify_tick`, 10 s in these tests), so the
+      # tick has to be the sweep's clock — there is no second timer to drift against it.
+      %{goal_id: ticking_goal_id, pid: pid} = start_goal!()
+      Process.sleep(10)
+      send(pid, :verify_tick)
+
+      # Ordering rather than a sleep: the tick is in that manager's mailbox before the call, and a
+      # GenServer answers in order, so a reply means the sweep has already run.
+      assert {:ok, _snapshot} = GoalManager.status(ticking_goal_id)
+
+      refute GoalManager.resolved?(stale_id)
+    end
+
+    test "a late ===ATHANOR_DONE=== from a goal resolved inside the window is still accounted for" do
+      # #55's regression, with no fakes: the goal really resolves (cancel is a terminal transition),
+      # the record really exists, a sweep really runs, and the worker really finishes afterwards.
+      neutralise_retention()
+
+      %{goal_id: goal_id} = start_goal!()
+      on_exit(fn -> :ets.delete(@resolved_table, goal_id) end)
+      assert :ok = GoalManager.cancel(goal_id)
+      refute GoalManager.registered?(goal_id)
+      assert GoalManager.resolved?(goal_id)
+
+      # Exactly what a periodic tick does. If this dropped the record, the late completion below
+      # would be misread as a fresh claim for a goal nobody manages — the #50 swallow, re-opened by
+      # the pruning itself.
+      assert GoalManager.sweep_resolved() == 0
+      assert GoalManager.resolved?(goal_id)
+
+      worker_id = "w-late-#{System.unique_integer([:positive])}"
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+      Bus.subscribe("conductor:#{parent_id}:children")
+
+      llm_fn = fn _messages, _tools, _agent_pid ->
+        {:ok,
+         %{
+           role: "assistant",
+           content: "did the work\n===ATHANOR_DONE=== status=ok summary=finished the real work",
+           tool_calls: []
+         }}
+      end
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          id: worker_id,
+          cd: File.cwd!(),
+          llm_fn: llm_fn,
+          goal_id: goal_id,
+          parent_id: parent_id,
+          notify_parent_on_done: nil
+        )
+
+      assert :ok = Agent.prompt(agent, "work the goal")
+
+      # Classified as already-accounted-for: the parent hears the worker's real completion.
+      assert_receive {:agent_event, ^worker_id, {:child_done, report}}, 2_000
+      assert report.status == "ok"
+      assert report.summary == "finished the real work"
+
+      # ...and not as a fresh claim for a goal whose manager is long gone.
+      refute_received {:agent_event, ^worker_id, {:goal_candidate_done, _}}
+    end
+
+    # Saves and clears both sources of the retention window, restoring them on exit. This module is
+    # `async: false` precisely so moving this global knob is safe.
+    defp neutralise_retention do
+      saved_env = System.get_env(@retention_env)
+      saved_app = Application.get_env(:athanor, @retention_key)
+
+      System.delete_env(@retention_env)
+      Application.delete_env(:athanor, @retention_key)
+
+      on_exit(fn ->
+        if saved_env,
+          do: System.put_env(@retention_env, saved_env),
+          else: System.delete_env(@retention_env)
+
+        if saved_app,
+          do: Application.put_env(:athanor, @retention_key, saved_app),
+          else: Application.delete_env(:athanor, @retention_key)
+      end)
+
+      :ok
+    end
+
+    defp set_retention_ms(ms) do
+      neutralise_retention()
+      Application.put_env(:athanor, @retention_key, ms)
     end
   end
 

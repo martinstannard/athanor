@@ -28,17 +28,32 @@ defmodule Athanor.GoalManager do
   and this manager's own `{:child_done}` closure echo. Both are dropped explicitly — the first to
   keep thousands of no-op messages per turn out of the mailbox, the second because acting on it
   would re-enter the close path (C2/C12).
+
+  ## The resolved-goal table is aged, never append-only (#55)
+
+  A public, process-global ETS table (`:athanor_resolved_goals`) holds
+  `{goal_id, status, resolved_at_ms}` for every goal that reached a terminal state. It has to
+  outlive the manager that wrote it — a late worker turn after its goal closed must still be able to
+  learn that it did (`resolved?/1`, #50) — but this daemon is long-lived by design, so nothing here
+  may grow for the lifetime of the VM. Records are swept once they are older than
+  `Athanor.Config.goal_resolved_retention_ms/0` (default one hour, well beyond any plausible worker
+  lifetime), both on the periodic `:verify_tick` and at every insert — an insert is the one moment
+  the table is provably growing. The recent past is deliberately preserved:
+  `:ets.delete_all_objects/1` never touches this table, because forgetting a goal that resolved a
+  moment ago *is* the #50 swallow.
   """
 
   use GenServer
 
   require Logger
 
-  alias Athanor.{Bus, Goal, Goal.Receipt, Verifier}
+  alias Athanor.{Bus, Config, Goal, Goal.Receipt, Verifier}
   alias Athanor.Verifier.Result
 
   @registry Athanor.GoalRegistry
   @supervisor Athanor.GoalSupervisor
+  # `{goal_id, status, resolved_at_ms}` (#55). Public and process-global because a worker must
+  # still be able to ask "did my goal already resolve?" after its manager is long gone (#50).
   @resolved_table :athanor_resolved_goals
 
   # How many recent events the audit trail keeps: enough to explain a decision, bounded so a chatty
@@ -144,13 +159,41 @@ defmodule Athanor.GoalManager do
   `:cancelled`).
 
   Prevents a late worker turn after a goal has already escalated or closed from triggering the C8
-  crash-fallback `{:child_done, _}` notification.
+  crash-fallback `{:child_done, _}` notification, so this is on the hot completion path
+  (`Athanor.Agent.maybe_publish_child_done/2`).
+
+  A record is `{goal_id, status, resolved_at_ms}` and the lookup is a pure membership test: aging is
+  `sweep_resolved/1`'s job, so exactly one place can forget a goal, and that place has a written,
+  configurable retention window. A second, implicit TTL *here* would be invisible — and a short one
+  is precisely how #50's "my goal already resolved" turns back into "misread as a fresh claim".
   """
   @spec resolved?(String.t()) :: boolean()
   def resolved?(goal_id) when is_binary(goal_id) do
-    :ets.lookup(@resolved_table, goal_id) != []
+    case :ets.lookup(@resolved_table, goal_id) do
+      [{^goal_id, _status, resolved_at_ms}] when is_integer(resolved_at_ms) -> true
+      _none -> false
+    end
   rescue
     ArgumentError -> false
+  end
+
+  @doc """
+  Drops resolved-goal records older than the retention window (#55).
+
+  `now` is injectable so a caller (a test, or an operator probing the table) can age it without
+  waiting out the window; production takes the default clock.
+
+  The boundary is strict: a goal resolved exactly `retention_ms` ago is still *inside* the window
+  and is kept, because "resolved recently enough that a late completion is already accounted for" is
+  the property the table exists for (#50). Returns how many records were dropped.
+  """
+  @spec sweep_resolved(integer()) :: non_neg_integer()
+  def sweep_resolved(now \\ Goal.now_ms()) do
+    cutoff = now - Config.goal_resolved_retention_ms()
+
+    :ets.select_delete(@resolved_table, [{{:_, :_, :"$1"}, [{:<, :"$1", cutoff}], [true]}])
+  rescue
+    ArgumentError -> 0
   end
 
   @doc """
@@ -300,6 +343,10 @@ defmodule Athanor.GoalManager do
 
   @impl GenServer
   def handle_info(:verify_tick, state) do
+    # #55: this timer is also the resolved-goal table's sweep clock. A manager that is ticking is by
+    # definition a live goal with a worker attached, so the verify cadence is the natural periodic
+    # sweep — no second timer to keep in step with this one.
+    sweep_resolved()
     state = note(%{state | timer_ref: nil}, :tick)
 
     state =
@@ -725,7 +772,13 @@ defmodule Athanor.GoalManager do
 
   defp mark_resolved(state, status) do
     init_resolved_table()
-    :ets.insert(@resolved_table, {state.goal.id, status})
+
+    # Sweep *before* inserting (see `sweep_resolved/1`): an insert is the one moment the table is
+    # provably growing, so pruning here makes "this table is bounded" a property of the table rather
+    # than of a timer happening to fire (#55). The record being inserted is stamped with `now`, so it
+    # is inside the window by construction and this sweep can never drop it.
+    sweep_resolved()
+    :ets.insert(@resolved_table, {state.goal.id, status, Goal.now_ms()})
     state
   rescue
     ArgumentError -> state
