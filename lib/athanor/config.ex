@@ -55,6 +55,7 @@ defmodule Athanor.Config do
   @default_memory_transcript_max_records 5_000
   @default_tool_guard_enabled true
   @default_prelude_read_required true
+  @default_mid_turn_queue true
 
   @doc """
   Returns the OpenCode Go base URL.
@@ -902,6 +903,28 @@ defmodule Athanor.Config do
   @spec prelude_read_required?() :: boolean()
   def prelude_read_required? do
     boolean_env("ATHANOR_PRELUDE_READ", :prelude_read_required, @default_prelude_read_required)
+  end
+
+  # -- prompt queue (#44) -----------------------------------------------------------------
+
+  @doc """
+  Whether a stacked prompt is picked up at a **tool-round boundary** mid-task, rather than only
+  when the whole task finishes (default `#{@default_mid_turn_queue}`).
+
+  With this on, `Athanor.Agent`'s `{:tools_result, …}` handler drains exactly one queued prompt and
+  appends it as a `user` message before starting the next LLM round, so a follow-up typed during a
+  long tool loop reaches the model as soon as a round closes instead of after the entire task.
+  Injection changes the model's plan by construction, so `ATHANOR_MID_TURN_QUEUE=0` (or
+  `:athanor, :mid_turn_queue`, or the per-session `mid_turn_queue: false` init option) restores the
+  old "wait for the task" behaviour without losing the stacked prompt — it simply waits for the
+  task boundary it always did.
+
+  Goal-attached sessions opt out regardless of this flag: see `Athanor.Agent`'s
+  `mid_turn_injection?/1` and issue #44's decision note.
+  """
+  @spec mid_turn_queue?() :: boolean()
+  def mid_turn_queue? do
+    boolean_env("ATHANOR_MID_TURN_QUEUE", :mid_turn_queue, @default_mid_turn_queue)
   end
 
   # Like `positive_int/3`, but zero is a legitimate value for the few knobs where "never" is a

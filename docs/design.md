@@ -48,7 +48,7 @@ Athanor.Supervisor (:one_for_one)
 - **Root-level persistent orchestrators** (`parent_id: nil`).
 - Have access to both local workspace tools (`read_file`, `write_file`, `edit_file`, `bash`) and orchestration tools (`launch_subagent`, `list_sessions`, `session_output`, `send_session`).
 - Subscribe to `"conductor:<id>:children"` on `Athanor.Bus`.
-- Maintain a `prompt_queue` so if multiple child sub-agents finish concurrently while the conductor is mid-turn, their `[DONE]` notifications are queued and processed in order without dropping events or returning `:busy`.
+- Maintain a `prompt_queue` so if multiple child sub-agents finish concurrently while the conductor is mid-turn, their `[DONE]` notifications are queued and processed in order without dropping events or returning `:busy`. A queued prompt is started as its own turn at a **task** boundary, or appended to the *current* turn as a `user` message at a **tool-round** boundary (mid-task injection — issue #44, `ATHANOR_MID_TURN_QUEUE`, exactly one per round) so a long tool loop no longer hides a follow-up until the whole task ends. Mid-round pickup is suppressed for a session with a live `goal_id` (§7.2: the worker's target must stay stable for verification).
 
 ### 2.2 Sub-Agents / Workers (`role: :worker`)
 - **Child sessions** spawned by a Conductor (`parent_id: <conductor_id>`).

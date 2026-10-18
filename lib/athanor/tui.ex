@@ -62,8 +62,18 @@ defmodule Athanor.TUI do
   `:streaming`/`:executing_tools`, `Enter` on non-empty input routes to
   `Athanor.Agent.enqueue_prompt/2` (via `Athanor.Daemon.send_session/2` ->
   `Athanor.Orchestrator.send_session/2`), the input line is cleared, and the prompt is **not**
-  lost: the agent runs it FIFO once the current turn ends. Empty input keeps its old "re-render"
-  no-op, and an idle session still submits immediately.
+  lost: the agent runs it FIFO. Empty input keeps its old "re-render" no-op, and an idle session
+  still submits immediately.
+
+  When it runs depends on where the session is (#44). A stacked prompt is picked up at the
+  **next tool-round boundary** — the agent appends it as a `user` message and the model sees it
+  from that round on, without the turn being cancelled — so a follow-up typed during a long tool
+  loop is no longer invisible until the whole task finishes. It is still started as its own turn
+  at the end of a task, and mid-round pickup is off for a session with a live goal (a §7.2
+  worker's target must stay stable for verification) or when `ATHANOR_MID_TURN_QUEUE=0`. Nothing
+  changes in this module either way: both pickups publish `{:prompt_queue, %{len:, next:}}` and
+  `{:user_message, _}`, which the handlers below already fold into the indicator and the
+  viewport.
 
   The pending depth is rendered as `⧗ N queued` (plus a one-line preview of the next prompt when it
   fits) at the right of the input line, fed by the agent's `{:prompt_queue, %{len:, next:}}` event
