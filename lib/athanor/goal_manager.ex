@@ -10,7 +10,10 @@ defmodule Athanor.GoalManager do
     * folds the worker's progress receipts into the goal, which is what resets the stall clock;
     * decides between nudging and escalating when the work stalls (M5); and
     * is the **only** thing in the system allowed to close a goal, and only on a `:verified` result
-      from `Athanor.Verifier` (M3).
+      from `Athanor.Verifier` **plus** the worker's own `===ATHANOR_DONE===` claim (M3, #50). A
+      verdict and a claim are each necessary and neither is sufficient: a verifier of the
+      `mix check`-shaped kind passes against partial work, so a verdict alone closes goals mid-flight;
+      a claim alone is the worker marking its own homework.
 
   ## Why `:temporary`, and what that costs
 

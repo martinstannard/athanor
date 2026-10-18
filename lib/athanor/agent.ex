@@ -98,6 +98,20 @@ defmodule Athanor.Agent do
   whatever the flag says. The stacked prompt is not dropped — it drains at the next task boundary,
   exactly as it did before this feature, and the TUI indicator keeps showing it meanwhile.
 
+  ### The control plane (#49)
+
+  `Athanor.GoalManager`'s nudges do **not** travel on the conversational queue. They arrive as
+  `{:goal_nudge, text}` and fill a separate `control_queue`, drained at the next tool-round boundary
+  (or at once when nothing is in flight, and at a task boundary too — a prose-only worker never makes
+  a tool call) by `append_one_control_prompt/1`. The reason is #49: a nudge sent as a queued prompt to
+  a goal-attached session can never arrive, because the drain that would carry it is suppressed by
+  the goal exemption above — the remedy queued behind the very condition it had to cure. A nudge is a
+  reminder about the objective already in flight, not a new instruction, so it needs no exemption:
+  `mid_turn_injection?/1` is deliberately not consulted for it, and #44's invariant ("no *user* text
+  can rewrite a goal worker's target mid-flight") therefore still holds. Consumed nudges are counted
+  (`nudges_delivered`) and mirrored back to the manager as `{:nudge_delivered, _}`, so an escalation
+  can say what was delivered rather than only what was sent.
+
   **Cancel clears the queue.** `cancel/1` (Esc in the TUI) is a stop-the-line gesture: it kills the
   in-flight turn *and* discards every queued prompt, publishing `{:prompt_queue, %{len: 0}}`.
   Retaining the queue would start the very next stacked prompt the moment the killed turn unwound —
