@@ -6,6 +6,12 @@
       "branch": "feat/44-mid-turn-queue",
       "claimed_at": "2026-10-18T01:25:42.550689073Z",
       "signed_by": "conductor-main"
+    },
+    "23": {
+      "agent_id": "conductor-main",
+      "branch": "feat/23-agent-skills",
+      "claimed_at": "2026-10-18T01:26:51.763835110Z",
+      "signed_by": "conductor-main"
     }
   },
   "settings": {
