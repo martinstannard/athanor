@@ -1,6 +1,13 @@
 {
   "version": 1,
-  "locks": {},
+  "locks": {
+    "44": {
+      "agent_id": "conductor-main",
+      "branch": "feat/44-mid-turn-queue",
+      "claimed_at": "2026-10-18T01:25:42.550689073Z",
+      "signed_by": "conductor-main"
+    }
+  },
   "settings": {
     "stale_lock_timeout_minutes": 60
   }
