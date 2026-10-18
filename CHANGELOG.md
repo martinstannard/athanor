@@ -33,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - Isolate parallel workers' builds: `Worktree.add/2` now seeds a worktree-local `_build` (self-ignoring, never clobbering an existing one), and the private-`_build` rule — build with your own `_build`, **never** symlink it into another checkout; `deps` may be symlinked — is stated in the worker system prompt and both worktree tool messages. A `_build` symlink is warned about rather than written through. Two workers sharing a `_build` corrupt each other's `.beam` files *silently*, which made a `mix check` verdict (and `set_goal`'s shell verifier) unsound (#47)
+- The TUI no longer makes any *awaited* daemon call on its input/render loop (#54). `Enter`/prompt submit, the queue verbs and `Esc`'s cancel are delivered one-way through the new `Athanor.Daemon.cast/4` (`:erpc.cast/4` against a remote daemon, a direct call locally); the reply-bearing verbs (`/spawn`, `/conductor`, `/kill`, `/resume`, `/clear`) run in a `Task` whose result the loop applies as a later message. Bounding those calls was not enough — a loaded or wedged daemon still parked the only process that reads keys or renders, which is indistinguishable from a frozen UI
 - `/.athanor/` (harness memory for a checkout) is gitignored as runtime state; commit a curated `MEMORY.md` with `git add -f` (#46)
 - Document deps/_build bootstrap for fresh worktrees (design §7.1 OQ-W5) (#39)
 - `learnings.jsonl` compacts itself past 256 KB (`ATHANOR_MEMORY_COMPACT_BYTES`) (#41)
