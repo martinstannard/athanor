@@ -110,7 +110,10 @@ defmodule Athanor.Agent do
   `mid_turn_injection?/1` is deliberately not consulted for it, and #44's invariant ("no *user* text
   can rewrite a goal worker's target mid-flight") therefore still holds. Consumed nudges are counted
   (`nudges_delivered`) and mirrored back to the manager as `{:nudge_delivered, _}`, so an escalation
-  can say what was delivered rather than only what was sent.
+  can say what was delivered rather than only what was sent. `cancel/1` deliberately leaves the
+  control queue alone: its "stop everything" gesture is about the conversational work, and a nudge
+  stays relevant because the goal it refers to survives the cancel — it is simply delivered on the
+  next turn the session runs, rather than starting one of its own.
 
   **Cancel clears the queue.** `cancel/1` (Esc in the TUI) is a stop-the-line gesture: it kills the
   in-flight turn *and* discards every queued prompt, publishing `{:prompt_queue, %{len: 0}}`.
