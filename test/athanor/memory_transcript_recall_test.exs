@@ -121,7 +121,12 @@ defmodule Athanor.MemoryTranscriptRecallTest do
 
   test "'all' does not include transcripts (they are opt-in by name)", %{tmp_dir: root} do
     append(root, "s1", "user", "worktrees share memory", 1)
-    # No project/global learnings exist in this root, so `all` finds nothing.
+    # No project/global learnings exist in this root, so `all` finds nothing. Assert that
+    # precondition rather than commenting it (#51): before `:root` scoped the project tier, this
+    # call read the *ambient* checkout's `learnings.jsonl`, so a developer's `remember` — or this
+    # repo's own memory — decided the outcome. The project-scoped probe pins the isolation the
+    # `all` assertion depends on.
+    assert recall(root, "worktrees", "project") == "No matching learnings."
     assert recall(root, "worktrees", "all") == "No matching learnings."
   end
 end
