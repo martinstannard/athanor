@@ -323,7 +323,7 @@ defmodule Athanor.GoalManagerTest do
     end
   end
 
-  describe "closure (only on a verified result)" do
+  describe "closure (a verified result *and* a worker claim)" do
     test "a verified result closes the goal, releases its keys and wakes the conductor" do
       parent_id = "conductor-#{System.unique_integer([:positive])}"
 
@@ -337,6 +337,10 @@ defmodule Athanor.GoalManagerTest do
 
       Bus.subscribe("goal:#{goal_id}:events")
       Bus.subscribe("conductor:#{parent_id}:children")
+
+      # #50: the Verifier's verdict is necessary but not sufficient — the worker has to claim done.
+      # A claim alone is not a verdict (C1); this is the mirror: a verdict is not a claim either.
+      Bus.publish_event(worker_id, nil, {:goal_candidate_done, %{status: "ok", summary: "all done"}})
 
       assert :ok = GoalManager.verify_now(goal_id)
 
@@ -416,10 +420,98 @@ defmodule Athanor.GoalManagerTest do
     test "verify_now/1 is honest about an unknown goal" do
       assert {:error, :not_found} = GoalManager.verify_now("goal-nobody")
     end
+
+    test "a verifier that passes before the worker claims done does not close the goal (#50)" do
+      # The losing-work bug, exactly: a `mix check`-shaped verifier is polled from t=0 and passes
+      # against partial work, so a verdict-only closure kills the goal mid-implementation — and the
+      # worker's later real completion then lands on a resolved goal.
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :verified, evidence: "mix check is green"}}
+          end
+        )
+
+      Bus.subscribe("goal:#{goal_id}:events")
+
+      assert :ok = GoalManager.verify_now(goal_id)
+
+      snapshot = await(goal_id, &(&1.last_verifier_result != nil))
+      assert snapshot.last_verifier_result.verdict == :verified
+      assert snapshot.status == :active
+
+      refute_received {:goal_event, ^goal_id, {:goal_verified, _, _}}
+      assert {:ok, ^goal_id} = GoalManager.for_worker(worker_id)
+      assert Process.alive?(pid)
+
+      # Still open after more ticks: waiting for the claim is a stable state, not one tick's grace.
+      send(pid, :verify_tick)
+      Process.sleep(30)
+      assert {:ok, %{status: :active}} = GoalManager.status(goal_id)
+      assert Process.alive?(pid)
+    end
+
+    test "a passing-but-unclaimed result never nudges or escalates (#50)" do
+      # The other half of the fix: a `:verified` verdict is *positive* evidence, so it must not fall
+      # into the stall path. Otherwise a fix for the early closure would nag a worker into
+      # "finishing" work its own verifier already confirmed.
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          stall_after_ms: 0,
+          max_nudges: 2,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :verified, evidence: "green"}}
+          end
+        )
+
+      Bus.subscribe("agent:#{worker_id}:inbox")
+      Bus.subscribe("agent:#{parent_id}:inbox")
+
+      send(pid, :verify_tick)
+      Process.sleep(30)
+      send(pid, :verify_tick)
+      Process.sleep(30)
+
+      refute_receive {:bus_command, {:goal_nudge, _}}, 150
+      refute_receive {:bus_command, {:enqueue_prompt, _}}, 150
+      assert {:ok, %{status: :active, nudge_count: 0, worker_status: nil}} = GoalManager.status(goal_id)
+    end
+
+    test "a claim after a passing verdict is what closes the goal — and only then" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      %{goal_id: goal_id, worker_id: worker_id} =
+        start_goal!(
+          parent_id: parent_id,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :verified, evidence: "green"}}
+          end
+        )
+
+      Bus.subscribe("goal:#{goal_id}:events")
+
+      assert :ok = GoalManager.verify_now(goal_id)
+
+      assert %{status: :active, last_verifier_result: %Result{verdict: :verified}} =
+               await(goal_id, &(&1.last_verifier_result != nil))
+
+      refute_received {:goal_event, ^goal_id, {:goal_verified, _, _}}
+
+      # Now the claim arrives: the manager re-verifies (which may already be in flight or done) and
+      # closes on the combination.
+      Bus.publish_event(worker_id, nil, {:goal_candidate_done, %{status: "ok", summary: "done"}})
+
+      assert_receive {:goal_event, ^goal_id, {:goal_verified, _, %Result{verdict: :verified}}}, 1_000
+
+      assert :error = GoalManager.for_worker(worker_id)
+    end
   end
 
   describe "stall detection, nudges, and escalation (§5.4–§5.5, M5)" do
-    test "nudges the worker inbox when stalled or contradicted, then escalates to conductor after max_nudges" do
+    test "nudges the worker's control plane and escalates to the conductor after max_nudges unproductive ticks" do
       parent_id = "conductor-#{System.unique_integer([:positive])}"
 
       %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
@@ -437,24 +529,30 @@ defmodule Athanor.GoalManagerTest do
       Bus.subscribe("goal:#{goal_id}:events")
       Bus.subscribe("conductor:#{parent_id}:goals")
 
-      # First contradicted claim -> Nudge 1/2
-      Bus.publish_event(worker_id, nil, {:goal_candidate_done, %{status: "ok", summary: "try 1"}})
-
-      assert_receive {:bus_command, {:enqueue_prompt, nudge_1}}, 1_000
+      # #48: the trigger is *unproductive ticks*, not a contradicted verdict. The worker is silent
+      # here (no status event), so the stall clock expiring is the whole signal.
+      Process.sleep(15)
+      send(pid, :verify_tick)
+      assert_receive {:bus_command, {:goal_nudge, nudge_1}}, 1_000
       assert nudge_1 =~ "[GOAL NUDGE 1/2]"
       assert nudge_1 =~ "make it so"
       assert nudge_1 =~ "exit 1: 2 failures"
+
       assert_receive {:goal_event, ^goal_id, {:goal_nudged, %Goal{nudge_count: 1}, ^nudge_1}}, 1_000
 
-      # Second contradicted claim (or stall expiry) -> Nudge 2/2
+      # The nudge is control-plane, not a conversational prompt: a goal worker's `prompt_queue` is
+      # deliberately not how it arrives (#49a), so nothing is enqueued as a user prompt.
+      refute_received {:bus_command, {:enqueue_prompt, _}}, 100
+
+      # Second unproductive tick -> Nudge 2/2 (`nudge/1` also refreshes the clock, so sleep past it).
       Process.sleep(15)
       send(pid, :verify_tick)
 
-      assert_receive {:bus_command, {:enqueue_prompt, nudge_2}}, 1_000
+      assert_receive {:bus_command, {:goal_nudge, nudge_2}}, 1_000
       assert nudge_2 =~ "[GOAL NUDGE 2/2]"
       assert_receive {:goal_event, ^goal_id, {:goal_nudged, %Goal{nudge_count: 2}, ^nudge_2}}, 1_000
 
-      # Third attempt exceeds max_nudges (2) -> Escalation to conductor!
+      # Third unproductive tick exceeds max_nudges (2) -> escalation to the conductor.
       Process.sleep(15)
       send(pid, :verify_tick)
 
@@ -462,6 +560,8 @@ defmodule Athanor.GoalManagerTest do
       assert escalation =~ "[GOAL ESCALATED]"
       assert escalation =~ "exceeded max_nudges (2)"
       assert escalation =~ "exit 1: 2 failures"
+      # #49d: zero-delivery is reported as such, not as "Nudges sent: 2".
+      assert escalation =~ "delivered: 0"
 
       assert_receive {:goal_event, ^goal_id,
                       {:goal_escalated, %Goal{status: :escalated, nudge_count: 2}, %Result{verdict: :contradicted},
@@ -471,9 +571,118 @@ defmodule Athanor.GoalManagerTest do
       # Also mirrored onto conductor:<parent_id>:goals (C11).
       assert_receive {:goal_event, ^goal_id, {:goal_escalated, _, _, :max_nudges_exceeded}}, 1_000
 
-      # Terminal: both registry keys released so a new goal can be attached (C5).
+      # Terminal: both registry keys released so a new goal can be attached (C5), and nothing
+      # further is enqueued to the worker whose goal is already gone (#48's last criterion).
       assert :error = GoalManager.for_worker(worker_id)
       assert {:error, :not_found} = GoalManager.status(goal_id)
+      refute_received {:bus_command, {:goal_nudge, _}}, 100
+      await_death(pid)
+    end
+
+    test "a :streaming worker with a contradicted verifier never escalates (#48 regression)" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          stall_after_ms: 0,
+          max_nudges: 2,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1: ."}}
+          end
+        )
+
+      Bus.subscribe("agent:#{worker_id}:inbox")
+      Bus.subscribe("agent:#{parent_id}:inbox")
+
+      # The live failure: an actively-streaming worker whose end-state verifier had not passed yet.
+      Bus.publish_event(worker_id, nil, {:status, :streaming})
+
+      for _tick <- 1..3 do
+        send(pid, :verify_tick)
+        Process.sleep(20)
+      end
+
+      # Well past `max_nudges`, and still alive, un-nudged and un-escalated: a failing verdict is
+      # information about the work, never evidence that the worker is idle.
+      snapshot = await(goal_id, &(&1.last_verifier_result != nil))
+      assert snapshot.status == :active
+      assert snapshot.stalled? == false
+      assert snapshot.nudge_count == 0
+
+      refute_received {:bus_command, {:goal_nudge, _}}, 150
+      refute_received {:bus_command, {:enqueue_prompt, _}}, 150
+      assert Process.alive?(pid)
+      assert {:ok, ^goal_id} = GoalManager.for_worker(worker_id)
+    end
+
+    test "a receipt resets the nudge budget so later legitimate stalls are survivable (#48 (b))" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          stall_after_ms: 10,
+          max_nudges: 2,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1"}}
+          end
+        )
+
+      Bus.subscribe("agent:#{worker_id}:inbox")
+
+      Process.sleep(15)
+      send(pid, :verify_tick)
+      assert_receive {:bus_command, {:goal_nudge, nudge_1}}, 1_000
+      assert nudge_1 =~ "[GOAL NUDGE 1/2]"
+      assert %{nudge_count: 1} = await_status(goal_id)
+
+      # Demonstrated progress: the counter is one of *consecutive* unproductive ticks, so this
+      # restores the full budget rather than leaving a monotonic lifetime count.
+      Process.sleep(15)
+      assert :ok = GoalManager.report_progress(worker_id, summary: "step done")
+      assert %{nudge_count: 0} = await_status(goal_id)
+
+      # A later stall is therefore nudged again as 1/2 — not escalated on the spot.
+      Process.sleep(15)
+      send(pid, :verify_tick)
+
+      assert_receive {:bus_command, {:goal_nudge, nudge_2}}, 1_000
+      assert nudge_2 =~ "[GOAL NUDGE 1/2]"
+      assert Process.alive?(pid)
+    end
+
+    test "escalation reports nudges actually delivered, not merely sent (#49d)" do
+      parent_id = "conductor-#{System.unique_integer([:positive])}"
+
+      %{goal_id: goal_id, worker_id: worker_id, pid: pid} =
+        start_goal!(
+          parent_id: parent_id,
+          stall_after_ms: 10,
+          max_nudges: 1,
+          verifier_fn: fn _goal, _opts ->
+            {:ok, %Result{mode: :shell, verdict: :contradicted, evidence: "exit 1"}}
+          end
+        )
+
+      Bus.subscribe("agent:#{parent_id}:inbox")
+      Bus.subscribe("agent:#{worker_id}:inbox")
+
+      # One nudge is sent and one is *consumed* (the agent reports consumption), so the escalation's
+      # numbers differ from the zero-delivery case above — that difference is the point.
+      Process.sleep(15)
+      send(pid, :verify_tick)
+      assert_receive {:bus_command, {:goal_nudge, _}}, 1_000
+      Bus.publish_event(worker_id, nil, {:nudge_delivered, "[GOAL NUDGE 1/1] ..."})
+
+      Process.sleep(15)
+      send(pid, :verify_tick)
+
+      assert_receive {:bus_command, {:enqueue_prompt, escalation}}, 1_000
+      assert escalation =~ "Nudges sent: 1, delivered: 1."
+      refute escalation =~ "delivered: 0"
+
+      _ = goal_id
       await_death(pid)
     end
   end
