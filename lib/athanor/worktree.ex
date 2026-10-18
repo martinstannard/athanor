@@ -22,7 +22,35 @@ defmodule Athanor.Worktree do
   This module is deliberately free of processes: the mutations in §M2 are serialised by
   `Athanor.Worktree.Server` (§M3), because `git worktree add` writes shared state and is not
   concurrency-safe.
+
+  ## Build isolation (#47)
+
+  A worktree isolates the *source*, not the build. `git worktree add` yields a tree with neither
+  `deps/` nor `_build/`, and `mix` compiles into whatever build directory the environment names —
+  so a worker told to `ln -sfn <main>/_build _build` compiles into a sibling's artefacts. Two
+  workers sharing one `_build` overwrite each other's `.beam` files **silently**, which is why a
+  shared `_build` makes a `mix check` result — and therefore a §7.2 goal verification — untrustworthy.
+
+  So the safe path is automatic rather than merely documented: `add/2` seeds a **worktree-local**
+  `_build` (`seed_build_dir/1`), so plain `mix …` run from the worktree compiles there, with no
+  flag and no prompt-level action. `deps/` is deliberately *not* seeded, because it may be
+  symlinked (read-only, safe to share) while `_build` may not:
+
+    * build with the **worktree-local** `_build` — the default when you simply run `mix …` from the
+      worktree;
+    * **never** symlink `_build` into another checkout: two workers compiling into one `_build`
+      silently corrupt each other's `.beam` files, and a "verified" verdict then cannot be trusted;
+    * `deps` **may** be symlinked (read-only, safe to share).
+
+  The seed is `.gitignore`-aware in the only way that cannot go wrong: the seeded directory carries
+  a self-ignoring `_build/.gitignore` (`*`), so it stays invisible to `git status` whether or not
+  the repository ignores `_build/` — a seeded build directory can never make a worktree look dirty
+  to `clean?/1` or to `remove/2`'s refusal. An existing `_build` (a re-attach, or a worker's own
+  build) is never touched, and a `_build` that exists but is not a real directory (a symlink) is
+  reported rather than clobbered.
   """
+
+  require Logger
 
   alias Athanor.{Config, Git, SessionId}
 
@@ -195,6 +223,14 @@ defmodule Athanor.Worktree do
   A session that already has a worktree gets it back rather than an error. If its branch outlived
   the worktree (the default `remove/2` policy keeps branches), the branch is *attached* rather than
   re-created — otherwise re-spawning a session would fail with "a branch named … already exists".
+
+  ## Build isolation (#47)
+
+  Every path through `add/2` — a fresh create, a re-attach, a plain lookup of a tracked tree —
+  ensures the worktree has a worktree-local `_build` (`seed_build_dir/1`). Seeding is idempotent
+  and best effort: an existing directory is left untouched, and a `_build` that is a **symlink**
+  (a worker that pointed it at another checkout) is reported as a warning, never repaired behind
+  the worker's back and never a reason to refuse the create.
   """
   @spec add(String.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def add(session_id, opts \\ []) when is_binary(session_id) do
@@ -207,9 +243,20 @@ defmodule Athanor.Worktree do
          :ok <- ensure_clean_source(repo, opts),
          :ok <- ensure_parent_dir(path),
          {:ok, _how} <- create_or_attach(repo, session_id, path, opts) do
+      seed_build_dir(path)
       read_back(repo, session_id, path)
     end
   end
+
+  @doc """
+  The path of the worktree-local build directory for a worktree at `path`.
+
+  Exposed so callers (and tests) can name the same directory `mix` will use without repeating the
+  convention. Athanor never sets `MIX_BUILD_PATH`: the whole point of #47 is that the private
+  directory is `mix`'s *default* inside a worktree.
+  """
+  @spec build_dir(String.t()) :: String.t()
+  def build_dir(path), do: Path.join(path, "_build")
 
   @doc """
   Removes a worktree, refusing by default to destroy uncommitted work or an unmerged branch.
@@ -382,6 +429,64 @@ defmodule Athanor.Worktree do
     case File.mkdir_p(Path.dirname(path)) do
       :ok -> :ok
       {:error, reason} -> {:error, {:worktree_dir_unwritable, reason}}
+    end
+  end
+
+  # -- build-dir seeding (#47) ----------------------------------------------------------------
+
+  # Gives the worktree its own `_build` so `mix` compiles there by default, with no flag and no
+  # prompt-level action: the *safe* path is what a worker gets for free, so a spawning Conductor's
+  # prompt cannot reintroduce a shared-_build collision by forgetting to mention one.
+  #
+  # Two details make this obviously correct:
+  #
+  #   * the directory is made to ignore itself (`_build/.gitignore` containing `*`), so it can never
+  #     make the worktree dirty — `clean?/1`, `remove/2`'s refusal and `git worktree remove` all keep
+  #     working whether or not the repository itself ignores `_build/`. Relying on the repository's
+  #     own `.gitignore` (`/_build/`) would leave a *newly* created directory untracked-and-ignored
+  #     only by convention, and would do nothing at all for a repo that does not ignore `_build`;
+  #   * nothing existing is ever overwritten. An existing directory is a worker's build, and an
+  #     existing *symlink* is exactly the collision this feature exists to prevent, so it is
+  #     reported (below) rather than silently replaced or written through.
+  defp seed_build_dir(path) do
+    dir = build_dir(path)
+
+    result =
+      case File.lstat(dir) do
+        {:ok, %{type: :directory}} -> :existing
+        {:ok, %{type: :symlink}} -> {:error, :build_dir_symlink}
+        {:ok, %{type: type}} -> {:error, {:build_dir_not_a_directory, type}}
+        {:error, :enoent} -> create_private_build_dir(dir)
+        {:error, reason} -> {:error, {:build_dir_unreadable, reason}}
+      end
+
+    case result do
+      :existing ->
+        :ok
+
+      {:error, reason} ->
+        # Best effort, like the Server's sidecar writes: losing the seed costs a slower first build
+        # (`mix` re-creates `_build` on demand), so it must never fail the create. The warning is the
+        # point — a `_build` symlink is the one case where the isolation is genuinely not there.
+        Logger.warning(
+          "Athanor.Worktree: no private _build seeded in #{path} (#{inspect(reason)}); " <>
+            "build with `mix` from that directory and do not share a _build with another checkout"
+        )
+
+        :ok
+
+      :ok ->
+        :ok
+    end
+  end
+
+  defp create_private_build_dir(dir) do
+    # The `.gitignore` is what makes the seed invisible to git regardless of the repository's own
+    # ignores, so it is written in the same step as the directory and its failure is reported too.
+    marker = "# seeded by Athanor: a worktree-private _build (#47)\n*\n"
+
+    with :ok <- File.mkdir_p(dir) do
+      File.write(Path.join(dir, ".gitignore"), marker)
     end
   end
 

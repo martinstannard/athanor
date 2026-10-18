@@ -73,6 +73,36 @@ defmodule Athanor.ToolsTest do
       refute "list_worktrees" in names
       refute "remove_worktree" in names
     end
+
+    test "the worktree tool descriptions carry the private-_build rule (#47)" do
+      # The collision was observed live: a worker told to share a `_build` compiles into a sibling's
+      # artefacts, and the defect is *silent*, so the text the model reads is the only place it can be
+      # prevented — both when it prepares the checkout (`create_worktree`) and when it spawns the
+      # worker (`launch_subagent`, where the rule rides on the `worktree` property the model reads
+      # before using the flag). Pinned so the two cannot drift apart, or quietly lose it in an edit.
+      schemas = Tools.schemas(role: :conductor)
+      find = fn name -> Enum.find(schemas, &(&1["function"]["name"] == name)) end
+
+      # The whole schema, not one field: what matters is that the rule reaches the model, not which
+      # string inside the JSON it lives in.
+      launch = flatten(find.("launch_subagent"))
+      create = flatten(find.("create_worktree"))
+
+      for text <- [launch, create] do
+        assert text =~ "WORKTREE-LOCAL `_build`"
+        assert text =~ "NEVER symlink `_build` into another checkout"
+        assert text =~ "silently corrupt each other's .beam files"
+        assert text =~ "`deps` MAY be symlinked"
+        # The no-flag part matters most: the safe path has to be the *default*, or a prompt that
+        # forgets to mention the build reintroduces the collision.
+        assert text =~ "seeds one when it creates the worktree"
+      end
+    end
+
+    # One line, so a phrase that happens to wrap inside the schema text still matches.
+    defp flatten(term) do
+      term |> JSON.encode!() |> String.replace(~r/\s+/, " ")
+    end
   end
 
   describe "write_file and read_file" do

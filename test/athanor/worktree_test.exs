@@ -275,6 +275,160 @@ defmodule Athanor.WorktreeTest do
       refute branch_exists?(repo, "athanor/m2-detached")
     end
 
+    # -- #47: the worktree-private `_build` ---------------------------------------------------
+
+    test "seeds a worktree-local _build so `mix` compiles privately with no flag", %{tmp_dir: dir} do
+      repo = GitRepo.init!(Path.join(dir, "repo"))
+
+      assert {:ok, wt} = Worktree.add("m2-build", repo: repo)
+
+      build = Worktree.build_dir(wt.path)
+      assert build == Path.join(wt.path, "_build")
+      # A real directory, not a symlink into another checkout: that distinction is the whole of #47.
+      assert File.dir?(build)
+      refute symlink?(build)
+      # And it is the directory plain `mix` uses, because Athanor deliberately never sets
+      # MIX_BUILD_PATH — the private build must be mix's *default* inside the worktree, not something
+      # a prompt has to remember to ask for.
+      assert System.get_env("MIX_BUILD_PATH") in [nil, ""]
+    end
+
+    test "the seeded _build cannot make the worktree look dirty", %{tmp_dir: dir} do
+      repo = GitRepo.init!(Path.join(dir, "repo"))
+
+      assert {:ok, wt} = Worktree.add("m2-clean", repo: repo)
+
+      # The seed carries its own `.gitignore` (`*`), so it stays invisible to git whether or not the
+      # repository ignores `_build/`. Leaning on the repository's own ignore would leave a repo
+      # without one looking dirty (`clean?/1` false, `remove/2` refusing a perfectly good worktree).
+      assert File.read!(Path.join(Worktree.build_dir(wt.path), ".gitignore")) =~ "*"
+      assert Worktree.clean?(wt.path)
+
+      # Real artefacts in it change nothing either, and removal still works without `force`.
+      File.mkdir_p!(Path.join([wt.path, "_build", "dev", "lib", "app", "ebin"]))
+      File.write!(Path.join([wt.path, "_build", "dev", "lib", "app", "ebin", "app.beam"]), "beam")
+
+      assert Worktree.clean?(wt.path)
+      assert Worktree.summary(wt.path) == "clean"
+      assert :ok = Worktree.remove(wt, repo: repo)
+      refute File.exists?(wt.path)
+    end
+
+    test "two worktrees get two distinct _build directories", %{tmp_dir: dir} do
+      repo = GitRepo.init!(Path.join(dir, "repo"))
+
+      assert {:ok, one} = Worktree.add("m2-build-a", repo: repo)
+      assert {:ok, two} = Worktree.add("m2-build-b", repo: repo)
+
+      # The collision that motivated #47, in one assertion: siblings must never share a build
+      # directory, so a `mix check` in one cannot read a half-written `.beam` from the other.
+      refute Worktree.build_dir(one.path) == Worktree.build_dir(two.path)
+      assert File.dir?(Worktree.build_dir(one.path))
+      assert File.dir?(Worktree.build_dir(two.path))
+    end
+
+    test "an existing _build is never clobbered", %{tmp_dir: dir} do
+      repo = GitRepo.init!(Path.join(dir, "repo"))
+
+      assert {:ok, wt} = Worktree.add("m2-build-existing", repo: repo)
+      marker = Path.join([wt.path, "_build", "worker-marker"])
+      File.write!(marker, "built by the worker\n")
+
+      # A re-add (a resume, a re-spawn) hands the same worktree back, and seeding is idempotent:
+      # overwriting a worker's build directory would be a silent waste at best.
+      assert {:ok, again} = Worktree.add("m2-build-existing", repo: repo)
+      assert again.path == wt.path
+      assert File.read!(marker) == "built by the worker\n"
+    end
+
+    @tag :capture_log
+    test "a _build symlink is reported, never written through", %{tmp_dir: dir} do
+      repo = GitRepo.init!(Path.join(dir, "repo"))
+      other = GitRepo.init!(Path.join(dir, "other"))
+
+      # Build the exact state #47 exists to prevent, the way it actually happens: the worker gets its
+      # private `_build`, then replaces it with a link into a *different* checkout. A later `add/2`
+      # (a re-spawn, a resume) must not quietly replace the worker's own choice with a directory, and
+      # must never write through the link into the sibling's build directory.
+      assert {:ok, wt} = Worktree.add("m2-build-symlink", repo: repo)
+      assert {:ok, shared_wt} = Worktree.add("m2-build-shared-src", repo: other)
+
+      shared_build = Worktree.build_dir(shared_wt.path)
+      File.write!(Path.join(shared_build, "sibling-marker"), "the sibling's own build\n")
+      before_entries = shared_build |> File.ls!() |> Enum.sort()
+
+      File.rm_rf!(Worktree.build_dir(wt.path))
+      assert :ok = File.ln_s(shared_build, Path.join(wt.path, "_build"))
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, again} = Worktree.add("m2-build-symlink", repo: repo)
+          assert again.path == wt.path
+        end)
+
+      assert symlink?(Path.join(wt.path, "_build"))
+
+      # Nothing was written *through* the link into the sibling's build directory: had the seed written
+      # through the symlink it would have added/refreshed entries there, which is how a convenience
+      # link silently becomes cross-checkout pollution.
+      assert shared_build |> File.ls!() |> Enum.sort() == before_entries
+      assert File.read!(Path.join(shared_build, "sibling-marker")) == "the sibling's own build\n"
+      refute File.exists?(Path.join(shared_build, "dev"))
+      # The warning names the one case where the isolation is genuinely not there, and the create still
+      # succeeds: refusing a re-attach over a build directory would be worse than saying so.
+      assert log =~ "no private _build"
+      assert log =~ "_build"
+    end
+
+    @tag timeout: 120_000
+    test "two workers building at the same time compile into separate _build directories (§#47)", %{
+      tmp_dir: dir
+    } do
+      # The end-to-end case, run against real `mix`: two worktrees of one repository, compiled
+      # *concurrently*, must not see each other's artefacts. This is the behaviour the whole issue is
+      # about, and nothing short of actually building proves it — a shared `_build` is silent, so a
+      # green suite in each directory would otherwise be indistinguishable from a corrupt one.
+      repo = mix_project!(dir)
+
+      assert {:ok, one} = Worktree.add("m2-build-par-a", repo: repo)
+      assert {:ok, two} = Worktree.add("m2-build-par-b", repo: repo)
+
+      # Both start from an empty tree: `git worktree add` carries no artefacts, which is exactly the
+      # gap the seed closes.
+      refute File.exists?(Path.join(one.path, "deps"))
+
+      [a, b] =
+        [
+          Task.async(fn -> mix_compile!(one.path) end),
+          Task.async(fn -> mix_compile!(two.path) end)
+        ]
+        |> Task.await_many(90_000)
+
+      assert a == :ok
+      assert b == :ok
+
+      beam_a = Path.join([one.path, "_build", "dev", "lib", "build_probe", "ebin", "Elixir.BuildProbe.beam"])
+      beam_b = Path.join([two.path, "_build", "dev", "lib", "build_probe", "ebin", "Elixir.BuildProbe.beam"])
+
+      assert File.exists?(beam_a)
+      assert File.exists?(beam_b)
+      # Separate paths, and *not* hard links to one file: each worktree owns its own artefact.
+      refute Path.expand(Path.dirname(beam_a)) == Path.expand(Path.dirname(beam_b))
+      assert inode(beam_a) != inode(beam_b)
+
+      # Neither build wrote into the source repository's tree — the property a shared
+      # `MIX_BUILD_PATH` (or a `_build` symlink) breaks, since only one directory would exist at all.
+      refute File.exists?(Path.join(repo, "_build"))
+
+      # A real build leaves the worktrees clean (the seeded `.gitignore`), so `mix check` in one
+      # worktree can never be tripped by the other's build, and removal needs no `--force`.
+      assert Worktree.clean?(one.path)
+      assert Worktree.clean?(two.path)
+
+      assert :ok = Worktree.remove(one, repo: repo)
+      assert :ok = Worktree.remove(two, repo: repo)
+    end
+
     test "remove/2 refuses a dirty worktree, names the paths, and only --force discards them", %{
       tmp_dir: dir
     } do
@@ -388,6 +542,64 @@ defmodule Athanor.WorktreeTest do
 
   defp branch_exists?(repo, branch) do
     match?({:ok, _}, Git.run(["rev-parse", "--verify", "--quiet", "refs/heads/#{branch}"], cd: repo))
+  end
+
+  # A repository holding a minimal, dependency-free Mix project, so the concurrent-build test can
+  # really compile without a network fetch or the athanor umbrella's own deps.
+  defp mix_project!(dir) do
+    repo = GitRepo.init!(Path.join(dir, "mix-repo"))
+
+    File.write!(Path.join(repo, "mix.exs"), """
+    defmodule BuildProbe.MixProject do
+      use Mix.Project
+
+      def project, do: [app: :build_probe, version: "0.1.0", elixir: "~> 1.18"]
+      def application, do: []
+    end
+    """)
+
+    File.mkdir_p!(Path.join(repo, "lib"))
+
+    File.write!(Path.join([repo, "lib", "build_probe.ex"]), """
+    defmodule BuildProbe do
+      @moduledoc "A tiny app the build-isolation tests compile."
+      def ok, do: :ok
+    end
+    """)
+
+    GitRepo.git!(repo, ["add", "."])
+    GitRepo.git!(repo, ["commit", "-qm", "add mix project"])
+    repo
+  end
+
+  # Runs a real `mix compile` in `dir` and returns `:ok` on a zero exit. Uses the same environment
+  # isolation the fixtures use, so an outer MIX_BUILD_PATH/MIX_ENV cannot make the assertion vacuous
+  # by pointing both worktrees at one directory — which is precisely the bug being tested for.
+  defp mix_compile!(dir) do
+    env = [
+      {"MIX_ENV", "dev"},
+      {"MIX_BUILD_PATH", nil},
+      {"MIX_BUILD_ROOT", nil},
+      {"MIX_DEPS_PATH", nil}
+    ]
+
+    case System.cmd("mix", ["compile"], cd: dir, stderr_to_stdout: true, env: env) do
+      {_output, 0} -> :ok
+      {output, code} -> flunk("mix compile in #{dir} failed (#{code}):\n#{output}")
+    end
+  end
+
+  # Inode identity, so "two separate artefacts" is a fact about the filesystem rather than about a
+  # path string (a hard link or a bind mount would fool the path comparison).
+  defp inode(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{inode: inode}} -> inode
+      {:error, reason} -> flunk("could not stat #{path}: #{inspect(reason)}")
+    end
+  end
+
+  defp symlink?(path) do
+    match?({:ok, %File.Stat{type: :symlink}}, File.lstat(path))
   end
 
   defp restore(key, nil), do: System.delete_env(key)

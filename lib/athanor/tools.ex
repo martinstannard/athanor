@@ -20,6 +20,19 @@ defmodule Athanor.Tools do
   @default_bash_timeout_ms 30_000
   @default_subagent_wait_timeout_ms 120_000
 
+  # The private-`_build` rule (#47), stated once and quoted by both worktree tool messages so the
+  # two can never drift apart. The *mechanism* that makes it automatic is
+  # `Athanor.Worktree.add/2` seeding a worktree-local `_build`; this text is what tells the model
+  # why it must not undo that with a symlink (the collision observed live while spawning #44/#23).
+  @private_build_rule """
+  Build with a WORKTREE-LOCAL `_build` — that is the default when you simply run `mix ...` from the \
+  worktree, and Athanor seeds one when it creates the worktree. NEVER symlink `_build` into another \
+  checkout (no `ln -sfn <other-checkout>/_build _build`, no shared MIX_BUILD_PATH): two workers \
+  compiling into one `_build` silently corrupt each other's .beam files, so a `mix check` that \
+  passed may have read a sibling's half-written artefacts and a "verified" verdict cannot be \
+  trusted. `deps` MAY be symlinked (read-only, safe to share); `_build` may not.\
+  """
+
   @doc """
   Returns the OpenAI-compatible tool definitions sent to the LLM.
   Options:
@@ -365,7 +378,9 @@ defmodule Athanor.Tools do
               "worktree" => %{
                 "type" => "boolean",
                 "description" =>
-                  "If true, the worker gets its own git worktree (its own checkout and branch) and works there, so parallel workers cannot fight over the same working directory. A string value means \"branch from that ref\". Refused when the repository has uncommitted changes: a worktree branches from committed HEAD, so the worker would not see them."
+                  "If true, the worker gets its own git worktree (its own checkout and branch) and works there, so parallel workers cannot fight over the same working directory. A string value means \"branch from that ref\". Refused when the repository has uncommitted changes: a worktree branches from committed HEAD, so the worker would not see them. " <>
+                    "Each worktree is seeded with its own `_build`, so the worker's `mix ...` compiles privately with no flag: pass this rule on if you mention the build at all. " <>
+                    @private_build_rule
               },
               "base" => %{
                 "type" => "string",
@@ -431,7 +446,9 @@ defmodule Athanor.Tools do
         "function" => %{
           "name" => "create_worktree",
           "description" =>
-            "Create an isolated git worktree (its own checkout and branch) and return its path. Use this to pin a session to a stable base, or to prepare a checkout you will hand to a sub-agent. Refuses to run when the repository has uncommitted changes, because a worktree branches from committed HEAD and a worker would not see them; pass allow_dirty=true to proceed anyway.",
+            "Create an isolated git worktree (its own checkout and branch) and return its path. Use this to pin a session to a stable base, or to prepare a checkout you will hand to a sub-agent. Refuses to run when the repository has uncommitted changes, because a worktree branches from committed HEAD and a worker would not see them; pass allow_dirty=true to proceed anyway. " <>
+              "The worktree is seeded with its own `_build`, so `mix ...` run there compiles privately with no flag and no action in your prompt. " <>
+              @private_build_rule,
           "parameters" => %{
             "type" => "object",
             "properties" => %{

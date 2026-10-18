@@ -31,9 +31,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI is silent when wedged: no activity indicator, no daemon connectivity, discarded command failures (#24)
 
 ### Changed
+- Isolate parallel workers' builds: `Worktree.add/2` now seeds a worktree-local `_build` (self-ignoring, never clobbering an existing one), and the private-`_build` rule — build with your own `_build`, **never** symlink it into another checkout; `deps` may be symlinked — is stated in the worker system prompt and both worktree tool messages. A `_build` symlink is warned about rather than written through. Two workers sharing a `_build` corrupt each other's `.beam` files *silently*, which made a `mix check` verdict (and `set_goal`'s shell verifier) unsound (#47)
 - `/.athanor/` (harness memory for a checkout) is gitignored as runtime state; commit a curated `MEMORY.md` with `git add -f` (#46)
+- Document deps/_build bootstrap for fresh worktrees (design §7.1 OQ-W5) (#39)
 - `learnings.jsonl` compacts itself past 256 KB (`ATHANOR_MEMORY_COMPACT_BYTES`) (#41)
 - TUI header: show daemon connectivity (#25)
-- Document deps/_build bootstrap for fresh worktrees (design §7.1 OQ-W5) (#39)
 - `write_file`/`edit_file` now refuse to modify an existing file the session has not read; creating a new file is unaffected. Disable with `ATHANOR_TOOL_GUARD=0` (#7)
 - Document chainlink's single-session-per-database model and its multi-agent workarounds (#32)
