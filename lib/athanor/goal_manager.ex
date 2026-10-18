@@ -463,6 +463,11 @@ defmodule Athanor.GoalManager do
   # The hot path: a streaming worker sends thousands of these per turn, and none of them are news.
   defp apply_worker_event(state, {:text_delta, _chunk}), do: state
 
+  # Reasoning deltas (#53) are the same story: thousands per turn, and none of them are progress.
+  # `Athanor.Agent` relays them but never lets them near the history, so the manager needs to know
+  # nothing about them beyond dropping them here.
+  defp apply_worker_event(state, {:thinking_delta, _chunk}), do: state
+
   # This manager's own closure echo (`Bus.publish_event/3` broadcasts here too): acting on it would
   # re-enter the close path (C12).
   defp apply_worker_event(state, {:child_done, _report}), do: state

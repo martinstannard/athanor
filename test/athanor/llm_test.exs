@@ -342,4 +342,243 @@ defmodule Athanor.LLMTest do
       refute Map.has_key?(LLM.finalize_message(state), :usage)
     end
   end
+
+  # Issue #53. The shapes asserted here are not guesses: each was captured from the live
+  # `opencode-go` endpoint before the parser was written (the probe the issue asked for), and the
+  # keys are exactly the ones observed. `reasoning_content` is the common case (DeepSeek V4
+  # pro/flash, GLM, Qwen, MiMo); `reasoning` + `reasoning_details` is Kimi K3, which sends the same
+  # text under both, hence the de-duplication test. No request flag is needed — the probe sent none
+  # and reasoning still streamed, so `include_reasoning: false` is an opt-*out*, not an opt-in this
+  # transport has to ask for.
+  describe "reasoning deltas (#53)" do
+    test "streams reasoning_content as {:llm_thinking_delta, _}, separately from content" do
+      sse = """
+      data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":""}}]}
+
+      data: {"choices":[{"delta":{"content":null,"reasoning_content":"We need answer"}}]}
+
+      data: {"choices":[{"delta":{"content":null,"reasoning_content":"Count r's."}}]}
+
+      data: {"choices":[{"delta":{"content":"There are 3"}}]}
+
+      data: {"choices":[{"delta":{"content":" r's."}}]}
+
+      data: [DONE]
+      """
+
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(sse, self())
+        |> LLM.flush_buffer(self())
+
+      assert_received {:llm_thinking_delta, "We need answer"}
+      assert_received {:llm_thinking_delta, "Count r's."}
+      assert_received {:llm_delta, "There are 3"}
+      assert_received {:llm_delta, " r's."}
+
+      # The opening `reasoning_content: ""` is noise, not an event: an empty delta would make every
+      # subscriber handle a no-op on the first and last chunk of every reasoning turn.
+      refute_received {:llm_thinking_delta, ""}
+
+      assert LLM.thinking(state) == "We need answerCount r's."
+
+      # The load-bearing assertion: the thinking is *not* the assistant's content, so it cannot be
+      # recorded into `messages` and cannot reach the provider.
+      assert LLM.finalize_message(state) == %{
+               role: "assistant",
+               content: "There are 3 r's.",
+               tool_calls: []
+             }
+
+      refute Map.has_key?(LLM.finalize_message(state), :thinking)
+    end
+
+    test "reads Kimi's `reasoning` without double-counting `reasoning_details`" do
+      # Captured verbatim from kimi-k3: the same text arrives under both keys in one delta. Reading
+      # both would double every token of thinking.
+      delta = %{
+        "content" => nil,
+        "reasoning" => " The user is asking",
+        "reasoning_details" => [
+          %{"type" => "reasoning.text", "text" => " The user is asking", "format" => "unknown", "index" => 0}
+        ]
+      }
+
+      sse = "data: " <> JSON.encode!(%{"choices" => [%{"delta" => delta}]}) <> "\n\n"
+
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(sse, self())
+        |> LLM.flush_buffer(self())
+
+      assert_received {:llm_thinking_delta, " The user is asking"}
+      refute_received {:llm_thinking_delta, " The user is asking"}
+      assert LLM.thinking(state) == " The user is asking"
+    end
+
+    test "falls back to reasoning_details when the plain `reasoning` key is absent" do
+      # A provider that only sends the structured form must still render. `text`-less blocks are
+      # skipped rather than guessed at.
+      delta = %{
+        "reasoning_details" => [
+          %{"type" => "reasoning.encrypted", "data" => "opaque"},
+          %{"type" => "reasoning.text", "text" => "structured only"}
+        ]
+      }
+
+      sse = "data: " <> JSON.encode!(%{"choices" => [%{"delta" => delta}]}) <> "\n\n"
+
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(sse, self())
+        |> LLM.flush_buffer(self())
+
+      assert LLM.thinking(state) == "structured only"
+    end
+
+    test "a provider with no reasoning streams nothing and leaves the accumulator empty" do
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(~s(data: {"choices":[{"delta":{"content":"just an answer"}}]}\n\n), self())
+        |> LLM.flush_buffer(self())
+
+      assert LLM.thinking(state) == ""
+      refute_received {:llm_thinking_delta, _}
+      assert LLM.finalize_message(state).content == "just an answer"
+    end
+
+    test "an unexpected reasoning shape contributes nothing rather than raising" do
+      # A future protocol change must degrade to "no thinking", never to a crashed stream.
+      for value <- [nil, 42, %{"nested" => "map"}, [], [%{"type" => "reasoning.text"}, "raw"]] do
+        delta = %{"reasoning_content" => nil, "reasoning" => nil, "reasoning_details" => value}
+
+        sse = "data: " <> JSON.encode!(%{"choices" => [%{"delta" => delta}]}) <> "\n\n"
+
+        state =
+          LLM.new_stream_state()
+          |> LLM.consume_sse_chunk(sse, self())
+          |> LLM.flush_buffer(self())
+
+        assert LLM.thinking(state) == ""
+      end
+    end
+
+    test "reasoning is never in format_messages/1 output" do
+      # The acceptance criterion the issue names. `format_messages/1` is the last thing to touch a
+      # request, so the assertion belongs here rather than on an internal accumulator.
+      state =
+        LLM.new_stream_state()
+        |> LLM.consume_sse_chunk(
+          ~s(data: {"choices":[{"delta":{"reasoning_content":"SECRET-REASONING-PROBE"}}]}\n\n),
+          self()
+        )
+        |> LLM.consume_sse_chunk(
+          ~s(data: {"choices":[{"delta":{"content":"the answer"}}]}\n\n),
+          self()
+        )
+        |> LLM.flush_buffer(self())
+
+      {:ok, assistant} = LLM.assemble_result(state, "ses_53")
+
+      wire = LLM.format_messages([%{role: "user", content: "q"}, assistant])
+
+      refute JSON.encode!(wire) =~ "SECRET-REASONING-PROBE"
+      refute inspect(wire) =~ "SECRET-REASONING-PROBE"
+
+      # Nor on a message somebody hand-built with a reasoning field, which is the belt-and-braces
+      # half: `format_message/1` builds each wire message from a fixed field set.
+      tainted = %{role: "assistant", content: "hi", reasoning_content: "SMUGGLED", thinking: "ALSO"}
+      refute inspect(LLM.format_messages([tainted])) =~ "SMUGGLED"
+      refute inspect(LLM.format_messages([tainted])) =~ "ALSO"
+    end
+
+    test "new_stream_state/0 starts with an empty thinking accumulator" do
+      assert LLM.thinking(LLM.new_stream_state()) == ""
+    end
+  end
+
+  # The end-to-end half of #53: real socket, real `Req` `into:` callback, real `stream/4`. The unit
+  # tests above pin the parser; this pins the *transport* — that reasoning decodes through the HTTP
+  # streaming path and reaches the caller as its own event while the returned assistant message
+  # stays clean. Without it, the whole feature would rest on the assumption that the `into:` callback
+  # plumbing behaves like the direct `consume_sse_chunk/3` call, which is the assumption a fixture
+  # cannot check.
+  describe "reasoning over a real SSE socket (#53)" do
+    alias Athanor.Test.SSEServer
+
+    test "stream/4 relays thinking separately and returns a message without it" do
+      body =
+        ~s(data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":"think A"}}]}
+
+) <>
+          ~s(data: {"choices":[{"delta":{"content":null,"reasoning_content":"think B"}}]}
+
+) <>
+          ~s(data: {"choices":[{"delta":{"content":"answer"}}]}
+
+) <>
+          ~s(data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":6,"completion_tokens_details":{"reasoning_tokens":4}}}
+
+) <>
+          "data: [DONE]
+
+"
+
+      {:ok, server} = SSEServer.start(body)
+
+      assert {:ok, message} =
+               LLM.stream([%{role: "user", content: "hi"}], [], self(),
+                 base_url: server.url,
+                 api_key: "test-key",
+                 receive_timeout: 5_000
+               )
+
+      # The caller's deltas: reasoning on its own tag, the answer on the usual one.
+      assert_received {:llm_thinking_delta, "think A"}
+      assert_received {:llm_thinking_delta, "think B"}
+      assert_received {:llm_delta, "answer"}
+
+      # The assistant message carries the answer and the provider's real usage — never the reasoning.
+      assert message.content == "answer"
+      assert message.tool_calls == []
+      assert message.usage["completion_tokens_details"]["reasoning_tokens"] == 4
+
+      refute inspect(message) =~ "think A"
+      refute inspect(message) =~ "think B"
+
+      # The acceptance criterion, at the transport boundary: the payload for the next request has
+      # nothing of the reasoning in it.
+      wire = LLM.format_messages([%{role: "user", content: "hi"}, message]) |> JSON.encode!()
+      refute wire =~ "think A"
+      refute wire =~ "think B"
+
+      SSEServer.await(server.accepted)
+    end
+
+    test "a stream with no reasoning sends no thinking events at all" do
+      body =
+        ~s(data: {"choices":[{"delta":{"content":"plain"}}]}
+
+) <>
+          ~s(data: {"choices":[{"delta":{"content":" answer"}}]}
+
+) <>
+          "data: [DONE]
+
+"
+
+      {:ok, server} = SSEServer.start(body)
+
+      assert {:ok, message} =
+               LLM.stream([%{role: "user", content: "hi"}], [], self(),
+                 base_url: server.url,
+                 api_key: "test-key",
+                 receive_timeout: 5_000
+               )
+
+      assert message.content == "plain answer"
+      refute_received {:llm_thinking_delta, _}
+      SSEServer.await(server.accepted)
+    end
+  end
 end

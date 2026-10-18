@@ -6,6 +6,11 @@ defmodule Athanor.LLM do
   `{:llm_delta, text}` messages to the caller and returning the assembled
   assistant message (including any accumulated tool calls).
 
+  A reasoning model's thinking arrives on the same stream, so it is parsed here too — into a
+  **separate** accumulator (`state.thinking`, see `thinking/1`) and a **separate** event,
+  `{:llm_thinking_delta, text}`. It is never merged into `content`, never returned on the assistant
+  message, and therefore never reaches `messages` or the wire (issue #53).
+
   One case is deliberately *not* returned as a normal completion: a turn whose only sign of tool
   use is the provider's tool-call markup leaking through as text in `content` (see
   `assemble_result/2`). Returned as prose, such a turn runs nothing and still reports success.
@@ -28,6 +33,25 @@ defmodule Athanor.LLM do
   # tried to call, bounded so one turn cannot bloat the log or the TUI.
   @error_excerpt_chars 2_000
 
+  # The reasoning-delta keys OpenCode Go actually streams (#53). Probed against the live endpoint
+  # rather than guessed from an OpenAI-compat document, and these are the *observed* shapes:
+  #
+  #   * `reasoning_content` — DeepSeek V4 (both variants), GLM, Qwen, MiniMax/MiMo. The common
+  #     case: a plain string of the next thinking chunk.
+  #   * `reasoning` — Kimi K3, which sends this *alongside* `reasoning_details`.
+  #   * `reasoning_details` — Kimi's structured form: a list of
+  #     `%{"type" => "reasoning.text", "text" => …}` blocks. Same text as `reasoning`, so it is only
+  #     read as a fallback (`reasoning_text/1`) to avoid doubling the accumulation.
+  #
+  # Reasoning is **on by default** for every reasoning model on this gateway: no request flag is
+  # needed (the probe sent none), and `include_reasoning: false` is the opt-*out*. Since the
+  # provider offers no "off" switch that makes the content cheaper to obtain, there is nothing to
+  # request — the only decision is whether to render what already arrives.
+  #
+  # A key nobody has observed is deliberately absent: the point of the probe was to avoid a parser
+  # for a speculative shape.
+  @reasoning_keys ["reasoning_content", "reasoning"]
+
   @type tool_call :: %{
           id: String.t(),
           type: String.t(),
@@ -46,8 +70,12 @@ defmodule Athanor.LLM do
   @doc """
   Streams a chat completion from OpenCode Go.
 
-  Sends `{:llm_delta, chunk}` to `caller_pid` as content tokens arrive.
-  Returns `{:ok, assistant_message}` when complete, or `{:error, reason}`.
+  Sends `{:llm_delta, chunk}` to `caller_pid` as content tokens arrive and
+  `{:llm_thinking_delta, chunk}` as reasoning tokens do (#53), before returning
+  `{:ok, assistant_message}` when complete, or `{:error, reason}`.
+
+  Both events are additive: a provider that streams no reasoning simply produces no
+  `{:llm_thinking_delta, _}`, so a caller written before #53 is unaffected.
   """
   @spec stream([map()], [map()], pid(), keyword()) ::
           {:ok, assistant_message()} | {:error, String.t()}
@@ -57,6 +85,11 @@ defmodule Athanor.LLM do
       model = Keyword.get(opts, :model, Config.model())
       url = String.trim_trailing(base_url, "/") <> "/chat/completions"
 
+      # No reasoning request flag is sent, and that is a finding rather than an omission: the probe
+      # on issue #53 showed every reasoning model on this gateway streams `reasoning_content` with
+      # no flag at all, so there is nothing to opt into. Sending a speculative `include_reasoning`/
+      # `reasoning_effort` would risk a 400 on a model that does not know the field (`claude-haiku-5-5`
+      # already rejects this protocol outright) in exchange for content that arrives anyway.
       body =
         %{
           "model" => model,
@@ -114,12 +147,15 @@ defmodule Athanor.LLM do
 
   @doc """
   Creates a fresh SSE stream accumulator state.
+
+  `thinking` is deliberately *not* part of `finalize_message/1` (see `thinking/1`).
   """
   @spec new_stream_state() :: map()
   def new_stream_state do
     %{
       buffer: "",
       content: "",
+      thinking: "",
       tool_calls: %{},
       usage: nil,
       raw_error: ""
@@ -127,8 +163,23 @@ defmodule Athanor.LLM do
   end
 
   @doc """
+  The reasoning text accumulated for this stream (#53), or `""` when the turn produced none.
+
+  A **separate** accumulator on purpose. Reasoning does not belong to the assistant message: it
+  must never be sent back to the provider, so it is not part of the map `finalize_message/1`
+  returns, and `format_messages/1` (and therefore the token estimate and the compaction input,
+  which read `messages`) can never see it. Keeping it in one binary here — rather than appending
+  it to `content` — is what makes that structural rather than a rule somebody has to remember.
+
+  Exposed so a caller (or a test) can read what the turn thought without a second parse.
+  """
+  @spec thinking(map()) :: String.t()
+  def thinking(state) when is_map(state), do: Map.get(state, :thinking, "")
+
+  @doc """
   Consumes a raw binary chunk of SSE data, emitting `{:llm_delta, text}` to `caller_pid`
-  for any content deltas and accumulating tool call fragments by index.
+  for any content deltas, `{:llm_thinking_delta, text}` for any reasoning deltas, and
+  accumulating tool call fragments by index.
   """
   @spec consume_sse_chunk(map(), binary(), pid()) :: map()
   def consume_sse_chunk(state, chunk, caller_pid) when is_binary(chunk) do
@@ -167,6 +218,12 @@ defmodule Athanor.LLM do
 
   @doc """
   Converts the final accumulator state into an assistant message map.
+
+  `state.thinking` is **not** included, and that is the load-bearing part of #53's correctness
+  requirement: this map is what `Athanor.Agent` records into `messages`, so anything absent here is
+  absent from the history, from `format_messages/1`, from the compaction input and from the token
+  estimate — by construction, not by a later filter somebody could forget. Use `thinking/1` to read
+  the reasoning if you want it.
   """
   @spec finalize_message(map()) :: assistant_message()
   def finalize_message(state) do
@@ -284,6 +341,7 @@ defmodule Athanor.LLM do
        when is_map(delta) do
     state
     |> apply_content_delta(delta, caller_pid)
+    |> apply_reasoning_delta(delta, caller_pid)
     |> apply_tool_calls_delta(delta)
   end
 
@@ -306,6 +364,61 @@ defmodule Athanor.LLM do
   end
 
   defp apply_content_delta(state, _delta, _caller_pid), do: state
+
+  # Reasoning deltas (#53), from the keys the probe actually observed. The order matters and is
+  # deliberate: `@reasoning_keys` is tried first, and `reasoning_details` only when neither plain
+  # key carried text — Kimi K3 sends the same thinking text under both `reasoning` and
+  # `reasoning_details`, so reading both unconditionally would double every token.
+  #
+  # Never touches `state.content`, and the emitted event is a *different* tag from
+  # `{:llm_delta, _}`, so the assistant text on the wire and the assistant text in the viewport are
+  # both unaffected by how much the model thought.
+  defp apply_reasoning_delta(state, delta, caller_pid) do
+    case reasoning_text(delta) do
+      text when is_binary(text) and text != "" ->
+        send(caller_pid, {:llm_thinking_delta, text})
+        %{state | thinking: (Map.get(state, :thinking) || "") <> text}
+
+      _none ->
+        state
+    end
+  end
+
+  # `reasoning_content` / `reasoning`: the observed plain-string shapes. `nil` and `""` are both
+  # "no text in this chunk" — the provider opens and closes a stream with `reasoning_content: ""`,
+  # and an empty event would be noise for every subscriber.
+  defp reasoning_text(delta) do
+    Enum.find_value(@reasoning_keys, fn key ->
+      case Map.get(delta, key) do
+        text when is_binary(text) and text != "" -> text
+        _other -> nil
+      end
+    end) || reasoning_details_text(Map.get(delta, "reasoning_details"))
+  end
+
+  # Kimi's structured form: a list of blocks, each possibly `%{"text" => …}`. Only `text`-carrying
+  # blocks contribute, and non-text block types are ignored rather than guessed at.
+  defp reasoning_details_text(details) when is_list(details) do
+    details
+    |> Enum.map(&reasoning_detail_text/1)
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join()
+    |> case do
+      "" -> nil
+      joined -> joined
+    end
+  end
+
+  defp reasoning_details_text(_details), do: nil
+
+  defp reasoning_detail_text(%{} = detail) do
+    case Map.get(detail, "text") do
+      text when is_binary(text) -> text
+      _other -> nil
+    end
+  end
+
+  defp reasoning_detail_text(_detail), do: nil
 
   defp apply_tool_calls_delta(state, %{"tool_calls" => calls}) when is_list(calls) do
     updated_calls = Enum.reduce(calls, state.tool_calls, &merge_tool_call_delta/2)
@@ -364,6 +477,13 @@ defmodule Athanor.LLM do
 
   As a final step, `pair_tool_calls/1` guarantees the other invariant the API enforces: every
   `tool_calls` entry must be followed by a `tool` message answering its `tool_call_id`.
+
+  **Reasoning never appears in the output** (#53). `format_message/1` builds each wire message from
+  a fixed field set — `role`/`content`/`tool_calls` for an assistant, and nothing else — so a
+  reasoning field on any input map is dropped here even if a future caller puts one there. The
+  primary guarantee is upstream (`Athanor.LLM.finalize_message/1` never emits one), and this is the
+  belt-and-braces half: this function is the exact last thing that touches a request, so it is the
+  only place an assertion about "thinking is not in the payload" can be made honestly.
 
   Exposed rather than private because it is the last thing to inspect when a request is rejected —
   `mix run -e 'Athanor.LLM.format_messages(msgs)'` is the fastest way to see what would be sent.

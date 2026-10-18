@@ -2103,6 +2103,76 @@ defmodule Athanor.AgentTest do
     end
   end
 
+  # Issue #53. The agent is the relay, and the whole correctness claim rests on it doing *nothing*
+  # but relaying: reasoning must never enter `state.messages`, which is what keeps it out of
+  # `LLM.format_messages/1`, the compaction input and the token estimate.
+  describe "reasoning relay (#53)" do
+    setup do
+      # "deck:events" is a :duplicate Registry key: subscribe exactly once per test.
+      Bus.subscribe("deck:events")
+      :ok
+    end
+
+    test "relays {:llm_thinking_delta, _} as {:thinking_delta, _} without touching history", %{
+      tmp_dir: tmp_dir
+    } do
+      llm_fn = fn _messages, _tools, agent_pid ->
+        send(agent_pid, {:llm_thinking_delta, "We need answer"})
+        send(agent_pid, {:llm_thinking_delta, " the user."})
+        send(agent_pid, {:llm_delta, "There are 3 r's."})
+
+        {:ok, %{role: "assistant", content: "There are 3 r's.", tool_calls: []}}
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+      assert :ok = Agent.prompt(agent, "count the r's")
+
+      assert_receive {:agent_event, {:thinking_delta, "We need answer"}}
+      assert_receive {:agent_event, {:thinking_delta, " the user."}}
+      assert_receive {:agent_event, {:text_delta, "There are 3 r's."}}
+      assert_receive {:agent_event, {:turn_complete, "There are 3 r's."}}
+
+      state = Agent.get_state(agent)
+
+      # The history is exactly (system, user, assistant): no thinking record of any kind.
+      assert Enum.map(state.messages, &Map.get(&1, :role)) == ["system", "user", "assistant"]
+
+      refute Enum.any?(state.messages, fn msg ->
+               inspect(msg) =~ "We need answer"
+             end)
+
+      # And therefore none of it is in the payload the transport would send.
+      wire = state.messages |> Athanor.LLM.format_messages() |> JSON.encode!()
+      refute wire =~ "We need answer"
+      refute wire =~ "the user."
+    end
+
+    test "thinking does not inflate the context estimate, and never enters compaction input", %{
+      tmp_dir: tmp_dir
+    } do
+      # A large reasoning block and a one-line answer: the estimate must reflect the answer, not the
+      # reasoning, or a chatty reasoner would trigger compaction on text the provider never sees.
+      thinking = String.duplicate("deliberation ", 500)
+      answer = "Three."
+
+      llm_fn = fn _messages, _tools, agent_pid ->
+        send(agent_pid, {:llm_thinking_delta, thinking})
+        {:ok, %{role: "assistant", content: answer, tool_calls: []}}
+      end
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+      assert :ok = Agent.prompt(agent, "how many")
+      assert_receive {:agent_event, {:turn_complete, "Three."}}
+
+      state = Agent.get_state(agent)
+      estimate = Tokens.estimate_messages(state.messages)
+
+      # The whole history is a handful of messages of short content: the reasoning is absent.
+      assert estimate < Tokens.estimate(thinking)
+      assert estimate == Tokens.estimate_messages(Enum.reject(state.messages, &is_map_key(&1, :thinking)))
+    end
+  end
+
   describe "usage stats (#26)" do
     test "accumulates real usage and tool-call counts, and publishes them", %{tmp_dir: tmp_dir} do
       File.write!(Path.join(tmp_dir, "x.txt"), "hi")

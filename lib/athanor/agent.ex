@@ -12,6 +12,16 @@ defmodule Athanor.Agent do
     the exact, replayable conversation (correction C1). The `system` message is **never**
     published — it is re-derived on resume (correction C13).
 
+  ## Reasoning / thinking (#53)
+
+  A reasoning model's thinking reaches this process as `{:llm_thinking_delta, text}` and is relayed
+  as `{:thinking_delta, text}` — **and nothing else happens to it**. It is not appended to
+  `state.messages`, not published as a `{:message, _}` (so the Recorder never persists it), and
+  therefore never appears in the next request, the compaction input or `Tokens.estimate_messages/1`.
+  That is a structural guarantee, not a filter: `Athanor.LLM.finalize_message/1` builds the assistant
+  message from a fixed field set that has no reasoning field, so there is nothing here to strip.
+  Only the viewport renders it, and only when asked.
+
   ## Compaction (design §7.4, plan §5.4)
 
   The Agent owns `state.messages`, so it also owns the compaction *trigger*: **before every
@@ -654,6 +664,21 @@ defmodule Athanor.Agent do
 
   def handle_info({:llm_delta, chunk}, state) do
     notify(state, {:text_delta, chunk})
+    {:noreply, state}
+  end
+
+  # Reasoning tokens (#53), relayed like text deltas and — importantly — *nothing more*. There is
+  # deliberately no `record_messages/2` here: reasoning must never enter `messages`, which is exactly
+  # what keeps it out of the next request (`LLM.format_messages/1`), the compaction input and the
+  # token estimate. `Athanor.LLM` sends the assistant's `content` and this stream separately, and the
+  # assistant message it finally returns carries no reasoning at all (`finalize_message/1`), so the
+  # accumulator and the history are different structures rather than one filtered later.
+  #
+  # The event tag differs from `{:text_delta, _}` so a subscriber can render it as its own entry; a
+  # subscriber that does not know it (`Athanor.GoalManager`, an older client) ignores it, exactly as
+  # it already ignores text deltas.
+  def handle_info({:llm_thinking_delta, chunk}, state) do
+    notify(state, {:thinking_delta, chunk})
     {:noreply, state}
   end
 
