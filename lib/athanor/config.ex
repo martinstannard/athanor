@@ -44,6 +44,7 @@ defmodule Athanor.Config do
   @default_goal_stall_after_ms 60_000
   @default_goal_verify_timeout_ms 60_000
   @default_goal_peer_timeout_ms 120_000
+  @default_goal_resolved_retention_ms 3_600_000
   @default_memory_enabled true
   @default_memory_project_budget 2_000
   @default_memory_global_budget 1_000
@@ -674,6 +675,30 @@ defmodule Athanor.Config do
   @spec goal_peer_timeout_ms() :: pos_integer()
   def goal_peer_timeout_ms do
     positive_int("ATHANOR_GOAL_PEER_TIMEOUT_MS", :goal_peer_timeout_ms, @default_goal_peer_timeout_ms)
+  end
+
+  @doc """
+  How long a *resolved* goal's record stays in `Athanor.GoalManager`'s resolved-goal table
+  (default `#{@default_goal_resolved_retention_ms}` ms — one hour, #55).
+
+  `Athanor.GoalManager` records every goal that reaches a terminal state so that a *late* worker
+  completion can tell "my goal already resolved" from "my goal vanished" (#50), and that record is
+  consulted on the hot completion path (`resolved?/1`). The daemon is long-lived by design, so the
+  table is swept past this window instead of growing for the lifetime of the VM.
+
+  One hour is deliberately well beyond any plausible worker lifetime: the record must outlive the
+  worker's own turn, and a window that is too short turns #50's "already accounted for" back into
+  "misread as a fresh claim". Positive-only, so the window cannot be set to zero to mean "prune
+  everything" by accident. Overridable via `ATHANOR_GOAL_RESOLVED_RETENTION_MS` or
+  `:athanor, :goal_resolved_retention_ms`.
+  """
+  @spec goal_resolved_retention_ms() :: pos_integer()
+  def goal_resolved_retention_ms do
+    positive_int(
+      "ATHANOR_GOAL_RESOLVED_RETENTION_MS",
+      :goal_resolved_retention_ms,
+      @default_goal_resolved_retention_ms
+    )
   end
 
   @doc """

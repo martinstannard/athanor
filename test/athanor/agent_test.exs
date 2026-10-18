@@ -1,7 +1,7 @@
 defmodule Athanor.AgentTest do
   use ExUnit.Case, async: true
 
-  alias Athanor.{Agent, Bus, GoalManager}
+  alias Athanor.{Agent, Bus, Goal, GoalManager}
   alias Athanor.Store.{Compactor, Tokens}
 
   @moduletag :tmp_dir
@@ -1938,10 +1938,12 @@ defmodule Athanor.AgentTest do
   # Puts `goal_id` in `Athanor.GoalManager`'s resolved-goal table without starting a manager: the
   # state a worker observes after its goal closed or escalated. The table is a process-global ETS
   # table (it outlives a manager by design — see `GoalManager.init_resolved_table/0`), so the entry
-  # is removed on exit rather than leaked into another test.
+  # is removed on exit rather than leaked into another test. The record carries the time it resolved
+  # at (#55): a 2-tuple would be one the sweep could never age, which is the leak the timestamp is
+  # there to bound — so this fixture writes the shape the manager actually writes.
   defp mark_goal_resolved!(goal_id) do
     GoalManager.init_resolved_table()
-    :ets.insert(:athanor_resolved_goals, {goal_id, :closed})
+    :ets.insert(:athanor_resolved_goals, {goal_id, :closed, Goal.now_ms()})
     on_exit(fn -> :ets.delete(:athanor_resolved_goals, goal_id) end)
     :ok
   end
