@@ -606,6 +606,11 @@ defmodule Athanor.Tools do
 
   @doc """
   Executes a named tool with a map of string-keyed arguments (or a JSON-encoded string).
+
+  Options are the calling session's context, not per-tool parameters: `:cd` (the directory a
+  relative path resolves against), `:session_id` (§7.6's read-before-write guard), `:role` (which
+  tools a session may name), `:skill_opts` (where `skill` resolves names), and `:worktree` (that
+  session's own checkout, when it has one — see `guard_write/3`).
   """
   @spec execute(String.t(), map() | String.t(), keyword()) ::
           {:ok, String.t()} | {:error, String.t()}
@@ -994,10 +999,62 @@ defmodule Athanor.Tools do
   # The guard applies only to a path that already exists: creating a file destroys nothing, and
   # refusing it would break scaffolding.
   defp guard_write(path, full_path, opts) do
-    if ToolGuard.refuse?(opts[:session_id], full_path) do
-      {:error, ToolGuard.refusal_message(path)}
-    else
-      :ok
+    cond do
+      ToolGuard.refuse?(opts[:session_id], full_path) ->
+        {:error, ToolGuard.refusal_message(path)}
+
+      worktree_escape(full_path, opts) ->
+        {:error, worktree_escape_message(path, full_path, opts)}
+
+      true ->
+        :ok
+    end
+  end
+
+  # Belt and braces for worktree isolation (#58). Resolving a *relative* path against the session's
+  # `cd` is what makes a worker's edits land in its own tree — and it is exactly what broke: a
+  # resumed worker whose `cd` had fallen back to the main checkout wrote 51 lines into main while its
+  # worktree stayed untouched. An **absolute** path names a checkout directly and so cannot be
+  # protected by `cd` at all, which makes "the model repeats a path it saw elsewhere" a live escape
+  # route even after that fix.
+  #
+  # So: a session that has a worktree may not *write* into a different git working tree. The rule is
+  # deliberately narrow — it is about a second checkout, not about the filesystem. A path outside any
+  # repository (a scratch file in `/tmp`) is still allowed, `read_file` is never restricted (reading
+  # `<main>/lib/foo.ex` to compare is legitimate), and a session without a worktree is untouched.
+  defp worktree_escape(full_path, opts) do
+    case Keyword.get(opts, :worktree) do
+      worktree when is_binary(worktree) ->
+        worktree = Path.expand(worktree)
+        full_path = Path.expand(full_path)
+
+        not inside?(worktree, full_path) and enclosing_repo(full_path) not in [nil, worktree]
+
+      _no_worktree ->
+        false
+    end
+  end
+
+  defp worktree_escape_message(path, full_path, opts) do
+    worktree = Path.expand(Keyword.fetch!(opts, :worktree))
+
+    "Refusing to write #{path} (#{full_path}): this session is isolated in the worktree " <>
+      "#{worktree}, and that path is inside another checkout (#{enclosing_repo(full_path)}). " <>
+      "Use a path inside #{worktree} — relative paths already resolve there."
+  end
+
+  defp inside?(dir, path), do: path == dir or String.starts_with?(path, dir <> "/")
+
+  # The nearest ancestor holding a `.git` — a directory in a main checkout, a *file* in a linked
+  # worktree — i.e. the working tree this path belongs to. `nil` when it belongs to none, which is
+  # how "a scratch file outside the repo" stays allowed.
+  defp enclosing_repo(path), do: walk_up(Path.dirname(Path.expand(path)))
+
+  defp walk_up(dir) do
+    cond do
+      File.exists?(Path.join(dir, ".git")) -> dir
+      Path.dirname(dir) == dir -> nil
+      true -> walk_up(Path.dirname(dir))
     end
   end
 
