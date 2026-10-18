@@ -14,6 +14,7 @@ defmodule Athanor.Tools do
   alias Athanor.ToolGuard
   alias Athanor.Tools.{Glob, Grep}
   alias Athanor.Tools.Goal, as: GoalTools
+  alias Athanor.Tools.Skill, as: SkillTools
   alias Athanor.Tools.Worktree, as: WorktreeTools
 
   @default_bash_timeout_ms 30_000
@@ -30,12 +31,15 @@ defmodule Athanor.Tools do
     role = Keyword.get(opts, :role, :worker)
 
     case role do
-      :conductor -> workspace_schemas() ++ conductor_schemas() ++ goal_schemas() ++ memory_schemas()
+      :conductor ->
+        workspace_schemas() ++ conductor_schemas() ++ goal_schemas() ++ memory_schemas() ++ skill_schemas()
+
       # `report_progress` is worker-only: a conductor has no goal of its own to report against, so
       # offering it there is pure token cost (§7.2, plan §7).
       # Memory tools are for *every* agent — design §7.5 says "an agent", and a worker is usually
       # the one who discovers the gotcha (plan D2).
-      _worker -> workspace_schemas() ++ worker_schemas() ++ memory_schemas()
+      _worker ->
+        workspace_schemas() ++ worker_schemas() ++ memory_schemas() ++ skill_schemas()
     end
   end
 
@@ -301,6 +305,33 @@ defmodule Athanor.Tools do
               }
             },
             "required" => ["id"]
+          }
+        }
+      }
+    ]
+  end
+
+  # The on-demand half of the §7.5 anti-pollution split: the catalogue injected into the system
+  # prompt carries names and descriptions, and this tool is how a *body* enters the conversation —
+  # one skill at a time, only when chosen. Offered to **both** roles: a worker whose prompt names a
+  # skill must be able to read it, and it costs one schema entry rather than every body.
+  defp skill_schemas do
+    [
+      %{
+        "type" => "function",
+        "function" => %{
+          "name" => "skill",
+          "description" =>
+            "Load a local Agent Skill by name and return its full SKILL.md instructions. The system prompt lists the skills available on this machine (name and description); call this with the exact name to read one. Use it when a skill's description matches the task at hand. Only the chosen skill's text enters the conversation.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "name" => %{
+                "type" => "string",
+                "description" => "Exact skill name as listed in the system prompt (e.g. \"tdd-elixir\")."
+              }
+            },
+            "required" => ["name"]
           }
         }
       }
@@ -781,6 +812,12 @@ defmodule Athanor.Tools do
     Memory.forget(args, opts)
   end
 
+  def execute("skill", %{"name" => name}, opts) when is_binary(name) do
+    # The agent's per-session `:skill_opts` win over the process-global config, so a name resolves
+    # against the same roots whose catalogue the model was shown.
+    SkillTools.run(name, Keyword.get(opts, :skill_opts, []))
+  end
+
   def execute(tool_name, _args, _opts)
       when tool_name in [
              "read_file",
@@ -803,7 +840,8 @@ defmodule Athanor.Tools do
              "list_goals",
              "remember",
              "recall",
-             "forget"
+             "forget",
+             "skill"
            ] do
     {:error, "Missing or invalid required arguments for tool #{tool_name}"}
   end

@@ -55,6 +55,9 @@ defmodule Athanor.Config do
   @default_memory_transcript_max_records 5_000
   @default_tool_guard_enabled true
   @default_prelude_read_required true
+  @default_skills_enabled true
+  @default_skill_paths ["~/.agents/skills", "~/work/skills/.agents/skills"]
+  @default_skill_max_bytes 32_768
 
   @doc """
   Returns the OpenCode Go base URL.
@@ -902,6 +905,96 @@ defmodule Athanor.Config do
   @spec prelude_read_required?() :: boolean()
   def prelude_read_required? do
     boolean_env("ATHANOR_PRELUDE_READ", :prelude_read_required, @default_prelude_read_required)
+  end
+
+  # -- skills (#23) --------------------------------------------------------------
+
+  @doc """
+  Master switch for Agent Skills (default `#{@default_skills_enabled}`).
+
+  `ATHANOR_SKILLS=0` (or `"false"`) turns the whole layer off: `Athanor.Skills.discover/1`
+  returns `[]`, so no catalogue is injected and the `skill` tool reports that nothing is
+  available. Mirrors `memory_enabled?/0` and `project_context_enabled?/0` — a single switch for
+  a user who does not want their machine's skill library in a session's prompt, or whose skills
+  are untrusted. An explicit `:skills` init option on `Athanor.Agent` wins over this value.
+
+  Note that this is a *separate* switch from the read-before-write guard: the `skill` tool only
+  reads files, so `ATHANOR_TOOL_GUARD=0` has no effect on it.
+  """
+  @spec skills_enabled?() :: boolean()
+  def skills_enabled? do
+    boolean_env("ATHANOR_SKILLS", :skills_enabled, @default_skills_enabled)
+  end
+
+  @doc """
+  The ordered skill roots to discover from, defaulting to:
+
+      #{inspect(@default_skill_paths)}
+
+  **Order is precedence**: roots are scanned in order and the *later* root wins a name collision,
+  so the workspace root (second) overrides the global one (first). See `Athanor.Skills`.
+
+  Overridable via `ATHANOR_SKILL_PATHS` (colon-separated, `PATH`-style) or
+  `:athanor, :skill_paths`. Blank entries are dropped, so a trailing colon is harmless, and an
+  explicitly empty value falls back to the defaults rather than silently disabling discovery
+  (that is `skills_enabled?/0`'s job). Each entry is `Path.expand/1`ed by the caller, so `~` is
+  safe to write.
+  """
+  @spec skill_paths() :: [String.t()]
+  def skill_paths do
+    case System.get_env("ATHANOR_SKILL_PATHS") do
+      nil ->
+        configured_skill_paths()
+
+      "" ->
+        @default_skill_paths
+
+      paths ->
+        case split_paths(paths) do
+          [] -> @default_skill_paths
+          list -> list
+        end
+    end
+  end
+
+  defp configured_skill_paths do
+    case Application.get_env(:athanor, :skill_paths, @default_skill_paths) do
+      list when is_list(list) -> Enum.filter(list, &is_binary/1)
+      other when is_binary(other) -> split_paths(other)
+      _other -> @default_skill_paths
+    end
+  end
+
+  @doc """
+  The built-in skill roots, before any override:
+
+      #{inspect(@default_skill_paths)}
+
+  Exposed so `Athanor.Skills` can document and test the default precedence order without
+  duplicating the list.
+  """
+  @spec default_skill_paths() :: [String.t()]
+  def default_skill_paths, do: @default_skill_paths
+
+  defp split_paths(value) do
+    value
+    |> String.split(":")
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  @doc """
+  Maximum number of bytes of a skill body the `skill` tool returns (default
+  `#{@default_skill_max_bytes}`).
+
+  The same idiom as `project_context_max_bytes/0` and `search_max_file_bytes/0`: a `SKILL.md` is
+  human-authored prose and can legitimately be long, but it is still bounded so one pathological
+  file cannot fill the context window. Over-limit bodies are truncated with a visible marker,
+  never silently. Overridable via `ATHANOR_SKILL_MAX_BYTES` or `:athanor, :skill_max_bytes`.
+  """
+  @spec skill_max_bytes() :: pos_integer()
+  def skill_max_bytes do
+    positive_int("ATHANOR_SKILL_MAX_BYTES", :skill_max_bytes, @default_skill_max_bytes)
   end
 
   # Like `positive_int/3`, but zero is a legitimate value for the few knobs where "never" is a

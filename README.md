@@ -44,6 +44,33 @@ To select a specific OpenCode Go model:
 mix athanor --model gemini-4-argon-contributor
 ```
 
+## Agent Skills
+
+Athanor discovers local **Agent Skills** — a directory with a `SKILL.md` carrying
+`--- name: … description: … ---` frontmatter, plus optional assets — from an ordered list of roots:
+
+| Order | Root |
+|---|---|
+| 1 | `~/.agents/skills` (global, per-user) |
+| 2 | `~/work/skills/.agents/skills` (workspace) |
+
+Override the list with a colon-separated `ATHANOR_SKILL_PATHS` (a root may also name the repository
+that holds a `.agents/skills` tree), and turn the whole layer off with `ATHANOR_SKILLS=0`.
+
+Skills are exposed in two halves so a large library never bloats a prompt:
+
+- a **conductor's** system prompt carries a one-line catalogue of skill names and descriptions;
+- the **`skill(name)` tool** returns one skill's full instructions on demand, so only the chosen
+  skill's text enters the conversation.
+
+Names collide in the wild (a symlink and its target, or a stale backup copy), so discovery resolves
+symlinks, de-duplicates by name, and resolves collisions **later root wins** — workspace overrides
+global — recording the losing copy. `disable-model-invocation: true` in a `SKILL.md` keeps that skill
+out of the catalogue while leaving it loadable by name.
+
+Skills are a distinct layer from memory (`remember`/`recall`) and MCP: they are local *instruction
+bundles*, read from disk, never written, never learned. See `docs/architecture.md` §13.
+
 ## Themes
 
 Athanor ships with 13 colour themes: `default` (the original palette, unchanged) plus 12 popular
@@ -80,6 +107,7 @@ client can pick a different theme from a local one while both watch the same dae
 - **`Athanor.Theme`** — Semantic colour roles and the built-in theme palettes.
 - **`Athanor.Markdown`** — Terminal Markdown renderer used by the TUI (theme-aware).
 - **`Athanor.Worktree`** / **`Athanor.Worktree.Server`** — Git worktree isolation: `launch_subagent(…, worktree: true)` gives a sub-agent its own checkout and `cd`, and the Server serialises every mutation. See §7.1 of `docs/design.md` for the location, branch and clean-tree rules.
+- **`Athanor.Skills`** / **`Athanor.Tools.Skill`** — Local Agent Skill discovery (ordered roots, symlink resolution, later-root-wins de-duplication) and the on-demand `skill(name)` tool; conductors also get a name+description catalogue in their system prompt.
 - **`Athanor.Daemon`** — Persistent BEAM node plus attach/detach bridge for remote clients.
 
 See `docs/architecture.md` for the full supervision tree and message flow.
