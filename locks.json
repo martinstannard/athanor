@@ -1,12 +1,6 @@
 {
   "version": 1,
   "locks": {
-    "44": {
-      "agent_id": "conductor-main",
-      "branch": "feat/44-mid-turn-queue",
-      "claimed_at": "2026-10-18T01:25:42.550689073Z",
-      "signed_by": "conductor-main"
-    },
     "23": {
       "agent_id": "conductor-main",
       "branch": "feat/23-agent-skills",
