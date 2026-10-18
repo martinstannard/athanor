@@ -605,6 +605,470 @@ defmodule Athanor.AgentTest do
     end
   end
 
+  # --- #44: mid-task pickup at a tool-round boundary ------------------------------------------
+
+  describe "mid-task pickup at a tool-round boundary (#44)" do
+    setup do
+      # "deck:events" is a :duplicate Registry key: subscribe exactly once per test.
+      Bus.subscribe("deck:events")
+      :ok
+    end
+
+    test "a prompt stacked mid-tool-loop is seen at the next round boundary", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      # The provider reports what it was handed and blocks, so the test can hold round 2 open:
+      # that is the round the injected prompt must already be part of.
+      llm_fn = test_driven_llm_fn(self())
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, mid_turn_queue: true)
+
+      assert :ok = Agent.prompt(agent, "start the long task")
+
+      # Round 1: the model asks for a tool.
+      assert_receive {:llm_messages, round1_task, round1}
+      assert List.last(round1).content == "start the long task"
+
+      send(
+        round1_task,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      # Stack the follow-up while the tool round is in flight.
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+      assert :ok = Agent.enqueue_prompt(agent, "also update the docs")
+      assert_receive {:agent_event, {:prompt_queue, %{len: 1, next: "also update the docs"}}}
+
+      # Round 2 begins at the *round* boundary — no turn_complete, no cancel — and the model is
+      # handed the injected prompt as the last message.
+      assert_receive {:llm_messages, round2_task, round2}, 2_000
+      assert List.last(round2) == %{role: "user", content: "also update the docs"}
+
+      # Wire legality: the injected user message lands after the tool result, never between the
+      # assistant's tool_calls and its answer.
+      assert Enum.map(round2, &field(&1, "role")) |> Enum.take(-3) == [
+               "assistant",
+               "tool",
+               "user"
+             ]
+
+      assert_paired!(round2)
+
+      # The queue is empty and the indicator has been updated...
+      assert_receive {:agent_event, {:prompt_queue, %{len: 0, next: nil}}}
+      assert Agent.get_state(agent).prompt_queue_len == 0
+
+      # ...and the turn was never cancelled: no `:cancelled`, no `turn_complete` yet.
+      refute_received {:agent_event, :cancelled}
+      refute_received {:agent_event, {:turn_complete, _}}
+      assert Agent.get_state(agent).status == :streaming
+
+      # The turn carries on and completes normally, `turn_complete` firing exactly once at the end.
+      send(round2_task, {:reply, {:ok, %{role: "assistant", content: "did both", tool_calls: []}}})
+
+      assert_receive {:agent_event, {:turn_complete, "did both"}}, 2_000
+      refute_received {:agent_event, {:turn_complete, _}}
+
+      state = Agent.get_state(agent)
+      assert state.status == :idle
+      assert state.prompt_queue_len == 0
+      assert_paired!(state.messages)
+    end
+
+    test "drains at most one prompt per round, FIFO", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = test_driven_llm_fn(self())
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, mid_turn_queue: true)
+
+      assert :ok = Agent.prompt(agent, "task")
+
+      tool_call_reply = fn id ->
+        {:ok,
+         %{
+           role: "assistant",
+           content: "",
+           tool_calls: [
+             %{
+               id: id,
+               type: "function",
+               function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+             }
+           ]
+         }}
+      end
+
+      # Round 1 → tool round → stack two prompts behind it.
+      assert_receive {:llm_messages, round1, _}
+      send(round1, {:reply, tool_call_reply.("call_1")})
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+
+      assert :ok = Agent.enqueue_prompt(agent, "follow-up one")
+      assert :ok = Agent.enqueue_prompt(agent, "follow-up two")
+      assert_receive {:agent_event, {:prompt_queue, %{len: 2, next: "follow-up one"}}}
+      flush_prompt_queue_events()
+
+      # Round 2 sees exactly the first one...
+      assert_receive {:llm_messages, round2, sent2}, 2_000
+      assert List.last(sent2).content == "follow-up one"
+      refute Enum.any?(sent2, &(field(&1, "content") == "follow-up two"))
+      assert_receive {:agent_event, {:prompt_queue, %{len: 1, next: "follow-up two"}}}
+
+      # ...round 3 (after the second tool round) sees the second.
+      send(round2, {:reply, tool_call_reply.("call_2")})
+      assert_receive {:llm_messages, round3, sent3}, 2_000
+      assert List.last(sent3).content == "follow-up two"
+      assert_receive {:agent_event, {:prompt_queue, %{len: 0, next: nil}}}
+
+      send(round3, {:reply, {:ok, %{role: "assistant", content: "done", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "done"}}, 2_000
+
+      assert Agent.get_state(agent).prompt_queue_len == 0
+    end
+
+    test "publishes the injected prompt through the one write path", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = test_driven_llm_fn(self())
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, mid_turn_queue: true)
+
+      assert :ok = Agent.prompt(agent, "task")
+      assert_receive {:llm_messages, round1, _}
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+      assert :ok = Agent.enqueue_prompt(agent, "interjection")
+
+      # `record_messages/2` is the single append choke point: the TUI event and the §7.4 wire
+      # message both fire, exactly as for any other message.
+      assert_receive {:agent_event, {:user_message, "interjection"}}, 2_000
+      assert_receive {:message, "conductor-main", %{role: "user", content: "interjection"}}, 2_000
+
+      assert_receive {:llm_messages, round2, _}, 2_000
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "ok", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "ok"}}, 2_000
+    end
+
+    test "mid_turn_queue: false restores the old wait-for-the-task behaviour", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = test_driven_llm_fn(self())
+
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, mid_turn_queue: false)
+
+      assert :ok = Agent.prompt(agent, "task")
+      assert_receive {:llm_messages, round1, _}
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+      assert :ok = Agent.enqueue_prompt(agent, "waits for the task")
+
+      # The next round is the plain continuation: the prompt is still queued, not injected.
+      assert_receive {:llm_messages, round2, sent}, 2_000
+      refute Enum.any?(sent, &(field(&1, "content") == "waits for the task"))
+      assert Agent.get_state(agent).prompt_queue_len == 1
+
+      # It runs as its own turn once the task genuinely ends — today's behaviour exactly.
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "task done", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "task done"}}, 2_000
+      assert_receive {:llm_messages, second_turn, sent2}, 2_000
+      assert List.last(sent2).content == "waits for the task"
+
+      send(second_turn, {:reply, {:ok, %{role: "assistant", content: "second done", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "second done"}}, 2_000
+    end
+
+    test "a goal-attached session never injects mid-round (#44 decision note)", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = test_driven_llm_fn(self())
+
+      # `attach_goal/3` is the real path; the `goal_id:` init option is the same field. The flag is
+      # left ON here on purpose: the goal exemption must win over `ATHANOR_MID_TURN_QUEUE`.
+      {:ok, agent} =
+        Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, goal_id: "goal_44")
+
+      assert :ok = Agent.prompt(agent, "work the goal")
+      assert_receive {:llm_messages, round1, _}
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+      assert :ok = Agent.enqueue_prompt(agent, "a different objective")
+
+      assert_receive {:llm_messages, round2, sent}, 2_000
+      refute Enum.any?(sent, &(field(&1, "content") == "a different objective"))
+      assert Agent.get_state(agent).prompt_queue_len == 1
+
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "still on goal", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "still on goal"}}, 2_000
+
+      # Not dropped — it drains at the task boundary, as before.
+      assert_receive {:llm_messages, second_turn, sent2}, 2_000
+      assert List.last(sent2).content == "a different objective"
+
+      send(second_turn, {:reply, {:ok, %{role: "assistant", content: "now", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "now"}}, 2_000
+    end
+
+    test "attach_goal/3 mid-turn also opts the session out (the live-goal path)", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = test_driven_llm_fn(self())
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn)
+
+      assert :ok = Agent.prompt(agent, "task")
+      assert_receive {:llm_messages, round1, _}
+
+      # A goal can be attached while the worker is already running (`set_goal` does exactly this),
+      # so the exemption cannot only be an init-time decision.
+      Agent.attach_goal(agent, "goal_attached")
+      assert :sys.get_state(agent).goal_id == "goal_attached"
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+      assert :ok = Agent.enqueue_prompt(agent, "a different objective")
+
+      assert_receive {:llm_messages, round2, sent}, 2_000
+      refute Enum.any?(sent, &(field(&1, "content") == "a different objective"))
+      assert Agent.get_state(agent).prompt_queue_len == 1
+
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "on goal", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "on goal"}}, 2_000
+    end
+
+    test "an idle session's stacked prompt still submits exactly as today", %{tmp_dir: tmp_dir} do
+      llm_fn = test_driven_llm_fn(self())
+
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, mid_turn_queue: true)
+
+      assert :ok = Agent.prompt(agent, "idle prompt")
+      assert_receive {:llm_messages, task, sent}
+      assert List.last(sent).content == "idle prompt"
+      # Idle is not a round boundary: no drain path is involved at all.
+      assert Agent.get_state(agent).prompt_queue_len == 0
+
+      send(task, {:reply, {:ok, %{role: "assistant", content: "answered", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "answered"}}, 2_000
+      assert Agent.get_state(agent).status == :idle
+    end
+
+    test "the injected message never lands between a tool_calls group and its answers", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      # Two tool calls in one round: the group must close in one piece before the user message.
+      llm_fn = test_driven_llm_fn(self())
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, mid_turn_queue: true)
+
+      assert :ok = Agent.prompt(agent, "task")
+      assert_receive {:llm_messages, round1, _}
+
+      calls =
+        for n <- [1, 2] do
+          %{
+            id: "call_#{n}",
+            type: "function",
+            function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+          }
+        end
+
+      send(round1, {:reply, {:ok, %{role: "assistant", content: "", tool_calls: calls}}})
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+
+      assert :ok = Agent.enqueue_prompt(agent, "interjection")
+
+      assert_receive {:llm_messages, round2, sent}, 2_000
+
+      roles = Enum.map(sent, &field(&1, "role"))
+      assert Enum.take(roles, -4) == ["assistant", "tool", "tool", "user"]
+      assert_paired!(sent)
+
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "ok", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "ok"}}, 2_000
+    end
+
+    test "the injected prompt is sent with the round it lands on, not held back (#44)", %{
+      tmp_dir: tmp_dir
+    } do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = test_driven_llm_fn(self())
+
+      # A seeded, over-budget history so the pre-flight compaction (#28) runs on every request:
+      # this pins the *order* inside a round boundary — record the tool results, drain the prompt,
+      # then compact-and-send. Were the drain to happen after `start_llm_turn/1` (or not at all),
+      # the interjection would be missing from the request that is actually in flight.
+      history = big_turns(4)
+      opts = compaction_opts(Tokens.estimate_messages(history))
+
+      {:ok, agent} =
+        Agent.start_link(
+          subscriber: self(),
+          cd: tmp_dir,
+          messages: history,
+          llm_fn: llm_fn,
+          compaction_opts: opts,
+          mid_turn_queue: true
+        )
+
+      assert :ok = Agent.prompt(agent, "task")
+      assert_receive {:llm_messages, round1, sent1}
+      # The first request was compacted, so the seeded history really is over budget.
+      assert Enum.any?(sent1, &(to_string(field(&1, "content")) =~ "[CONTEXT COMPACTED]"))
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:agent_event, {:tool_start, "read_file", _}}, 2_000
+      assert :ok = Agent.enqueue_prompt(agent, "interjection")
+
+      assert_receive {:llm_messages, round2, sent}, 2_000
+      assert List.last(sent).content == "interjection"
+      assert_paired!(sent)
+
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "ok", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "ok"}}, 2_000
+    end
+
+    test "control: without an interjection the round boundary drains nothing", %{tmp_dir: tmp_dir} do
+      File.write!(Path.join(tmp_dir, "secret.txt"), "alchemical_gold")
+
+      llm_fn = test_driven_llm_fn(self())
+      {:ok, agent} = Agent.start_link(subscriber: self(), cd: tmp_dir, llm_fn: llm_fn, mid_turn_queue: true)
+
+      assert :ok = Agent.prompt(agent, "task")
+      assert_receive {:llm_messages, round1, _}
+
+      send(
+        round1,
+        {:reply,
+         {:ok,
+          %{
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              %{
+                id: "call_1",
+                type: "function",
+                function: %{name: "read_file", arguments: ~s({"path":"secret.txt"})}
+              }
+            ]
+          }}}
+      )
+
+      assert_receive {:llm_messages, round2, sent}, 2_000
+      assert Enum.map(sent, &field(&1, "role")) == ["system", "user", "assistant", "tool"]
+      assert Agent.get_state(agent).prompt_queue_len == 0
+      # No injection: drain any `{:user_message, _}` still queued from the *original* prompt first.
+      flush_user_message_events()
+      refute_received {:agent_event, {:user_message, _}}
+
+      send(round2, {:reply, {:ok, %{role: "assistant", content: "ok", tool_calls: []}}})
+      assert_receive {:agent_event, {:turn_complete, "ok"}}, 2_000
+    end
+  end
+
   # --- #30: a tool intent that arrived as text ------------------------------------
 
   describe "a turn whose tool intent arrived as text (#30)" do
@@ -1279,6 +1743,14 @@ defmodule Athanor.AgentTest do
   defp flush_prompt_queue_events do
     receive do
       {:agent_event, {:prompt_queue, _}} -> flush_prompt_queue_events()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp flush_user_message_events do
+    receive do
+      {:agent_event, {:user_message, _}} -> flush_user_message_events()
     after
       0 -> :ok
     end

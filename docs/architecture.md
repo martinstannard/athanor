@@ -154,8 +154,9 @@ implements both roles; only the default system prompt and the tool set differ by
   - `messages` — ordered conversation; index 0 is `%{role: "system", content: …}`.
   - `current_task` — `{pid, ref}` of the monitored LLM/tool process, or `nil` (this is what makes
     cancellation and overlap-detection possible).
-  - `turn_count`, `max_turns` (default `100`), `notify_parent_on_done`, `prompt_queue`
-    (`:queue.new()` by default).
+  - `turn_count`, `max_turns` (default `:infinity`, `ATHANOR_MAX_TURNS`), `notify_parent_on_done`,
+    `prompt_queue` (`:queue.new()` by default), `mid_turn_queue` (default `true`,
+    `ATHANOR_MID_TURN_QUEUE` — #44).
   - `compaction_opts`, `compacted?` — the §12 compaction seam: the init option `:compaction_opts`
     feeds `Compactor` (thresholds, `:summarizer_fn`), and `compacted?` is the hysteresis latch the
     Agent holds because the Compactor is pure.
@@ -184,15 +185,24 @@ implements both roles; only the default system prompt and the tool set differ by
      `{:tool_end, name, {:ok, _} | {:error, _}}` per call and finally `{:tools_result, tool_messages}`.
      Tool errors are converted to a `"Error: <reason>"` tool message the model can read and correct.
   6. On `{:tools_result, …}` the loop increments `turn_count`; at `max_turns` it sets `:error` and
-     emits `{:error, "Reached maximum tool-call turns (…)"}`, otherwise it calls `start_llm_turn/1`
-     again. Steps 4–6 are the recursion that makes it an *agent* rather than a single completion.
+     emits `{:error, "Reached maximum tool-call turns (…)"}`, otherwise it drains **at most one**
+     queued prompt as a `user` message (#44) and calls `start_llm_turn/1` again. Steps 4–6 are the
+     recursion that makes it an *agent* rather than a single completion.
 - **Cancellation**: `do_cancel/1` demonitors and `Process.exit(pid, :kill)`s the in-flight task, sets
   `:idle`, and emits `:cancelled`. It clears `prompt_queue` too: cancel means *stop*, not "start the
   next stacked prompt the moment this one dies". `clear_prompt_queue/1` (drop the whole stack) and
   `drop_last_prompt/1` (drop only the newest entry) are the selective verbs that leave the turn alone.
 - **Queuing**: `do_enqueue_prompt/2` starts a turn immediately when `:idle`/`:error`, and otherwise
-  appends to `prompt_queue`; `drain_prompt_queue/1` pops one prompt per completed turn. This is what
-  lets a Conductor absorb several concurrent child completions without dropping any.
+  appends to `prompt_queue`. Two drain points, both "exactly one, FIFO": `drain_prompt_queue/1`
+  starts a queued prompt as its **own new turn** at the end of a task (an assistant message with no
+  `tool_calls`), and `drain_one_queued_prompt/1` (#44) appends a queued prompt to the **current**
+  turn as a `user` message at a tool-round boundary — injection, not interruption, so a follow-up
+  typed during a long tool loop is seen from the next round instead of after the whole task. The
+  mid-round drain only runs after the round's `tool` results are recorded (never between an
+  assistant `tool_calls` and its answers) and is off for a session with a live `goal_id` (a §7.2
+  worker's target must stay stable for verification) or when `ATHANOR_MID_TURN_QUEUE=0` /
+  `mid_turn_queue: false` restores the old behaviour. This is what lets a Conductor absorb several
+  concurrent child completions without dropping any.
 - **Parent wakeups** (`maybe_publish_child_done/2`): for any session with a binary `parent_id` and
   `notify_parent_on_done: true`, **every** completed text turn publishes a
   `{:child_done, report}` event — not only turns that contain a sentinel. The sentinel, when present,
@@ -360,6 +370,7 @@ env var, then `Application.get_env(:athanor, …)`, then a module-attribute defa
 | Diagnostic log rotation cap | `ATHANOR_LOG_MAX_BYTES` | `:log_max_bytes` | `5_000_000` |
 | Daemon RPC timeout (ms) | `ATHANOR_RPC_TIMEOUT_MS` | `:rpc_timeout_ms` | `15_000` |
 | Agent turn watchdog (ms) | `ATHANOR_TURN_TIMEOUT_MS` | `:turn_timeout_ms` | `900_000` |
+| Mid-task prompt pickup (#44) | `ATHANOR_MID_TURN_QUEUE` | `:mid_turn_queue` | `true` |
 
 `model/0` strips a leading `"opencode-go/"` prefix. `api_key/0` returns a descriptive error string
 when no key can be found.

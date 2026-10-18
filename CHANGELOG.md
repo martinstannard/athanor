@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Pick up a stacked prompt between tool rounds, not only when a whole task finishes: a prompt enqueued while a tool loop is running is appended as a `user` message at the next tool-round boundary (exactly one per round, FIFO), so a follow-up typed mid-task reaches the model without cancelling the turn. `ATHANOR_MID_TURN_QUEUE=0` restores the old "wait for the task" behaviour; a session with a live goal always waits (#44)
 - Search past session transcripts from `recall` (scope `transcripts`) (#41)
 - TUI header: show how full the active session's context is (#43)
 - Add /stats command: tokens, turns, tool calls and estimated cost (#26)

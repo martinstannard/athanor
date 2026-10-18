@@ -43,15 +43,60 @@ defmodule Athanor.Agent do
 
   A prompt that arrives while a turn is in flight is **never dropped**: `enqueue_prompt/2` — and
   the `{:enqueue_prompt, text}` bus command that `Athanor.Orchestrator.send_session/2` and the TUI
-  use — appends it to `state.prompt_queue`, and `drain_prompt_queue/1` starts exactly **one**
-  queued prompt (FIFO) each time a turn reaches its terminal boundary. `prompt/2` is the
-  synchronous counterpart and answers `{:error, :busy}` instead of queueing.
+  use — appends it to `state.prompt_queue`, and exactly **one** queued prompt (FIFO) is drained at
+  each boundary the turn reaches — the task's end (`drain_prompt_queue/1`) or a tool round's end
+  (`drain_one_queued_prompt/1`, #44, below). `prompt/2` is the synchronous counterpart and answers
+  `{:error, :busy}` instead of queueing.
 
   Every queue mutation publishes `{:prompt_queue, %{len: n, next: prompt | nil}}`, so a client can
   render the pending depth without polling; the depth is also carried by `get_state/1` and
   `snapshot_meta/1` as `:prompt_queue_len`. A queued prompt is persisted only once it *begins* a
-  turn (`begin_user_turn/2` -> `record_messages/1`), which keeps §7.4's transcript exactly equal to
-  the conversation that actually happened.
+  turn (`begin_user_turn/2` -> `record_messages/1`, or the mid-round append) which keeps §7.4's
+  transcript exactly equal to the conversation that actually happened.
+
+  ### Mid-task pickup at a tool-round boundary (#44)
+
+  Waiting for the *whole task* to finish is the wrong bound for a long tool loop: a conductor
+  running a big refactor (or a §7.2 goal worker) can go minutes to hours between the moment a
+  follow-up is typed and the moment the model can read it, and the only way to interject is `Esc` —
+  which cancels the turn. So the `{:tools_result, …}` handler also drains **exactly one** queued
+  prompt (same FIFO, same "starts exactly one" rule) before starting the next LLM round. This is
+  **injection, not interruption**: the in-flight task is not cancelled, the new instruction is
+  simply appended to the conversation, and the model takes it into account from the next round on.
+  `Esc` remains the hard stop.
+
+  Two invariants make that safe:
+
+    * **Wire legality.** The append happens *after* `record_messages/2` has recorded the round's
+      `tool` results, i.e. with the tool-call group closed — never between an assistant
+      `tool_calls` and its answers, which is the shape the API rejects (#29's class).
+      `Athanor.LLM.pair_tool_calls/1` stays the backstop.
+    * **One write path and visibility.** The appended message goes through `record_messages/2`
+      (published + persisted like any other message), and the drain publishes
+      `{:prompt_queue, %{len: _, next: _}}` plus `{:user_message, text}` so the TUI's pending
+      indicator and transcript update immediately.
+
+  `turn_complete` is untouched: it still fires only when a task genuinely ends, i.e. on an
+  assistant message with no `tool_calls`.
+
+  The injected message is the user's text **verbatim** — no "new instruction mid-task" prefix.
+  §7.4's transcript must equal the conversation that actually happened, and the TUI renders the
+  `{:user_message, _}` it already renders for every other prompt; a synthetic prefix would put
+  words in the user's mouth on disk. The role boundary is the signal: a `user` message arriving
+  after a `tool` result is by construction new input to a task in progress.
+
+  Mid-task injection changes the model's plan by construction, so it has an off switch:
+  `ATHANOR_MID_TURN_QUEUE=0` (or `:athanor, :mid_turn_queue`, or a per-session
+  `mid_turn_queue: false`) restores the old "wait for the task" behaviour — the stacked prompt is
+  not lost, it simply waits for the task boundary as before.
+
+  **Goal-attached sessions are exempt.** Injecting a new instruction into a §7.2 goal worker
+  mid-task could send it after a *different* objective while `Athanor.GoalManager` keeps verifying
+  the original — the trust-but-verify story assumes the worker's target is stable for the life of
+  the goal. Per issue #44's decision note the safer option was taken: a session with a live
+  `goal_id` (`attach_goal/3` or the `goal_id:` init option) never receives a mid-round injection,
+  whatever the flag says. The stacked prompt is not dropped — it drains at the next task boundary,
+  exactly as it did before this feature, and the TUI indicator keeps showing it meanwhile.
 
   **Cancel clears the queue.** `cancel/1` (Esc in the TUI) is a stop-the-line gesture: it kills the
   in-flight turn *and* discards every queued prompt, publishing `{:prompt_queue, %{len: 0}}`.
@@ -146,6 +191,7 @@ defmodule Athanor.Agent do
     :goal_id,
     :goal_objective,
     :turn_timeout_ms,
+    :mid_turn_queue,
     status: :idle,
     turn_count: 0,
     # Per-session consumption totals for `/stats` (#26). In-process and cheap: folded from the
@@ -193,8 +239,14 @@ defmodule Athanor.Agent do
   end
 
   @doc """
-  Enqueues a message over PubSub (or via GenServer cast) to be processed immediately
-  if `:idle`, or as soon as the current turn finishes.
+  Enqueues a message over PubSub (or via GenServer cast) to be processed immediately if `:idle`, or
+  at the next boundary of the current turn otherwise.
+
+  A busy session picks the prompt up at the next **tool-round** boundary — appended to the current
+  conversation as a `user` message so the model sees it from the next round on, without the turn
+  being cancelled (`drain_one_queued_prompt/1`, issue #44) — or, if that is disabled
+  (`ATHANOR_MID_TURN_QUEUE=0`) or the session has a live goal, at the end of the task, where it
+  starts a turn of its own. Either way the prompt is never dropped.
   """
   @spec enqueue_prompt(GenServer.server() | String.t(), String.t()) :: :ok
   def enqueue_prompt(agent_id, text) when is_binary(agent_id) and is_binary(text) do
@@ -381,6 +433,7 @@ defmodule Athanor.Agent do
         turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, Config.turn_timeout_ms()),
         goal_id: Keyword.get(opts, :goal_id),
         goal_objective: Keyword.get(opts, :goal_objective),
+        mid_turn_queue: Keyword.get(opts, :mid_turn_queue, Config.mid_turn_queue?()),
         compaction_opts: normalize_compaction_opts(opts),
         llm_fn: Keyword.get(opts, :llm_fn, default_llm_fn),
         messages: initial_messages(system_prompt, Keyword.get(opts, :messages))
@@ -575,9 +628,18 @@ defmodule Athanor.Agent do
     if max_turns_reached?(state) do
       state = set_status(state, :error)
       notify(state, {:error, "Reached maximum tool-call turns (#{state.max_turns})"})
+
+      # Deliberately NOT a round boundary: the task is being abandoned in `:error`, and a queued
+      # prompt left here starts on the session's next prompt (FIFO holds — `do_enqueue_prompt/2`
+      # begins a turn through the queue, so a stacked prompt is never overtaken).
       {:noreply, state}
     else
-      {:noreply, start_llm_turn(state)}
+      # #44: a round boundary is a conversation boundary. The group is closed (the results above
+      # are recorded), so exactly one queued prompt may be appended as a `user` message *before*
+      # the next request goes out — injection, not interruption. This is after `record_messages/2`
+      # on purpose and must stay there: appending a `user` message between an assistant
+      # `tool_calls` and its `tool` answers is the malformed history the API rejects (#29's class).
+      {:noreply, state |> drain_one_queued_prompt() |> start_llm_turn()}
     end
   end
 
@@ -969,6 +1031,52 @@ defmodule Athanor.Agent do
         state
     end
   end
+
+  # -- mid-task pickup (#44) ---------------------------------------------------------------
+
+  # The `{:tools_result, …}` half of the queue drain: append **at most one** queued prompt as a
+  # `user` message and leave the in-flight task running, instead of the whole-task bound
+  # `drain_prompt_queue/1` uses (which starts a *new* turn via `begin_user_turn/2`). At most one
+  # per round is the point — the existing drain's "starts exactly one" rule, so a burst stacked
+  # during a long loop can never swamp the model with several new instructions in one request.
+  #
+  # Not a cancel: nothing is killed and `turn_count` is untouched. The message goes through
+  # `record_messages/2` (one write path: published + persisted) and the queue mutation through
+  # `notify_prompt_queue/1`, so the TUI's indicator updates exactly as on every other queue change.
+  #
+  # A no-op when there is nothing to inject: no queued prompt, mid-turn pickup disabled, or this is
+  # a goal-attached session (see `mid_turn_injection?/1`). `start_llm_turn/1` follows in the caller
+  # either way, so the round continues with or without the interjection.
+  defp drain_one_queued_prompt(state) do
+    with true <- mid_turn_injection?(state),
+         {{:value, next_prompt}, rest} <- :queue.out(state.prompt_queue) do
+      state = %{state | prompt_queue: rest}
+      notify_prompt_queue(state)
+      # Record *then* announce, exactly like `begin_user_turn/2`: the message must be in the
+      # working set (and on disk) before a client is told about it.
+      state = record_messages(state, %{role: "user", content: next_prompt})
+      notify(state, {:user_message, next_prompt})
+      state
+    else
+      _ -> state
+    end
+  end
+
+  # The two ways a round boundary does *not* take a new instruction.
+  #
+  # `mid_turn_queue` is the `ATHANOR_MID_TURN_QUEUE` off switch (per-session `mid_turn_queue:`
+  # option wins), which restores the old "wait for the task" behaviour without losing the stacked
+  # prompt.
+  #
+  # A live `goal_id` suppresses it unconditionally. Injecting a new user instruction into a §7.2
+  # goal worker mid-task could send it after a *different* objective while `Athanor.GoalManager`
+  # keeps verifying the original — the trust-but-verify story assumes the worker's target is stable
+  # for the life of the goal, and a goal that can be rewritten mid-flight cannot be verified
+  # against anything. Issue #44's decision note chose this safer branch: the prompt waits for the
+  # task boundary (today's behaviour) rather than risking a wandering worker, and `Esc` remains the
+  # explicit way to redirect one.
+  defp mid_turn_injection?(%{goal_id: goal_id}) when is_binary(goal_id), do: false
+  defp mid_turn_injection?(state), do: state.mid_turn_queue != false
 
   # The single notification point for every queue mutation: the depth (what the TUI renders) plus
   # a preview of the next prompt. `snapshot_meta/1` carries the depth across the wire as well,

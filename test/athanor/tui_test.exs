@@ -881,6 +881,26 @@ defmodule Athanor.TUITest do
       typed = elem(TUI.handle_key(TUI.new(), "/unqueuex"), 1)
       assert {:submit, "/unqueuex", _} = TUI.handle_key(typed, "\r")
     end
+
+    test "a prompt injected mid-turn appears in the viewport and moves the indicator (#44)" do
+      # The agent's mid-round pickup publishes exactly the same pair of events a normal prompt
+      # does — `{:prompt_queue, _}` then `{:user_message, _}` — so the TUI needs no new handler
+      # for it. This pins that contract: if #44 had invented an event (or a side channel) the
+      # interjection would be invisible here.
+      tui =
+        TUI.new(width: 120, height: 24)
+        |> TUI.handle_agent_event({:status, :streaming})
+        |> TUI.handle_agent_event({:prompt_queue, %{len: 1, next: "also update the docs"}})
+        |> TUI.handle_agent_event({:prompt_queue, %{len: 0, next: nil}})
+        |> TUI.handle_agent_event({:user_message, "also update the docs"})
+
+      assert TUI.active_queue_len(tui) == 0
+      assert Enum.any?(entries(tui), &match?({:user, "also update the docs"}, &1))
+      assert TUI.render_frame(tui) =~ "also update the docs"
+      # ...and the turn was never cancelled or completed: still streaming.
+      assert TUI.active_status(tui) == :streaming
+      refute TUI.render_frame(tui) =~ "queued"
+    end
   end
 
   describe "daemon connectivity header (#25)" do
