@@ -109,7 +109,16 @@ defmodule Athanor.Orchestrator do
 
     case Worktree.Server.create_for_session(opts[:id], settings) do
       {:ok, worktree} ->
-        {:ok, opts |> Keyword.delete(:worktree) |> Keyword.put(:cd, worktree.path)}
+        # `:cd` is what makes relative paths resolve inside the tree; `:worktree_path` is what
+        # records that the tree exists at all, so a resume can reinstate it (or report it gone)
+        # instead of reopening the repo root (#58).
+        opts =
+          opts
+          |> Keyword.delete(:worktree)
+          |> Keyword.put(:cd, worktree.path)
+          |> Keyword.put(:worktree_path, worktree.path)
+
+        {:ok, opts}
 
       {:error, reason} ->
         {:error, reason}
@@ -180,10 +189,16 @@ defmodule Athanor.Orchestrator do
 
   **No initial prompt is ever dispatched** — resume restores history, it never re-runs work.
 
+  A session that had a worktree of its own is resumed **into that worktree**, not into the
+  repository root it was branched from (#58; see `resume_location/2`). That path is re-derived from
+  `Athanor.Worktree.Server` and from the `worktree_path` recorded in `meta.json`; when neither
+  resolves to a directory that still exists the session is **skipped** with
+  `reason: {:worktree_missing, path}` rather than quietly reopened in the main checkout.
+
   Returns `{:ok, ids, skipped}`, where `ids` are the resumed session ids **in spawn order**
   (parents before children) and `skipped` is a list of `%{id: id, reason: reason}` maps for the
-  sessions that could not be resumed (rejected at discovery, unreadable transcript, or a failed
-  spawn).
+  sessions that could not be resumed (rejected at discovery, unreadable transcript, a failed
+  spawn, or a recorded worktree that is gone).
   """
   @spec resume_all(keyword()) :: {:ok, [String.t()], [map()]} | {:error, term()}
   def resume_all(opts \\ []) do
@@ -194,7 +209,7 @@ defmodule Athanor.Orchestrator do
       sessions
       |> order_for_resume()
       |> Enum.reduce({[], skipped}, fn session, {ids, skipped} ->
-        case safe_resume(session, root) do
+        case safe_resume(session, root, opts) do
           {:ok, _id, _pid} -> {[session.id | ids], skipped}
           {:error, reason} -> {ids, [%{id: session.id, reason: reason} | skipped]}
         end
@@ -207,17 +222,18 @@ defmodule Athanor.Orchestrator do
   Rehydrates a single persisted session by id and returns its live pid.
 
   The single-node form of `resume_all/1`: the same history restore, the same `:idle`
-  neutralisation (C12), the same `{:resume, _}` marker. Returns `{:error, :not_found}` for an
-  unknown id or `{:error, {:unsupported_version, n}}` for a too-new `meta.json` (both from
-  `Athanor.Store.load/2`), or `{:error, reason}` when the transcript is unreadable or the spawn
-  fails.
+  neutralisation (C12), the same `{:resume, _}` marker, and the same worktree reinstatement (#58).
+  Returns `{:error, :not_found}` for an unknown id or `{:error, {:unsupported_version, n}}` for a
+  too-new `meta.json` (both from `Athanor.Store.load/2`), or `{:error, reason}` when the transcript
+  is unreadable, the spawn fails, or the session's recorded worktree no longer exists
+  (`{:error, {:worktree_missing, path}}`).
   """
   @spec resume_session(String.t(), keyword()) :: {:ok, String.t(), pid()} | {:error, term()}
   def resume_session(id, opts \\ []) when is_binary(id) do
     root = Store.root(opts)
 
     with {:ok, session} <- Store.load(id, root: root),
-         {:ok, _id, pid} <- rehydrate_and_spawn(session, root) do
+         {:ok, _id, pid} <- rehydrate_and_spawn(session, root, opts) do
       {:ok, id, pid}
     end
   end
@@ -597,15 +613,15 @@ defmodule Athanor.Orchestrator do
 
   defp created_at_key(_session), do: 0
 
-  defp safe_resume(session, root) do
-    rehydrate_and_spawn(session, root)
+  defp safe_resume(session, root, opts) do
+    rehydrate_and_spawn(session, root, opts)
   rescue
     error -> {:error, {:resume_failed, Exception.message(error)}}
   end
 
-  defp rehydrate_and_spawn(%Session{} = session, root) do
+  defp rehydrate_and_spawn(%Session{} = session, root, opts) do
     with {:ok, messages} <- rehydrate_messages(session.id, root) do
-      spawn_resumed(session, messages)
+      spawn_resumed(session, messages, opts)
     end
   end
 
@@ -692,11 +708,78 @@ defmodule Athanor.Orchestrator do
   defp record_seq(%{"seq" => seq}) when is_integer(seq), do: seq
   defp record_seq(_record), do: 0
 
+  # Where a resumed session should run (#58). On the create path the worktree is decided by
+  # `with_worktree_cd/2`; on the resume path nothing consulted it, so `cd` came straight from the
+  # record — which for a worktree worker is the *main* checkout, because the path was never persisted
+  # onto the session. Relative paths in the resumed worker's `edit_file`/`write_file` then resolved
+  # into main while its own worktree stayed clean: the breach this function removes.
+  #
+  # Two sources, because they fail differently:
+  #
+  #   * `Worktree.Server` holds the live mapping, keyed by session id. It is rebuilt from git at
+  #     boot (branch names carry the owner), so it also covers records written before #58.
+  #   * `meta.json`'s `worktree_path`, recorded by the Agent at spawn, survives a worktree that has
+  #     since been pruned — which is the only way to tell "its worktree is gone" from "it never had
+  #     one". Without it, a pruned worktree would silently reproduce the original bug.
+  #
+  # A path that no longer exists is **not** a reason to fall back to the repo root: it is reported as
+  # `{:worktree_missing, path}` and surfaces in `resume_all/1`'s `skipped` list (and, through
+  # `Athanor.Daemon`, as a `{:resume_skipped, id, reason}` warning).
+  defp resume_location(%Session{} = session, opts) do
+    candidates =
+      [live_worktree_path(session.id, opts), session.worktree_path]
+      |> Enum.filter(&is_binary/1)
+
+    case Enum.find(candidates, &File.dir?/1) do
+      nil ->
+        case candidates do
+          [] -> {:ok, session.cd, nil}
+          [missing | _rest] -> {:error, {:worktree_missing, missing}}
+        end
+
+      path ->
+        {:ok, path, path}
+    end
+  end
+
+  # Absent `Worktree.Server` reads as "no mapping", exactly like a session that never had a worktree:
+  # a `GenServer.call/3` to a name nobody registered would exit, and a bare `Orchestrator` in a test
+  # or script is a legitimate caller. An `:worktree_server` option lets a caller (or a test) name the
+  # instance to ask; it defaults to the supervised singleton.
+  defp live_worktree_path(id, opts) do
+    server = Keyword.get(opts, :worktree_server, Worktree.Server)
+
+    if worktree_server?(server) do
+      # A mapping is a recovery source, never a precondition: the Server is another process, and a
+      # resume that died because a lookup raced its restart would be the same class of failure as a
+      # session silently not coming back at all.
+      try do
+        case Worktree.Server.path_for(id, server: server) do
+          {:ok, path} -> path
+          :error -> nil
+        end
+      catch
+        :exit, _reason -> nil
+      end
+    end
+  end
+
+  defp worktree_server?(nil), do: false
+  defp worktree_server?(server) when is_pid(server), do: Process.alive?(server)
+  defp worktree_server?(server) when is_atom(server), do: Process.whereis(server) != nil
+  defp worktree_server?(_server), do: false
+
   # Parents-before-children is guaranteed by the caller's ordering; here we simply re-create the
   # session with its persisted identity restored and its history pre-seeded. `register: true`
   # keeps it reachable through `lookup/1`, `list_sessions/0` and the TUI. No `:prompt` is passed,
   # so `spawn_session/1` dispatches nothing — resume never re-runs work.
-  defp spawn_resumed(%Session{} = session, messages) do
+  defp spawn_resumed(%Session{} = session, messages, opts) do
+    with {:ok, cd, worktree_path} <- resume_location(session, opts) do
+      spawn_resumed_at(session, messages, cd, worktree_path)
+    end
+  end
+
+  defp spawn_resumed_at(%Session{} = session, messages, cd, worktree_path) do
     opts =
       [
         id: session.id,
@@ -704,7 +787,8 @@ defmodule Athanor.Orchestrator do
         role: session.role,
         parent_id: session.parent_id,
         model: session.model,
-        cd: session.cd,
+        cd: cd,
+        worktree_path: worktree_path,
         session_id: session.opencode_session_id,
         messages: messages,
         register: true

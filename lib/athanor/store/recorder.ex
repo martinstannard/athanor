@@ -802,6 +802,9 @@ defmodule Athanor.Store.Recorder do
         role: Session.to_role(snapshot_value(meta, :role, existing.role)),
         parent_id: snapshot_value(meta, :parent_id, existing.parent_id),
         model: snapshot_value(meta, :model, existing.model),
+        # A later `session_started` (a re-attach, a restart) must not lose where the session works.
+        cd: snapshot_value(meta, :cd, existing.cd),
+        worktree_path: snapshot_value(meta, :worktree_path, existing.worktree_path),
         opencode_session_id:
           snapshot_value(
             meta,
@@ -829,12 +832,20 @@ defmodule Athanor.Store.Recorder do
 
   # The `{:session_started, meta}` event carries `Athanor.Agent.snapshot_meta/1` (plus
   # `session_id`, C4); absent fields fall back to `Athanor.Store.Session.new/1`'s defaults.
+  #
+  # `:cd` and `:worktree_path` are here because the record has to describe where the session was
+  # *working*, not where the Recorder happens to run: `Session.new/1` would otherwise default `cd`
+  # to this process's directory, which is exactly the main checkout a worktree worker is not in
+  # (#58). Without `:worktree_path` a resume cannot tell "never had a worktree" from "its worktree
+  # is gone", and would quietly reopen the main checkout.
   defp snapshot_attrs(meta) do
     [
       title: field(meta, :title),
       role: field(meta, :role),
       parent_id: field(meta, :parent_id),
       model: field(meta, :model),
+      cd: field(meta, :cd),
+      worktree_path: field(meta, :worktree_path),
       session_id: field(meta, :session_id) || field(meta, :opencode_session_id),
       last_status: field(meta, :status) || field(meta, :last_status)
     ]

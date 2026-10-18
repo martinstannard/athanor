@@ -225,6 +225,10 @@ defmodule Athanor.Agent do
     :system_prompt,
     :model,
     :cd,
+    # The checkout this session was given, when it has one of its own (#58). `cd` alone cannot say
+    # "this session's working tree is a worktree", and that distinction is what lets a resume either
+    # reinstate the tree or report it as gone instead of silently reopening the main checkout.
+    :worktree_path,
     :llm_fn,
     :current_task,
     :max_turns,
@@ -481,6 +485,7 @@ defmodule Athanor.Agent do
         system_prompt: system_prompt,
         model: model,
         cd: cd,
+        worktree_path: Keyword.get(opts, :worktree_path),
         max_turns: max_turns,
         notify_parent_on_done: notify_parent,
         turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, Config.turn_timeout_ms()),
@@ -565,6 +570,7 @@ defmodule Athanor.Agent do
       messages: state.messages,
       model: state.model,
       cd: state.cd,
+      worktree_path: state.worktree_path,
       session_id: state.session_id,
       turn_count: state.turn_count,
       goal_id: state.goal_id,
@@ -1321,21 +1327,30 @@ defmodule Athanor.Agent do
   defp start_tool_execution(state, tool_calls) do
     state = set_status(state, :executing_tools) |> count_tool_calls(tool_calls) |> publish_stats()
     agent_pid = self()
-    cd = state.cd
-    session_id = state.id
-    # The role travels with the call so `Athanor.Tools` can refuse a conductor-only tool to a
-    # worker: schema gating keeps those tools out of a worker's prompt, but a model can still name
-    # a tool it was never offered, and refusing then has to be a decision, not an accident.
-    role = state.role
-    # The session's skill roots travel too (#23): the `skill` tool must resolve a name against
-    # exactly the roots whose catalogue was injected, not whatever the process-global config says
-    # by the time the tool runs.
-    skill_opts = state.skill_opts
+
+    # Everything a tool needs to root itself the way *this* session does, frozen at dispatch time:
+    #
+    #   * `:cd` — the directory a relative path resolves against, which for an isolated worker is
+    #     its own checkout;
+    #   * `:worktree` — that checkout, when the session has one. It is not derivable from `:cd`, and
+    #     it is what lets `Athanor.Tools` refuse a write that escapes into another working tree (#58);
+    #   * `:role` — so `Athanor.Tools` can refuse a conductor-only tool to a worker: schema gating
+    #     keeps those tools out of a worker's prompt, but a model can still name a tool it was never
+    #     offered, and refusing then has to be a decision, not an accident;
+    #   * `:skill_opts` — the session's skill roots (#23), so the `skill` tool resolves a name
+    #     against exactly the roots whose catalogue was injected, not whatever the process-global
+    #     config says by the time the tool runs.
+    tool_opts = [
+      cd: state.cd,
+      session_id: state.id,
+      role: state.role,
+      skill_opts: state.skill_opts,
+      worktree: state.worktree_path
+    ]
 
     {pid, ref} =
       spawn_monitor(fn ->
-        tool_messages =
-          Enum.map(tool_calls, &run_tool(&1, agent_pid, cd, session_id, role, skill_opts))
+        tool_messages = Enum.map(tool_calls, &run_tool(&1, agent_pid, tool_opts))
 
         send(agent_pid, {:tools_result, tool_messages})
       end)
@@ -1345,19 +1360,14 @@ defmodule Athanor.Agent do
     |> arm_watchdog("tool_execution")
   end
 
-  defp run_tool(tc, agent_pid, cd, session_id, role, skill_opts) do
+  defp run_tool(tc, agent_pid, tool_opts) do
     name = tc.function.name
     raw_args = tc.function.arguments
 
     send(agent_pid, {:tool_event, {:tool_start, name, raw_args}})
 
     output =
-      case Tools.execute(name, raw_args,
-             cd: cd,
-             session_id: session_id,
-             role: role,
-             skill_opts: skill_opts
-           ) do
+      case Tools.execute(name, raw_args, tool_opts) do
         {:ok, res} ->
           send(agent_pid, {:tool_event, {:tool_end, name, {:ok, res}}})
           res
@@ -1635,6 +1645,10 @@ defmodule Athanor.Agent do
       parent_id: state.parent_id,
       model: state.model,
       status: state.status,
+      # Where this session actually works, persisted onto `meta.json` so a resume can put it back
+      # (and so a worktree that has since been pruned is *detectable* rather than invisible, #58).
+      cd: state.cd,
+      worktree_path: state.worktree_path,
       session_id: state.session_id,
       prompt_queue_len: prompt_queue_len(state),
       nudges_delivered: state.nudges_delivered,

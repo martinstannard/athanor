@@ -14,6 +14,16 @@ defmodule Athanor.Store.Session do
   forward-compatible; bumping the version is a breaking change owned by
   `Athanor.Store.Schema.migrate/1`.
 
+  ## `worktree_path` (issue #58)
+
+  `worktree_path` is the checkout a worktree-isolated session was spawned *into*, and `nil` for a
+  session that never had one. It exists because `cd` alone cannot distinguish "this session never
+  had a worktree" from "its worktree is gone", and resume has to tell those apart: the first resumes
+  in `cd`, the second is reported as skipped instead of being dropped silently back into the main
+  checkout. Records written before this field existed simply have no key — `from_map/1` reads that
+  as `nil` ("no worktree"), so an old session still resumes; `Athanor.Orchestrator.resume_all/1`
+  additionally re-derives the mapping from `Athanor.Worktree.Server` for exactly those records.
+
   ## Naming decision (plan §8, OQ1)
 
   The Athanor session id (which is also the directory name) lives in `"id"`. The OpenCode Go
@@ -34,6 +44,7 @@ defmodule Athanor.Store.Session do
     :parent_id,
     :model,
     :cd,
+    :worktree_path,
     :opencode_session_id,
     :created_at,
     :updated_at,
@@ -58,6 +69,7 @@ defmodule Athanor.Store.Session do
           parent_id: String.t() | nil,
           model: String.t() | nil,
           cd: String.t() | nil,
+          worktree_path: String.t() | nil,
           opencode_session_id: String.t() | nil,
           created_at: timestamp() | nil,
           updated_at: timestamp() | nil,
@@ -75,7 +87,8 @@ defmodule Athanor.Store.Session do
   Requires `:id` (the Athanor session id, which is also the directory name); `:role` defaults
   to `:conductor` when no `:parent_id` is given and `:worker` otherwise, mirroring
   `Athanor.Agent.init/1`. `:title` defaults to the id, `:model` and `:cd` to the configured
-  model and the current working directory.
+  model and the current working directory. `:worktree_path` is `nil` unless the session was given
+  a worktree of its own.
   """
   @spec new(keyword()) :: t()
   def new(opts) when is_list(opts) do
@@ -90,6 +103,7 @@ defmodule Athanor.Store.Session do
       parent_id: parent_id,
       model: Keyword.get(opts, :model, Config.model()),
       cd: Keyword.get(opts, :cd, File.cwd!()),
+      worktree_path: Keyword.get(opts, :worktree_path),
       opencode_session_id: Keyword.get(opts, :session_id),
       created_at: Keyword.get(opts, :created_at, DateTime.utc_now()),
       updated_at: Keyword.get(opts, :updated_at, DateTime.utc_now()),
@@ -120,6 +134,7 @@ defmodule Athanor.Store.Session do
       "parent_id" => session.parent_id,
       "model" => session.model,
       "cd" => session.cd,
+      "worktree_path" => session.worktree_path,
       "session_id" => session.opencode_session_id,
       "created_at" => encode_time(session.created_at),
       "updated_at" => encode_time(session.updated_at),
@@ -160,6 +175,8 @@ defmodule Athanor.Store.Session do
       parent_id: Map.get(map, "parent_id"),
       model: Map.get(map, "model"),
       cd: Map.get(map, "cd"),
+      # Absent in everything written before #58: `nil` means "no worktree", never "unknown".
+      worktree_path: Map.get(map, "worktree_path"),
       opencode_session_id: Map.get(map, "session_id") || Map.get(map, "opencode_session_id"),
       created_at: decode_time(Map.get(map, "created_at")),
       updated_at: decode_time(Map.get(map, "updated_at")),
